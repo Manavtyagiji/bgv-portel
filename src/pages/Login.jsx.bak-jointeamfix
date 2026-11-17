@@ -1,0 +1,1049 @@
+/**
+ * Login.jsx — FULL UPDATED
+ *
+ * Fixes:
+ * 1) Saves JWT in currentUser.token AND token/authToken/jwt keys
+ * 2) Falls back to localStorage login if backend login fails
+ * 3) Syncs old local users to backend to get JWT
+ * 4) Prevents login → instant logout caused by missing token persistence
+ */
+
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { authAPI } from "../api/api";
+import {
+  SUPER_ADMIN_EMAIL,
+  getAllUsers,
+  saveAllUsers,
+  getAllTenants,
+  saveTenant,
+  generateTenantId,
+  generateAdminAccessCode,
+  getAllTenantAccessCodes,
+  validateTenantAccessCode,
+  registerInternalStaff,
+  registerClientAdmin,
+  registerClientTeam,
+  findAdminByAccessCode,
+  patchMissingSubTenantId,
+  patchMissingAccessCode,
+} from "../utils/tenantAuth";
+
+/* ─────────────────────────── CSS ────────────────────────────────────────── */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --ink:#0d1117; --ink2:#24292f; --ink3:#57606a; --ink4:#8c959f;
+  --bg:#f6f8fa; --card:#ffffff; --card2:#f6f8fa;
+  --blue:#0969da; --green:#2da44e; --purple:#8250df;
+  --red:#cf222e;  --amber:#9a6700; --gold:#bf8700;
+  --border:#d0d7de; --blue-border:rgba(9,105,218,0.30);
+  --shadow-sm:0 1px 3px rgba(27,31,36,0.10),0 4px 12px rgba(27,31,36,0.06);
+  --shadow:0 4px 16px rgba(27,31,36,0.10),0 12px 36px rgba(27,31,36,0.08);
+  --r:10px; --ease:cubic-bezier(.16,1,.3,1);
+  --font:'Sora',sans-serif; --mono:'JetBrains Mono',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);font-family:var(--font);}
+.lr{min-height:100vh;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px;position:relative;overflow:hidden;}
+.lr::before{content:'';position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse 55% 45% at 15% 10%,rgba(9,105,218,0.08),transparent 55%),radial-gradient(ellipse 45% 40% at 88% 85%,rgba(130,80,223,0.07),transparent 50%);}
+.lcard{background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow);width:100%;max-width:500px;position:relative;z-index:1;animation:card-in 0.38s var(--ease) both;overflow:hidden;}
+@keyframes card-in{from{opacity:0;transform:translateY(18px) scale(0.98);}to{opacity:1;transform:none;}}
+.lcard-stripe{height:3px;background:linear-gradient(90deg,#0969da 0%,#8250df 50%,#2da44e 100%);}
+.lcard-body{padding:26px 30px 30px;}
+.lbrand{display:flex;align-items:center;gap:11px;margin-bottom:22px;}
+.lbrand-icon{width:40px;height:40px;border-radius:10px;flex-shrink:0;background:linear-gradient(135deg,#0969da,#8250df);display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 12px rgba(9,105,218,0.28);}
+.lbrand-name{font-size:17px;font-weight:700;color:var(--ink);letter-spacing:-0.2px;}
+.lbrand-sub{font-size:10.5px;color:var(--ink4);margin-top:1px;font-weight:500;letter-spacing:0.05em;text-transform:uppercase;}
+.ltabs{display:flex;background:var(--card2);border:1px solid var(--border);border-radius:9px;padding:3px;margin-bottom:22px;gap:2px;}
+.ltab{flex:1;padding:8px 6px;border:none;border-radius:7px;font-family:var(--font);font-size:12px;font-weight:600;cursor:pointer;color:var(--ink4);background:transparent;transition:all 0.18s;white-space:nowrap;text-align:center;}
+.ltab.on{background:var(--card);color:var(--blue);box-shadow:0 1px 5px rgba(27,31,36,0.10);}
+.lstabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:20px;}
+.lstab{flex:1;padding:10px 12px;border:none;border-bottom:2.5px solid transparent;background:transparent;font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;color:var(--ink4);transition:all 0.15s;text-align:center;}
+.lstab.on{color:var(--blue);border-bottom-color:var(--blue);}
+.lstab:hover{color:var(--ink2);}
+.lh1{font-size:20px;font-weight:700;color:var(--ink);letter-spacing:-0.3px;margin-bottom:5px;line-height:1.25;}
+.lh2{font-size:13px;color:var(--ink3);margin-bottom:18px;line-height:1.6;}
+.lfield{margin-bottom:13px;}
+.llabel{display:block;font-size:11.5px;font-weight:600;color:var(--ink2);margin-bottom:5px;}
+.linput{width:100%;font-family:var(--font);font-size:14px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 13px;color:var(--ink);outline:none;transition:border-color 0.15s,box-shadow 0.15s;}
+.linput:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(9,105,218,0.12);}
+.linput::placeholder{color:var(--ink4);}
+.linput-note{font-size:11.5px;color:var(--ink4);margin-top:5px;line-height:1.5;}
+.lcode{width:100%;font-family:var(--mono);font-size:14px;letter-spacing:0.06em;background:#f0f6ff;border:1.5px solid var(--blue-border);border-radius:8px;padding:11px 14px;color:var(--blue);outline:none;transition:all 0.15s;text-transform:uppercase;}
+.lcode:focus{background:#fff;border-color:var(--blue);box-shadow:0 0 0 3px rgba(9,105,218,0.12);}
+.lcode::placeholder{color:var(--ink4);text-transform:none;font-family:var(--font);letter-spacing:0;font-size:13.5px;}
+.lpw{display:flex;gap:3px;margin-top:6px;}
+.lpw-s{flex:1;height:3px;border-radius:99px;background:var(--border);transition:background 0.22s;}
+.lpw-s.w{background:#cf222e;}.lpw-s.m{background:#9a6700;}.lpw-s.s{background:#2da44e;}
+.lpw-l{font-size:11px;color:var(--ink4);margin-top:4px;text-align:right;font-weight:600;}
+.lnotice{border-radius:9px;padding:11px 14px;font-size:12.5px;line-height:1.55;margin-bottom:16px;display:flex;gap:9px;align-items:flex-start;}
+.ln-blue{background:rgba(9,105,218,0.07);border:1px solid rgba(9,105,218,0.22);color:#0550ae;}
+.ln-green{background:rgba(45,164,78,0.07);border:1px solid rgba(45,164,78,0.22);color:#116329;}
+.ln-amber{background:rgba(154,103,0,0.07);border:1px solid rgba(154,103,0,0.25);color:#7d4e00;}
+.ln-red{background:rgba(207,34,46,0.07);border:1px solid rgba(207,34,46,0.25);color:#82071e;}
+.ln-purple{background:rgba(130,80,223,0.07);border:1px solid rgba(130,80,223,0.22);color:#5a3e9b;}
+.ln-icon{font-size:15px;flex-shrink:0;margin-top:1px;}
+.lsteps{display:flex;gap:4px;margin-bottom:18px;}
+.lstep{flex:1;height:3.5px;border-radius:99px;background:var(--border);transition:background 0.25s;}
+.lstep.on{background:var(--blue);}
+.lbtn{width:100%;padding:11px;font-family:var(--font);font-size:14px;font-weight:700;border:none;border-radius:9px;cursor:pointer;transition:all 0.18s;margin-top:6px;display:flex;align-items:center;justify-content:center;gap:7px;}
+.lbtn:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.lbtn:active{transform:scale(0.97);}
+.lbtn:disabled{opacity:0.42;cursor:not-allowed;transform:none;filter:none;}
+.lb-blue{background:linear-gradient(135deg,#0969da,#1f75cb);color:#fff;box-shadow:0 4px 14px rgba(9,105,218,0.28);}
+.lb-green{background:linear-gradient(135deg,#2da44e,#26943f);color:#fff;box-shadow:0 4px 14px rgba(45,164,78,0.28);}
+.lb-purple{background:linear-gradient(135deg,#8250df,#6639ba);color:#fff;box-shadow:0 4px 14px rgba(130,80,223,0.28);}
+.lalert{padding:11px 14px;border-radius:9px;font-size:13px;font-weight:500;margin-bottom:14px;display:flex;align-items:flex-start;gap:8px;animation:al-in 0.2s ease;line-height:1.5;}
+@keyframes al-in{from{opacity:0;transform:translateY(-5px);}to{opacity:1;transform:none;}}
+.la-err{background:rgba(207,34,46,0.07);border:1px solid rgba(207,34,46,0.25);color:#82071e;}
+.la-ok{background:rgba(45,164,78,0.07);border:1px solid rgba(45,164,78,0.25);color:#116329;}
+.lfooter{text-align:center;font-size:12.5px;color:var(--ink4);margin-top:16px;}
+.lfooter a{color:var(--blue);cursor:pointer;font-weight:600;text-decoration:none;}
+.lfooter a:hover{text-decoration:underline;}
+.lcreds{background:linear-gradient(135deg,rgba(9,105,218,0.05),rgba(130,80,223,0.04));border:1px solid rgba(9,105,218,0.18);border-radius:10px;padding:14px 16px;margin-top:16px;}
+.lcreds-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.09em;color:var(--ink4);margin-bottom:9px;}
+.lcreds-row{display:flex;align-items:center;gap:9px;margin-bottom:6px;}
+.lcreds-row:last-child{margin-bottom:0;}
+.lcreds-k{font-size:11px;font-weight:700;color:var(--ink4);width:68px;flex-shrink:0;}
+.lcreds-v{font-family:var(--mono);font-size:12px;color:var(--blue);background:rgba(9,105,218,0.08);border:1px solid rgba(9,105,218,0.15);border-radius:5px;padding:2px 9px;flex:1;letter-spacing:0.03em;}
+.lroles{display:flex;flex-direction:column;gap:6px;margin:12px 0;}
+.lrole{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;background:var(--card2);border:1px solid var(--border);}
+.lrole-i{font-size:17px;flex-shrink:0;}
+.lrole-n{font-size:13px;font-weight:600;color:var(--ink);}
+.lrole-d{font-size:11.5px;color:var(--ink4);margin-top:1px;}
+.spin{display:inline-block;width:15px;height:15px;border-radius:50%;border:2px solid rgba(255,255,255,0.30);border-top-color:#fff;animation:sp 0.7s linear infinite;}
+@keyframes sp{to{transform:rotate(360deg);}}
+.lscreen{text-align:center;padding:16px 0 8px;}
+.lscreen-ico{font-size:48px;margin-bottom:12px;}
+.lscreen-title{font-size:21px;font-weight:700;color:var(--ink);margin-bottom:7px;}
+.lscreen-text{font-size:13.5px;color:var(--ink3);line-height:1.65;max-width:340px;margin:0 auto 18px;}
+.lbadge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 14px;border-radius:99px;}
+.lb-amber{background:rgba(154,103,0,0.08);border:1px solid rgba(154,103,0,0.25);color:#7d4e00;}
+.lcode-box{background:rgba(45,164,78,0.06);border:1.5px solid rgba(45,164,78,0.28);border-radius:10px;padding:14px 16px;margin:14px 0;text-align:left;}
+.lcode-box-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.09em;color:#116329;margin-bottom:7px;}
+.lcode-box-val{font-family:var(--mono);font-size:15px;font-weight:700;color:#2da44e;background:rgba(45,164,78,0.10);border:1px solid rgba(45,164,78,0.22);border-radius:6px;padding:9px 13px;word-break:break-all;display:block;letter-spacing:0.05em;margin-bottom:7px;}
+.lcode-box-note{font-size:11.5px;color:#116329;line-height:1.5;}
+.lhowto{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:16px;}
+.lhowto-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--ink4);margin-bottom:10px;}
+.lhowto-steps{display:flex;flex-direction:column;gap:8px;}
+.lhowto-step{display:flex;align-items:flex-start;gap:10px;}
+.lhowto-num{width:20px;height:20px;border-radius:50%;flex-shrink:0;background:var(--blue);color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:1px;}
+.lhowto-text{font-size:12.5px;color:var(--ink2);line-height:1.5;}
+.lhowto-text strong{color:var(--blue);}
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("lr-css")) {
+  const s = document.createElement("style");
+  s.id = "lr-css";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+/* ─────────────────────────── HELPERS ────────────────────────────────────── */
+const BASE =
+  window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1"
+    ? "http://localhost:5002/api"
+    : "https://profeix.info/api";
+const norm = e => String(e || "").trim().toLowerCase();
+
+
+/* ───────────────────────── LOGIN ATTEMPT LOCK ─────────────────────────
+   No IP blocking. Lock is email/browser based only:
+   5 wrong passwords => locked for 5 minutes, then user can try again.
+────────────────────────────────────────────────────────────────────── */
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCK_TIME = 5 * 60 * 1000;
+
+function getLoginLockKey(email) {
+  return `login_lock_${norm(email)}`;
+}
+
+function getLoginLock(email) {
+  try {
+    return JSON.parse(localStorage.getItem(getLoginLockKey(email)) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function setLoginLock(email, data) {
+  try {
+    localStorage.setItem(getLoginLockKey(email), JSON.stringify(data));
+  } catch (_) {}
+}
+
+function clearLoginLock(email) {
+  try {
+    localStorage.removeItem(getLoginLockKey(email));
+  } catch (_) {}
+}
+
+function isLoginLocked(email) {
+  const lock = getLoginLock(email);
+
+  if (!lock.lockedUntil) return false;
+
+  if (Date.now() >= Number(lock.lockedUntil)) {
+    clearLoginLock(email);
+    return false;
+  }
+
+  return true;
+}
+
+function getRemainingLockMinutes(email) {
+  const lock = getLoginLock(email);
+  const remaining = Number(lock.lockedUntil || 0) - Date.now();
+  return Math.max(1, Math.ceil(remaining / 60000));
+}
+
+function recordWrongLoginAttempt(email) {
+  const lock = getLoginLock(email);
+  const attempts = Number(lock.attempts || 0) + 1;
+
+  if (attempts >= MAX_LOGIN_ATTEMPTS) {
+    setLoginLock(email, {
+      attempts: MAX_LOGIN_ATTEMPTS,
+      lockedUntil: Date.now() + LOGIN_LOCK_TIME,
+    });
+
+    return {
+      attempts: MAX_LOGIN_ATTEMPTS,
+      locked: true,
+    };
+  }
+
+  setLoginLock(email, { attempts });
+
+  return {
+    attempts,
+    locked: false,
+  };
+}
+
+function pwStr(p) {
+  if (!p) return 0;
+  let s = 0;
+  if (p.length >= 6) s++;
+  if (p.length >= 10) s++;
+  if (/[A-Z]/.test(p) || /[0-9]/.test(p) || /[^a-zA-Z0-9]/.test(p)) s++;
+  return s;
+}
+const PW_LBL = ["", "Weak", "Medium", "Strong"];
+const PW_CLS = ["", "w", "m", "s"];
+
+function PwBar({ pw }) {
+  const s = pwStr(pw);
+  if (!pw) return null;
+  return (
+    <>
+      <div className="lpw">
+        {[0, 1, 2].map(i => <div key={i} className={`lpw-s ${i < s ? PW_CLS[s] : ""}`} />)}
+      </div>
+      <div className="lpw-l">{PW_LBL[s]}</div>
+    </>
+  );
+}
+
+function Steps({ vals }) {
+  return (
+    <div className="lsteps">
+      {vals.map((v, i) => <div key={i} className={`lstep ${v ? "on" : ""}`} />)}
+    </div>
+  );
+}
+
+function saveSession(user, token = "") {
+  const finalToken =
+    token ||
+    user?.token ||
+    user?.accessToken ||
+    user?.jwt ||
+    "";
+
+  const finalUser = {
+    ...user,
+    token: finalToken,
+  };
+
+  sessionStorage.setItem("currentUser", JSON.stringify(finalUser));
+
+  if (finalToken) {
+    sessionStorage.setItem("token", finalToken);
+    sessionStorage.setItem("authToken", finalToken);
+    sessionStorage.setItem("jwt", finalToken);
+  } else {
+    sessionStorage.removeItem("token");
+    sessionStorage.removeItem("authToken");
+    sessionStorage.removeItem("jwt");
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   syncUserWithBackend
+══════════════════════════════════════════════════════════════════ */
+async function syncUserWithBackend(localUser, password) {
+  try {
+    const res = await fetch(`${BASE}/auth/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: localUser.name || "",
+        email: localUser.email || "",
+        password,
+        role: localUser.role || "team",
+        status: localUser.status || "pending",
+        tenantId: localUser.tenantId || null,
+        orgName: localUser.orgName || "",
+        adminAccessCode: localUser.adminAccessCode || null,
+        ownerAdminEmail: localUser.ownerAdminEmail || null,
+        isInternal: localUser.isInternal || false,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      if (data.status === "pending") return { pending: true };
+      if (data.status === "rejected") return { rejected: true };
+      console.warn("Backend sync failed:", data.error || res.status);
+      return { error: data.error };
+    }
+
+    return data;
+  } catch (e) {
+    console.warn("Backend sync unreachable:", e.message);
+    return { offline: true };
+  }
+}
+
+export default function Login() {
+  const navigate = useNavigate();
+
+  const [tab, setTab] = useState("signin");
+  const [subtab, setSubtab] = useState("register");
+
+  const [f, setF] = useState({ name: "", email: "", password: "", org: "", code: "" });
+  const set = (k, v) => { setF(p => ({ ...p, [k]: v })); setErr(null); };
+
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [success, setSuccess] = useState(null);
+
+  const switchTab = t => {
+    setTab(t);
+    setErr(null);
+    setLoading(false);
+    setPending(false);
+    setSuccess(null);
+    setF({ name: "", email: "", password: "", org: "", code: "" });
+  };
+
+  const switchSub = s => {
+    setSubtab(s);
+    setErr(null);
+    setF(p => ({ ...p, code: "" }));
+  };
+
+  const ensureSA = () => {
+    const users = getAllUsers();
+    if (!users.find(u => norm(u.email) === norm(SUPER_ADMIN_EMAIL))) {
+      saveAllUsers([...users, {
+        name: "Super Admin",
+        email: SUPER_ADMIN_EMAIL,
+        password: "Admin@1234",
+        role: "superadmin",
+        status: "approved",
+        tenantId: null,
+        subTenantId: null,
+        isInternal: true,
+        adminAccessCode: null,
+        ownerAdminEmail: null,
+      }]);
+    }
+  };
+
+  /* ── SIGN IN ──────────────────────────────────────────────────────────── */
+  const handleSignIn = async () => {
+    if (!f.email.trim() || !f.password) {
+      setErr("Please enter your email and password.");
+      return;
+    }
+
+    const email = norm(f.email);
+
+    // No IP blocking. Only this email is locked in this browser after wrong password attempts.
+    if (isLoginLocked(email)) {
+      setErr(
+        `Too many wrong password attempts. Please try again after ${getRemainingLockMinutes(email)} minutes.`
+      );
+      return;
+    }
+
+    setLoading(true);
+    setErr(null);
+    setPending(false);
+
+    try {
+      const res = await authAPI.login({
+        email,
+        password: f.password,
+      });
+
+      const token = res.token || res.user?.token || res.accessToken || res.jwt;
+
+      if (!token || !res.user) {
+        throw new Error("Login response missing token/user");
+      }
+
+      const user = {
+        ...res.user,
+        token,
+        subTenantId: res.user.subTenantId || res.user.tenantId || null,
+      };
+
+      // Correct login: reset wrong-password counter immediately.
+      clearLoginLock(email);
+
+      saveSession(user, token);
+
+      setLoading(false);
+      navigate("/");
+      return;
+    } catch (e) {
+      const msg = String(e.message || "").toLowerCase();
+
+      if (msg.includes("pending") || msg.includes("403")) {
+        setPending(true);
+      } else if (msg.includes("rejected")) {
+        setErr("Your account has been rejected. Please contact Tervies support.");
+      } else if (msg.includes("incorrect") || msg.includes("password") || msg.includes("401")) {
+        const result = recordWrongLoginAttempt(email);
+
+        if (result.locked) {
+          setErr("Wrong password entered 5 times. Login is locked for 5 minutes. After 5 minutes, you can enter password again.");
+        } else {
+          setErr(`Incorrect password. Attempt ${result.attempts}/${MAX_LOGIN_ATTEMPTS}.`);
+        }
+      } else {
+        setErr("Login failed. Please check your email/password or server connection.");
+      }
+
+      setLoading(false);
+    }
+  };
+
+  /* ── JOIN AS STAFF ────────────────────────────────────────────────────── */
+  const handleStaff = async () => {
+    setErr(null);
+    setLoading(true);
+
+    try {
+      if (!f.name.trim() || !f.email.trim() || f.password.length < 6) {
+        setErr("Please fill in all fields. Password must be at least 6 characters.");
+        setLoading(false);
+        return;
+      }
+
+      const staffPayload = {
+        name: f.name.trim(),
+        email: norm(f.email),
+        password: f.password,
+        role: "team",
+        status: "pending",
+        tenantId: null,
+        subTenantId: null,
+        ownerAdminEmail: null,
+        isInternal: true,
+        orgName: "Tervies Internal",
+      };
+
+      const r = await registerInternalStaff({
+        name: staffPayload.name,
+        email: staffPayload.email,
+        password: staffPayload.password,
+      });
+
+      if (r.error) {
+        setErr(r.error);
+        setLoading(false);
+        return;
+      }
+
+      // Only Super Admin internal staff is synced to backend here.
+      // Company admin and company team registration logic below is untouched.
+      try {
+        const res = await fetch(`${BASE}/auth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(staffPayload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok && !String(data.error || data.message || "").toLowerCase().includes("exist")) {
+          console.warn("Backend staff register failed:", data.error || data.message || res.status);
+        }
+      } catch (e) {
+        console.warn("Backend staff register unreachable, local request saved:", e.message);
+      }
+
+      const all = getAllUsers();
+      const localUser = { ...staffPayload, registeredAt: new Date().toLocaleDateString("en-IN") };
+      if (!all.some(u => norm(u.email) === staffPayload.email)) saveAllUsers([...all, localUser]);
+      else saveAllUsers(all.map(u => norm(u.email) === staffPayload.email ? { ...u, ...localUser } : u));
+
+      setPending(true);
+    } catch (e) {
+      console.error("Staff registration failed:", e);
+      setErr("Staff registration failed. Please try again.");
+    }
+
+    setLoading(false);
+  };
+
+  /* ── COMPANY REGISTER ─────────────────────────────────────────────────── */
+  const handleCompanyRegister = async () => {
+    setErr(null);
+    setLoading(true);
+
+    try {
+      if (!f.name.trim() || !f.email.trim() || f.password.length < 6 || !f.org.trim()) {
+        setErr("Please fill in all fields before entering your access code.");
+        setLoading(false);
+        return;
+      }
+
+      const code = f.code.trim().toUpperCase();
+
+      if (!code) {
+        setErr("Please enter your Tenant Access Code. Contact superadmin@tervies.com if you don't have one.");
+        setLoading(false);
+        return;
+      }
+
+      /*
+        LIVE FIX:
+        Earlier this page checked TAC only from browser localStorage first.
+        On another laptop / after refresh / after server sync, valid TAC could be
+        present in MongoDB PortalState but missing from this browser localStorage,
+        causing false "invalid or already used" errors.
+
+        New safe flow:
+        1) Try backend registration first. Backend now validates TAC from MongoDB.
+        2) Mirror returned user/tenant into localStorage so old UI logic stays same.
+        3) If backend is unreachable, fallback to old localStorage registration.
+      */
+      let backendOk = false;
+      let backendUser = null;
+      let backendError = "";
+
+      try {
+        const res = await fetch(`${BASE}/auth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: f.name.trim(),
+            email: f.email.trim(),
+            password: f.password,
+            role: "admin",
+            orgName: f.org.trim(),
+            tenantAccessCode: code,
+          }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (res.ok && data?.user) {
+          backendOk = true;
+          backendUser = data.user;
+        } else {
+          backendError = data.error || data.message || `HTTP ${res.status}`;
+        }
+      } catch (e) {
+        backendError = e.message || "Backend unreachable";
+      }
+
+      if (backendOk && backendUser) {
+        const all = getAllUsers();
+        const cleanUser = {
+          ...backendUser,
+          email: norm(backendUser.email || f.email),
+          password: f.password,
+          registeredAt: backendUser.registeredAt || new Date().toLocaleString("en-IN"),
+        };
+
+        if (!all.some(u => norm(u.email) === norm(cleanUser.email))) {
+          saveAllUsers([...all, cleanUser]);
+        } else {
+          saveAllUsers(all.map(u => norm(u.email) === norm(cleanUser.email) ? { ...u, ...cleanUser } : u));
+        }
+
+        if (cleanUser.tenantId) {
+          saveTenant(cleanUser.tenantId, {
+            name: f.org.trim(),
+            adminEmail: norm(f.email),
+            tenantId: cleanUser.tenantId,
+            subTenantId: cleanUser.subTenantId || cleanUser.tenantId,
+            active: cleanUser.status === "approved",
+            createdAt: new Date().toLocaleString("en-IN"),
+            adminAccessCode: cleanUser.adminAccessCode,
+            accessCodeUsed: code,
+          });
+        }
+
+        try {
+          const codes = getAllTenantAccessCodes();
+          const key = Object.keys(codes).find(k => String(k).toUpperCase() === code);
+          if (key) {
+            codes[key] = { ...(codes[key] || {}), used: true, usedBy: norm(f.email), usedAt: Date.now(), code };
+            localStorage.setItem("tenantAccessCodes", JSON.stringify(codes));
+          }
+        } catch (_) {}
+
+        setSuccess({
+          org: f.org.trim(),
+          email: norm(f.email),
+          adminCode: cleanUser.adminAccessCode,
+        });
+
+        setLoading(false);
+        return;
+      }
+
+      /* Fallback: keep old localStorage registration logic for local/dev cases. */
+      const r = registerClientAdmin({
+        name: f.name.trim(),
+        email: f.email.trim(),
+        password: f.password,
+        orgName: f.org.trim(),
+        tenantAccessCode: code,
+      });
+
+      if (r.error) {
+        const msg = String(backendError || r.error || "");
+        if (
+          r.error.includes("Invalid or expired") ||
+          msg.toLowerCase().includes("invalid") ||
+          msg.toLowerCase().includes("used")
+        ) {
+          setErr(`Access code "${code}" is invalid or has already been used. Please ask Tervies to generate a new code.`);
+        } else {
+          setErr(r.error);
+        }
+        setLoading(false);
+        return;
+      }
+
+      setSuccess({
+        org: f.org.trim(),
+        email: norm(f.email),
+        adminCode: r.adminAccessCode,
+      });
+    } catch (e) {
+      console.error("Company registration failed:", e);
+      setErr("Company registration failed. Please try again.");
+    }
+
+    setLoading(false);
+  };
+
+  /* ── JOIN COMPANY ─────────────────────────────────────────────────────── */
+  const handleJoinCompany = async () => {
+    setErr(null);
+    setLoading(true);
+
+    try {
+      if (!f.name.trim() || !f.email.trim() || f.password.length < 6) {
+        setErr("Please fill in all fields.");
+        setLoading(false);
+        return;
+      }
+
+      const code = f.code.trim();
+
+      if (!code) {
+        setErr("Please enter the access code your company admin gave you.");
+        setLoading(false);
+        return;
+      }
+
+      const r = await registerClientTeam({
+        name: f.name.trim(),
+        email: f.email.trim(),
+        password: f.password,
+        adminAccessCode: code,
+      });
+
+      if (r.error) {
+        setErr(r.error);
+        setLoading(false);
+        return;
+      }
+
+      setPending(true);
+    } catch (e) {
+      console.error("Team registration failed:", e);
+      setErr("Team registration failed. Please try again.");
+    }
+
+    setLoading(false);
+  };
+
+  if (success) {
+    return (
+      <div className="lr">
+        <div className="lcard">
+          <div className="lcard-stripe" />
+          <div className="lcard-body">
+            <div className="lbrand">
+              <div className="lbrand-icon">🏢</div>
+              <div>
+                <div className="lbrand-name">TERVIES Portal</div>
+                <div className="lbrand-sub">BGV System</div>
+              </div>
+            </div>
+            <div className="lscreen">
+              <div className="lscreen-ico">🎉</div>
+              <div className="lscreen-title">Company Registered!</div>
+              <div className="lscreen-text">
+                <strong>{success.org}</strong> has been submitted for review.
+                Tervies will activate your account. You'll be notified once approved.
+              </div>
+              <div className="lcode-box">
+                <div className="lcode-box-label">🔑 Your Team Access Code</div>
+                <code className="lcode-box-val">{success.adminCode}</code>
+                <div className="lcode-box-note">
+                  <strong>Save this immediately.</strong> Share it with your team members so they can
+                  register under your company account using the <em>"Join Company"</em> tab.
+                </div>
+              </div>
+              <div className="lbadge lb-amber" style={{ margin: "0 auto 18px" }}>
+                ⏳ Awaiting Tervies Approval
+              </div>
+              <button className="lbtn lb-blue" onClick={() => { setSuccess(null); switchTab("signin"); }}>
+                🔐 Back to Sign In
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (pending) {
+    const isStaff = tab === "staff";
+    return (
+      <div className="lr">
+        <div className="lcard">
+          <div className="lcard-stripe" />
+          <div className="lcard-body">
+            <div className="lbrand">
+              <div className="lbrand-icon">🛡️</div>
+              <div>
+                <div className="lbrand-name">TERVIES Portal</div>
+                <div className="lbrand-sub">BGV System</div>
+              </div>
+            </div>
+            <div className="lscreen">
+              <div className="lscreen-ico">📬</div>
+              <div className="lscreen-title">Request Submitted!</div>
+              <div className="lscreen-text">
+                {isStaff
+                  ? "Your staff request is pending. Tervies admin will review and approve your account."
+                  : "Your request is pending. Your company admin will review and approve your account once they're set up."}
+              </div>
+              <div className="lbadge lb-amber" style={{ margin: "0 auto 20px" }}>
+                ⏳ Awaiting Approval
+              </div>
+              <button className="lbtn lb-blue" onClick={() => { setPending(false); switchTab("signin"); }}>
+                ← Back to Sign In
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="lr">
+      <div className="lcard">
+        <div className="lcard-stripe" />
+        <div className="lcard-body">
+          <div className="lbrand">
+            <div className="lbrand-icon">🛡️</div>
+            <div>
+              <div className="lbrand-name">TERVIES Portal</div>
+              <div className="lbrand-sub">Background Verification System</div>
+            </div>
+          </div>
+
+          <div className="ltabs">
+            <button className={`ltab ${tab === "signin" ? "on" : ""}`} onClick={() => switchTab("signin")}>🔐 Sign In</button>
+            <button className={`ltab ${tab === "staff" ? "on" : ""}`} onClick={() => switchTab("staff")}>👤 Join as Staff</button>
+            <button className={`ltab ${tab === "company" ? "on" : ""}`} onClick={() => switchTab("company")}>🏢 Company Access</button>
+          </div>
+
+          {err && (
+            <div className="lalert la-err">
+              <span style={{ flexShrink: 0 }}>❌</span>
+              <span>{err}</span>
+            </div>
+          )}
+
+          {tab === "signin" && (
+            <>
+              <div className="lh1">Welcome back</div>
+              <div className="lh2">Sign in to your TERVIES BGV Portal account.</div>
+
+              <div className="lfield">
+                <label className="llabel">Email Address</label>
+                <input
+                  className="linput"
+                  type="email"
+                  placeholder="you@company.com"
+                  value={f.email}
+                  onChange={e => set("email", e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleSignIn()}
+                  autoComplete="email"
+                />
+              </div>
+
+              <div className="lfield">
+                <label className="llabel">Password</label>
+                <input
+                  className="linput"
+                  type="password"
+                  placeholder="••••••••"
+                  value={f.password}
+                  onChange={e => set("password", e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleSignIn()}
+                  autoComplete="current-password"
+                />
+              </div>
+
+              <button className="lbtn lb-blue" onClick={handleSignIn} disabled={loading}>
+                {loading ? <><span className="spin" /> Signing in…</> : "🔐 Sign In"}
+              </button>
+
+              <div className="lnotice ln-amber" style={{ marginTop: 12, marginBottom: 0 }}>
+                <span className="ln-icon">🔑</span>
+                <span>
+                  Forgot password? Ask your Super Admin/Admin to open <strong>Manage Users</strong> and click
+                  <strong> Reset Password</strong> beside your account.
+                </span>
+              </div>
+
+           
+              <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--ink4)", marginBottom: 8 }}>
+                  Access levels
+                </div>
+                <div className="lroles">
+                  {[
+                    { i: "👑", n: "Super Admin", d: "You — manages everything, generates access codes" },
+                    { i: "👤", n: "Tervies Staff", d: "Your team — approved by you directly" },
+                    { i: "🔑", n: "Company Admin", d: "Client company admin — needs TAC code from you" },
+                    { i: "🏢", n: "Company Team", d: "Client staff — needs access code from their admin" },
+                  ].map(r => (
+                    <div key={r.n} className="lrole">
+                      <span className="lrole-i">{r.i}</span>
+                      <div>
+                        <div className="lrole-n">{r.n}</div>
+                        <div className="lrole-d">{r.d}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {tab === "staff" && (
+            <>
+              <div className="lh1">Join as Tervies Staff</div>
+              <div className="lh2">Register as an internal team member. The Tervies admin will approve your account.</div>
+
+              <div className="lnotice ln-blue">
+                <span className="ln-icon">ℹ️</span>
+                <span>
+                  This is for <strong>Tervies employees only</strong>.
+                  If you work for a client company, use the <strong>"Company Access"</strong> tab.
+                </span>
+              </div>
+
+              <Steps vals={[!!f.name.trim(), !!f.email.trim(), f.password.length >= 6]} />
+
+              <div className="lfield">
+                <label className="llabel">Your Full Name</label>
+                <input className="linput" placeholder="Jane Smith" value={f.name} onChange={e => set("name", e.target.value)} />
+              </div>
+
+              <div className="lfield">
+                <label className="llabel">Work Email</label>
+                <input className="linput" type="email" placeholder="jane@tervies.com" value={f.email} onChange={e => set("email", e.target.value)} />
+              </div>
+
+              <div className="lfield">
+                <label className="llabel">Password</label>
+                <input className="linput" type="password" placeholder="Minimum 6 characters" value={f.password} onChange={e => set("password", e.target.value)} onKeyDown={e => e.key === "Enter" && handleStaff()} />
+                <PwBar pw={f.password} />
+              </div>
+
+              <button className="lbtn lb-blue" onClick={handleStaff} disabled={!f.name || !f.email || f.password.length < 6}>
+                👤 Submit Staff Request
+              </button>
+
+              <div className="lfooter">
+                Already have an account? <a onClick={() => switchTab("signin")}>Sign in</a>
+              </div>
+            </>
+          )}
+
+          {tab === "company" && (
+            <>
+              <div className="lstabs">
+                <button className={`lstab ${subtab === "register" ? "on" : ""}`} onClick={() => switchSub("register")}>
+                  🏢 Register Company
+                </button>
+                <button className={`lstab ${subtab === "join" ? "on" : ""}`} onClick={() => switchSub("join")}>
+                  🔗 Join Company
+                </button>
+              </div>
+
+              {subtab === "register" && (
+                <>
+                  <div className="lh1">Register Your Company</div>
+                  <div className="lh2">Set up your company's BGV portal. You need a Tenant Access Code from Tervies.</div>
+
+                  <div className="lhowto">
+                    <div className="lhowto-title">How to get a Tenant Access Code</div>
+                    <div className="lhowto-steps">
+                      {[
+                        { n: 1, t: <>Contact Tervies at <strong>superadmin@tervies.com</strong> to request access.</> },
+                        { n: 2, t: <>Tervies generates a unique code <strong>(TAC-XXXXX-XXXXXX)</strong> for your company.</> },
+                        { n: 3, t: <>Enter that code below to create your company account.</> },
+                        { n: 4, t: <>Once Tervies approves, you can sign in and start using the portal.</> },
+                      ].map(s => (
+                        <div key={s.n} className="lhowto-step">
+                          <div className="lhowto-num">{s.n}</div>
+                          <div className="lhowto-text">{s.t}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <Steps vals={[!!f.name.trim(), !!f.email.trim(), f.password.length >= 6, !!f.org.trim(), !!f.code.trim()]} />
+
+                  <div className="lfield">
+                    <label className="llabel">Your Full Name</label>
+                    <input className="linput" placeholder="Priya Sharma" value={f.name} onChange={e => set("name", e.target.value)} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Company Name</label>
+                    <input className="linput" placeholder="Acme Pvt Ltd" value={f.org} onChange={e => set("org", e.target.value)} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Work Email</label>
+                    <input className="linput" type="email" placeholder="admin@acme.com" value={f.email} onChange={e => set("email", e.target.value)} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Password</label>
+                    <input className="linput" type="password" placeholder="Minimum 6 characters" value={f.password} onChange={e => set("password", e.target.value)} />
+                    <PwBar pw={f.password} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Tenant Access Code</label>
+                    <input
+                      className="lcode"
+                      placeholder="TAC-XXXXXXXX-XXXXXX  (from Tervies)"
+                      value={f.code}
+                      onChange={e => set("code", e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && handleCompanyRegister()}
+                    />
+                    <div className="linput-note">
+                      This code is generated for you by Tervies. Each code is single-use.
+                      Email <strong>superadmin@tervies.com</strong> if you need one.
+                    </div>
+                  </div>
+
+                  <button className="lbtn lb-purple" onClick={handleCompanyRegister} disabled={!f.name || !f.org || !f.email || f.password.length < 6}>
+                    🏢 Register Company
+                  </button>
+
+                  <div className="lfooter">
+                    Already registered? <a onClick={() => switchTab("signin")}>Sign in</a>
+                  </div>
+                </>
+              )}
+
+              {subtab === "join" && (
+                <>
+                  <div className="lh1">Join Your Company</div>
+                  <div className="lh2">Register as a team member under your company. Ask your company admin for their team access code.</div>
+
+                  <div className="lnotice ln-green">
+                    <span className="ln-icon">💡</span>
+                    <span>
+                      Ask your <strong>company admin</strong> for their <strong>Team Access Code</strong>.
+                      It looks like: <code style={{ fontFamily: "var(--mono)", fontSize: 12 }}>XXXXXX-XXXXXX-XXXXXX</code>
+                    </span>
+                  </div>
+
+                  <Steps vals={[!!f.name.trim(), !!f.email.trim(), f.password.length >= 6, !!f.code.trim()]} />
+
+                  <div className="lfield">
+                    <label className="llabel">Your Full Name</label>
+                    <input className="linput" placeholder="Rahul Verma" value={f.name} onChange={e => set("name", e.target.value)} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Your Email</label>
+                    <input className="linput" type="email" placeholder="rahul@acme.com" value={f.email} onChange={e => set("email", e.target.value)} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Password</label>
+                    <input className="linput" type="password" placeholder="Minimum 6 characters" value={f.password} onChange={e => set("password", e.target.value)} />
+                    <PwBar pw={f.password} />
+                  </div>
+
+                  <div className="lfield">
+                    <label className="llabel">Company Admin Access Code</label>
+                    <input
+                      className="lcode"
+                      placeholder="XXXXXX-XXXXXX-XXXXXX-XXXXXX"
+                      value={f.code}
+                      onChange={e => set("code", e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && handleJoinCompany()}
+                    />
+                    <div className="linput-note">
+                      Your admin gets this code after their company is approved.
+                      They share it with team members to link accounts.
+                    </div>
+                  </div>
+
+                  <button className="lbtn lb-green" onClick={handleJoinCompany} disabled={!f.name || !f.email || f.password.length < 6 || !f.code.trim()}>
+                    🔗 Join Company Team
+                  </button>
+
+                  <div className="lfooter">
+                    Already have an account? <a onClick={() => switchTab("signin")}>Sign in</a>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+}

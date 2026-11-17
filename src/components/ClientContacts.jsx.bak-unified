@@ -1,0 +1,299 @@
+// src/components/ClientContacts.jsx
+// Admin-only: manage client email contacts (TO + CC) for manual case-mail sends.
+// Mirrors the VendorContacts screen layout for consistency.
+
+import { useState, useEffect, useRef } from "react";
+import { clientContactsAPI } from "../api/api";
+
+/* ── helpers ── */
+function isValidEmail(e = "") {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || "").trim());
+}
+
+/* ── CC chip input ── */
+function CcChips({ chips, onChange }) {
+  const [input, setInput] = useState("");
+  const inputRef = useRef(null);
+
+  const addChip = (raw) => {
+    const val = raw.trim().toLowerCase();
+    if (!val) return;
+    const news = val.split(/[,;]+/).map(s => s.trim()).filter(s => s && !chips.includes(s));
+    if (news.length) onChange([...chips, ...news]);
+    setInput("");
+  };
+
+  const removeChip = (idx) => onChange(chips.filter((_, i) => i !== idx));
+
+  return (
+    <div
+      onClick={() => inputRef.current?.focus()}
+      style={{ display:"flex", flexWrap:"wrap", gap:6, padding:"7px 10px", borderRadius:"var(--r8)", border:"1.5px solid var(--border2)", background:"var(--card)", cursor:"text", minHeight:38 }}
+    >
+      {chips.map((c, i) => (
+        <span key={i} style={{ display:"inline-flex", alignItems:"center", gap:4, background:"rgba(37,99,235,0.10)", border:"1px solid rgba(37,99,235,0.22)", borderRadius:99, padding:"2px 8px", fontSize:12, color:"var(--accent)", fontFamily:"var(--head)", fontWeight:600 }}>
+          {c}
+          <span onClick={() => removeChip(i)} style={{ cursor:"pointer", opacity:0.6, fontWeight:700 }}>×</span>
+        </span>
+      ))}
+      <input
+        ref={inputRef}
+        value={input}
+        onChange={e => setInput(e.target.value)}
+        onKeyDown={e => {
+          if (["Enter","Tab",","," "].includes(e.key)) { e.preventDefault(); addChip(input); }
+          if (e.key === "Backspace" && !input && chips.length) removeChip(chips.length - 1);
+        }}
+        onBlur={() => addChip(input)}
+        placeholder={chips.length ? "" : "Type email, press Enter or comma"}
+        style={{ border:"none", outline:"none", background:"transparent", fontSize:13, color:"var(--text)", minWidth:180, flex:1 }}
+      />
+    </div>
+  );
+}
+
+const EMPTY_FORM = { clientName:"", email:"", ccList:[], isActive:true };
+
+export default function ClientContacts() {
+  const [tab,       setTab]       = useState("list");   // "list" | "import"
+  const [contacts,  setContacts]  = useState([]);
+  const [loading,   setLoading]   = useState(true);
+  const [error,     setError]     = useState("");
+
+  // Add/Edit form
+  const [form,      setForm]      = useState(EMPTY_FORM);
+  const [editId,    setEditId]    = useState(null);
+  const [saving,    setSaving]    = useState(false);
+  const [formError, setFormError] = useState("");
+  const [formOk,    setFormOk]    = useState("");
+
+  // Bulk import
+  const [importFile,    setImportFile]    = useState(null);
+  const [importing,     setImporting]     = useState(false);
+  const [importResult,  setImportResult]  = useState(null);
+  const [importError,   setImportError]   = useState("");
+  const fileRef = useRef(null);
+
+  const load = () => {
+    setLoading(true);
+    clientContactsAPI.list()
+      .then(d => { setContacts(Array.isArray(d?.contacts) ? d.contacts : []); setError(""); })
+      .catch(e => setError(e.message || "Failed to load"))
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const resetForm = () => { setForm(EMPTY_FORM); setEditId(null); setFormError(""); setFormOk(""); };
+
+  const handleEdit = (c) => {
+    setForm({ clientName: c.clientName, email: c.email || "", ccList: c.ccList || [], isActive: c.isActive !== false });
+    setEditId(c._id);
+    setFormError(""); setFormOk("");
+    setTab("list");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleDelete = async (c) => {
+    if (!window.confirm(`Delete contact for "${c.clientName}"?`)) return;
+    try {
+      await clientContactsAPI.remove(c._id);
+      setContacts(prev => prev.filter(x => x._id !== c._id));
+    } catch (e) { alert("Delete failed: " + e.message); }
+  };
+
+  const handleSave = async () => {
+    setFormError(""); setFormOk("");
+    if (!form.clientName.trim()) { setFormError("Client name is required."); return; }
+    if (!form.email.trim()) { setFormError("Email address is required."); return; }
+    if (!isValidEmail(form.email)) { setFormError("Invalid email address."); return; }
+    const badCc = form.ccList.filter(e => !isValidEmail(e));
+    if (badCc.length) { setFormError(`Invalid CC email(s): ${badCc.join(", ")}`); return; }
+
+    setSaving(true);
+    try {
+      const body = { clientName: form.clientName.trim(), email: form.email.trim().toLowerCase(), ccList: form.ccList, isActive: form.isActive };
+      if (editId) {
+        const d = await clientContactsAPI.update(editId, body);
+        setContacts(prev => prev.map(x => x._id === editId ? d.contact : x));
+        setFormOk("Contact updated.");
+      } else {
+        const d = await clientContactsAPI.create(body);
+        setContacts(prev => {
+          const exists = prev.find(x => x._id === d.contact._id);
+          return exists ? prev.map(x => x._id === d.contact._id ? d.contact : x) : [...prev, d.contact];
+        });
+        setFormOk("Contact saved.");
+      }
+      resetForm();
+    } catch (e) { setFormError(e.message || "Save failed."); }
+    finally { setSaving(false); }
+  };
+
+  const handleImport = async () => {
+    if (!importFile) return;
+    setImporting(true); setImportResult(null); setImportError("");
+    try {
+      const result = await clientContactsAPI.bulkImport(importFile);
+      setImportResult(result);
+      load();
+    } catch (e) { setImportError(e.message || "Import failed."); }
+    finally { setImporting(false); }
+  };
+
+  const inputStyle = { padding:"8px 10px", borderRadius:"var(--r8)", border:"1.5px solid var(--border2)", background:"var(--card)", color:"var(--text)", fontSize:13, width:"100%" };
+  const labelStyle = { fontSize:11, fontFamily:"var(--head)", fontWeight:600, color:"var(--text3)", textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:4, display:"block" };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+
+      {/* Header */}
+      <div style={{ background:"var(--card)", border:"1.5px solid var(--border2)", borderRadius:"var(--r16)", padding:"20px 24px", boxShadow:"var(--shadow)" }}>
+        <div style={{ fontFamily:"var(--head)", fontSize:17, fontWeight:700, color:"var(--text)", marginBottom:4 }}>📬 Client Contacts</div>
+        <div style={{ fontSize:13, color:"var(--text3)" }}>Store client email + CC for "Send to Client" on case rows. Admin-only.</div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display:"flex", gap:8 }}>
+        {[["list","📋 Contacts"], ["import","📥 Bulk Import"]].map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)}
+            style={{ fontFamily:"var(--head)", fontSize:13, fontWeight:600, padding:"8px 18px", borderRadius:"var(--r8)", border:"1.5px solid var(--border2)", cursor:"pointer", background: tab===id ? "var(--accentg)" : "var(--card)", color: tab===id ? "#fff" : "var(--text)" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── LIST TAB ── */}
+      {tab === "list" && (
+        <>
+          {/* Add / Edit form */}
+          <div style={{ background:"var(--card)", border:"1.5px solid var(--border2)", borderRadius:"var(--r16)", padding:"22px 24px", boxShadow:"var(--shadow)" }}>
+            <div style={{ fontFamily:"var(--head)", fontSize:14, fontWeight:700, color:"var(--text)", marginBottom:16 }}>
+              {editId ? "✏️ Edit Contact" : "➕ Add Contact"}
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+              <label>
+                <span style={labelStyle}>Client Name</span>
+                <input value={form.clientName} onChange={e => setForm(f => ({...f, clientName: e.target.value}))}
+                  placeholder="Exact client name from records" style={inputStyle} />
+              </label>
+              <label>
+                <span style={labelStyle}>Email (TO)</span>
+                <input value={form.email} onChange={e => setForm(f => ({...f, email: e.target.value}))}
+                  placeholder="client@company.com" type="email" style={inputStyle} />
+              </label>
+            </div>
+            <div style={{ marginTop:12 }}>
+              <span style={labelStyle}>CC Emails (optional — type and press Enter or comma)</span>
+              <CcChips chips={form.ccList} onChange={cc => setForm(f => ({...f, ccList: cc}))} />
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:14, flexWrap:"wrap" }}>
+              <label style={{ display:"flex", alignItems:"center", gap:6, fontSize:13, color:"var(--text)", cursor:"pointer" }}>
+                <input type="checkbox" checked={form.isActive} onChange={e => setForm(f => ({...f, isActive: e.target.checked}))} />
+                Active
+              </label>
+              <div style={{ flex:1 }} />
+              {editId && (
+                <button onClick={resetForm} style={{ fontFamily:"var(--head)", fontSize:12, fontWeight:600, padding:"7px 14px", borderRadius:"var(--r8)", border:"1.5px solid var(--border2)", background:"transparent", color:"var(--text)", cursor:"pointer" }}>
+                  Cancel
+                </button>
+              )}
+              <button onClick={handleSave} disabled={saving}
+                style={{ fontFamily:"var(--head)", fontSize:13, fontWeight:600, padding:"8px 20px", borderRadius:"var(--r8)", border:"none", background: saving ? "rgba(37,99,235,0.3)" : "var(--accentg)", color:"#fff", cursor: saving ? "not-allowed" : "pointer" }}>
+                {saving ? "Saving…" : (editId ? "Update" : "Save Contact")}
+              </button>
+            </div>
+            {formError && <div style={{ marginTop:10, fontSize:13, color:"#b91c1c", background:"rgba(239,68,68,0.07)", borderRadius:"var(--r8)", padding:"8px 12px" }}>⚠️ {formError}</div>}
+            {formOk    && <div style={{ marginTop:10, fontSize:13, color:"#059669", background:"rgba(16,185,129,0.07)", borderRadius:"var(--r8)", padding:"8px 12px" }}>✓ {formOk}</div>}
+          </div>
+
+          {/* Contact list */}
+          {loading && <div style={{ textAlign:"center", padding:"32px 0", color:"var(--text3)", fontSize:14 }}>Loading…</div>}
+          {!loading && error && <div style={{ background:"rgba(239,68,68,0.07)", border:"1px solid rgba(239,68,68,0.28)", borderRadius:"var(--r12)", padding:"14px 18px", fontSize:13, color:"#b91c1c" }}>⚠️ {error}</div>}
+          {!loading && !error && contacts.length === 0 && (
+            <div style={{ background:"var(--card)", border:"1.5px dashed var(--border2)", borderRadius:"var(--r16)", padding:"40px 24px", textAlign:"center" }}>
+              <div style={{ fontSize:36, marginBottom:10, opacity:0.2 }}>📬</div>
+              <div style={{ fontFamily:"var(--head)", fontSize:15, fontWeight:700, color:"var(--text3)" }}>No contacts yet</div>
+              <div style={{ fontSize:13, color:"var(--text3)", marginTop:4 }}>Add a contact above or use Bulk Import.</div>
+            </div>
+          )}
+          {!loading && !error && contacts.length > 0 && (
+            <div style={{ background:"var(--card)", border:"1.5px solid var(--border2)", borderRadius:"var(--r16)", boxShadow:"var(--shadow)", overflow:"hidden" }}>
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse" }}>
+                  <thead>
+                    <tr style={{ background:"rgba(37,99,235,0.04)" }}>
+                      {["Client Name","Email (TO)","CC","Status","Actions"].map(h => (
+                        <th key={h} style={{ padding:"9px 16px", textAlign:"left", fontFamily:"var(--head)", fontSize:11, fontWeight:600, color:"var(--text3)", letterSpacing:"0.06em", textTransform:"uppercase", borderBottom:"1px solid var(--border2)", whiteSpace:"nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {contacts.map((c, i) => (
+                      <tr key={c._id} style={{ borderBottom: i < contacts.length-1 ? "1px solid var(--border2)" : "none", background: i%2===0 ? "transparent" : "rgba(37,99,235,0.02)" }}>
+                        <td style={{ padding:"11px 16px", fontSize:13, fontFamily:"var(--head)", fontWeight:600, color:"var(--text)" }}>{c.clientName}</td>
+                        <td style={{ padding:"11px 16px", fontSize:12, color:"var(--text)" }}>{c.email || <span style={{color:"var(--text3)"}}>—</span>}</td>
+                        <td style={{ padding:"11px 16px", fontSize:12, color:"var(--text3)", maxWidth:220 }}>
+                          {(c.ccList||[]).length > 0
+                            ? (c.ccList||[]).join(", ")
+                            : <span style={{color:"var(--text3)"}}>—</span>}
+                        </td>
+                        <td style={{ padding:"11px 16px" }}>
+                          <span style={{ fontSize:11, fontFamily:"var(--head)", fontWeight:700, padding:"2px 8px", borderRadius:99, background: c.isActive ? "rgba(16,185,129,0.10)" : "rgba(239,68,68,0.08)", color: c.isActive ? "#059669" : "#b91c1c", border: `1px solid ${c.isActive ? "rgba(16,185,129,0.25)" : "rgba(239,68,68,0.25)"}` }}>
+                            {c.isActive ? "Active" : "Inactive"}
+                          </span>
+                        </td>
+                        <td style={{ padding:"11px 16px", whiteSpace:"nowrap" }}>
+                          <div style={{ display:"flex", gap:6 }}>
+                            <button onClick={() => handleEdit(c)} style={{ fontFamily:"var(--head)", fontSize:11, fontWeight:600, padding:"5px 11px", borderRadius:"var(--r8)", border:"1.5px solid var(--border2)", background:"transparent", color:"var(--accent)", cursor:"pointer" }}>Edit</button>
+                            <button onClick={() => handleDelete(c)} style={{ fontFamily:"var(--head)", fontSize:11, fontWeight:600, padding:"5px 11px", borderRadius:"var(--r8)", border:"1.5px solid rgba(239,68,68,0.30)", background:"rgba(239,68,68,0.06)", color:"#b91c1c", cursor:"pointer" }}>Delete</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── BULK IMPORT TAB ── */}
+      {tab === "import" && (
+        <div style={{ background:"var(--card)", border:"1.5px solid var(--border2)", borderRadius:"var(--r16)", padding:"24px", boxShadow:"var(--shadow)", display:"flex", flexDirection:"column", gap:16 }}>
+          <div style={{ fontFamily:"var(--head)", fontSize:14, fontWeight:700, color:"var(--text)" }}>📥 Bulk Import from Excel</div>
+          <div style={{ fontSize:13, color:"var(--text3)", lineHeight:1.6 }}>
+            Upload an <b>.xlsx</b> file with columns: <b>Client Name</b>, <b>Email</b>, <b>CC</b> (optional — multiple emails separated by comma/semicolon).<br/>
+            Upserts by client name — existing contacts are updated, new ones are created.
+          </div>
+
+          <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+            <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={e => { setImportFile(e.target.files[0] || null); setImportResult(null); setImportError(""); }}
+              style={{ fontSize:13, color:"var(--text)" }} />
+            <button onClick={handleImport} disabled={!importFile || importing}
+              style={{ fontFamily:"var(--head)", fontSize:13, fontWeight:600, padding:"8px 20px", borderRadius:"var(--r8)", border:"none", background: !importFile||importing ? "rgba(37,99,235,0.3)" : "var(--accentg)", color:"#fff", cursor: !importFile||importing ? "not-allowed" : "pointer", whiteSpace:"nowrap" }}>
+              {importing ? "Importing…" : "Import"}
+            </button>
+          </div>
+
+          {importError && <div style={{ fontSize:13, color:"#b91c1c", background:"rgba(239,68,68,0.07)", borderRadius:"var(--r8)", padding:"10px 14px" }}>⚠️ {importError}</div>}
+
+          {importResult && (
+            <div style={{ fontSize:13, background:"rgba(16,185,129,0.07)", border:"1px solid rgba(16,185,129,0.22)", borderRadius:"var(--r8)", padding:"12px 16px", lineHeight:1.7 }}>
+              <b style={{ color:"#059669" }}>✓ Import complete</b><br/>
+              Added: <b>{importResult.added}</b> · Updated: <b>{importResult.updated}</b> · Skipped: <b>{importResult.skipped}</b>
+              {importResult.errors?.length > 0 && (
+                <div style={{ marginTop:8, color:"#b91c1c" }}>
+                  <b>Issues:</b>
+                  <ul style={{ margin:"4px 0 0 16px", padding:0 }}>
+                    {importResult.errors.map((e, i) => <li key={i}>{e}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,128 @@
+// bgv-backend/models/Record.js
+import mongoose from "mongoose";
+
+const RecordSchema = new mongoose.Schema({
+
+  // ── METADATA ────────────────────────────────────────────────────────────
+  uploadedBy:  { type: String,  default: "",    trim: true },
+  uploadBatch:    { type: String,  default: "" },
+  dailyUploadId:  { type: String,  default: "" }, // links to DailyUpload doc; set at import time for future bulk delete
+  uploadedAt:     { type: Date,    default: Date.now },
+  tenantId:    { type: String,  default: null,  trim: true },
+
+  // ── NORMALISED FIELDS ────────────────────────────────────────────────────
+  clientName:    { type: String, default: "", trim: true },
+  candidateName: { type: String, default: "", trim: true },
+  checkName:     { type: String, default: "", trim: true },
+  status:        { type: String, default: "Pending", trim: true },
+  city:          { type: String, default: "", trim: true },
+  state:         { type: String, default: "", trim: true },
+  assignedDate:  { type: Date,   default: null },
+
+  // ── INSUFF FIELDS ─────────────────────────────────────────────────────────
+  insuffRemark:      { type: String, default: "" },
+  insuffDate:        { type: Date,   default: null },
+  insuffClearDate:   { type: Date,   default: null },
+  insuffClearRemark: { type: String, default: "" },
+
+  // ── OPERATIONAL FIELDS (editable in table) ──────────────────────────────
+  rate:       { type: Number, default: 0 },
+  agent:      { type: String, default: "", trim: true },
+  assignDate: { type: String, default: "" },
+
+  // ── REPORT FIELDS ────────────────────────────────────────────────────────
+  reportFile:       { type: String,  default: "" },
+  reportFileName:   { type: String,  default: "" },
+  reportUploaded:   { type: Boolean, default: false },
+  reportUploadedAt: { type: Date,    default: null },
+  reportUploadedBy: { type: String,  default: "" },
+  // Set once a report is uploaded to (or migrated to) S3. Bucket/region come
+  // from env, not stored per-record. Presence of this field is what the view
+  // endpoint uses to decide S3-presigned-URL vs legacy local-file serving.
+  reportS3Key:      { type: String,  default: "" },
+
+  // ── REPORT SENT MARKER (first-send-wins; set by admin via Sent Reports) ──
+  reportSentAt:      { type: Date,   default: null },
+  reportSentBy:      { type: String, default: "" },
+  reportSentChannel: { type: String, default: "" },
+
+  // ── EXTRA APPROVAL ────────────────────────────────────────────────────────
+  extraApproved: { type: Boolean, default: false },
+  extraAmount:   { type: Number,  default: 0 },
+
+  // ── SPECIAL BILLING OVERRIDE (super-admin only) ───────────────────────────
+  isSpecialCase:      { type: Boolean, default: false },
+  specialBillingDate: { type: Date,    default: null  },
+
+  // ── RAW EXCEL ROW ────────────────────────────────────────────────────────
+  rawData: { type: mongoose.Schema.Types.Mixed, default: {} },
+
+  // Only set when a row has BOTH a Check Id and an Address (see addRecord) —
+  // `${tenantId}::${normalizedCheckId}::${normalizedAddress}`. Backs the
+  // unique index below, which is the atomic backstop for the find-then-
+  // create duplicate check in addRecord: under a large concurrent batch
+  // upload, two identical rows can both pass the find-check before either
+  // has finished saving (classic TOCTOU race) and both get created. The
+  // find-check alone can't prevent that; only a DB-level constraint can.
+  dedupeKey: { type: String, default: undefined },
+
+}, {
+  strict: false,   // allow extra fields from rawData merges
+  timestamps: false,
+});
+
+// ── INDEXES ──────────────────────────────────────────────────────────────────
+RecordSchema.index({ tenantId:    1 });
+RecordSchema.index({ clientName:  1 });
+RecordSchema.index({ uploadedBy:  1 });
+RecordSchema.index({ uploadedAt: -1 });
+RecordSchema.index({ uploadBatch:   1 });
+RecordSchema.index({ dailyUploadId: 1 });
+RecordSchema.index({ reportUploadedAt: -1 });
+RecordSchema.index({ reportSentAt: 1 });
+RecordSchema.index({ status:      1 });
+RecordSchema.index({ state:       1 });
+RecordSchema.index({ city:        1 });
+RecordSchema.index({ assignedDate:-1 });
+
+RecordSchema.index({ tenantId: 1, clientName:  1 });
+RecordSchema.index({ tenantId: 1, status:      1 });
+RecordSchema.index({ tenantId: 1, uploadedAt: -1 });
+RecordSchema.index({ clientName: 1, status:    1 });
+RecordSchema.index({ uploadedBy: 1, uploadedAt:-1 });
+RecordSchema.index({ clientName: 1, uploadedAt:-1 });
+RecordSchema.index({ uploadedBy: 1, clientName: 1, status: 1 });
+
+// Check Id lives in rawData (no dedicated top-level field) — this index
+// speeds up Bulk Update's server-side match (bulkMatchByCheckId) and any
+// Check Id search as record volume grows. A plain (non-unique) index: works
+// fine with duplicate Check Ids (existing app-level logic already reports
+// those as "ambiguous" and skips them) and with records that have no Check
+// Id at all (indexed as a missing/null entry, harmless).
+RecordSchema.index({ "rawData.Check Id": 1 });
+
+// Sparse: only applies to documents that actually have dedupeKey set (rows
+// with both a Check Id and an Address). Every existing record predates this
+// field and has it unset, so this can't conflict with — or need cleanup of —
+// any pre-existing data; it only guards new inserts going forward.
+RecordSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
+
+RecordSchema.index({
+  candidateName: "text",
+  clientName:    "text",
+  checkName:     "text",
+  city:          "text",
+  state:         "text",
+}, {
+  name: "record_text_search",
+  weights: {
+    candidateName: 10,
+    clientName:     8,
+    checkName:      5,
+    city:           3,
+    state:          3,
+  },
+});
+
+const Record = mongoose.model("Record", RecordSchema);
+export default Record;

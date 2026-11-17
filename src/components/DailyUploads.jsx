@@ -1,0 +1,264 @@
+// src/components/DailyUploads.jsx
+// "See Daily Upload Allocation" screen — lists saved daily Excel uploads by date,
+// each with a Download button. Read-only, no edits to any existing data.
+//
+// isVendorTeam prop: when true, the caller is a SA internal team member with at
+// least one vendor allocation. The backend already scopes rows + strips client
+// names for these users — the UI just shows a notice and relabels the counts.
+
+import { useState, useEffect } from "react";
+import { dailyUploadsAPI } from "../api/api";
+
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString("en-IN", {
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function groupByDate(uploads) {
+  const groups = {};
+  uploads.forEach(u => {
+    const key = new Date(u.createdAt).toLocaleDateString("en-IN", {
+      day: "2-digit", month: "short", year: "numeric",
+    });
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(u);
+  });
+  return Object.entries(groups); // already sorted newest-first by server
+}
+
+export default function DailyUploads({ isVendorTeam = false, canDelete = false }) {
+  const [uploads,      setUploads]      = useState([]);
+  const [loading,      setLoading]      = useState(true);
+  const [error,        setError]        = useState("");
+  const [downloading,  setDownloading]  = useState(null);
+  const [deleting,     setDeleting]     = useState(null); // upload _id being deleted
+
+  useEffect(() => {
+    setLoading(true);
+    dailyUploadsAPI.list()
+      .then(data => {
+        setUploads(Array.isArray(data?.uploads) ? data.uploads : []);
+        setError("");
+      })
+      .catch(e => setError(e.message || "Failed to load uploads"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const handleDownload = async (u) => {
+    setDownloading(u._id);
+    try {
+      await dailyUploadsAPI.download(u._id, u.originalFilename);
+    } catch (e) {
+      alert("Download failed: " + (e.message || "Unknown error"));
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  const handleDeleteFile = async (u) => {
+    const confirmed = window.confirm(
+      `Delete file "${u.originalFilename}" from the list?\n\nRecords imported from this file are NOT deleted.`
+    );
+    if (!confirmed) return;
+    setDeleting(u._id);
+    try {
+      await dailyUploadsAPI.deleteDailyUpload(u._id);
+      setUploads(prev => prev.filter(x => x._id !== u._id));
+    } catch (e) {
+      alert("Delete failed: " + (e.message || "Unknown error"));
+    } finally {
+      setDeleting(null);
+    }
+  };
+
+  const groups = groupByDate(uploads);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* Header */}
+      <div style={{
+        background: "var(--card)", border: "1.5px solid var(--border2)",
+        borderRadius: "var(--r16)", padding: "20px 24px",
+        boxShadow: "var(--shadow)",
+      }}>
+        <div style={{ fontFamily: "var(--head)", fontSize: 17, fontWeight: 700, color: "var(--text)", marginBottom: 4 }}>
+          📅 Daily Upload Allocation
+        </div>
+        <div style={{ fontSize: 13, color: "var(--text3)" }}>
+          Excel files uploaded via "Upload Daily Excel" — sorted newest first. Only uploads made after this feature was enabled are shown.
+        </div>
+      </div>
+
+      {/* Vendor-team notice */}
+      {isVendorTeam && (
+        <div style={{
+          background: "linear-gradient(135deg,rgba(124,58,237,0.07),rgba(37,99,235,0.05))",
+          border: "1.5px solid rgba(124,58,237,0.22)",
+          borderRadius: "var(--r12)", padding: "13px 18px",
+          display: "flex", alignItems: "flex-start", gap: 10,
+        }}>
+          <span style={{ fontSize: 18, flexShrink: 0 }}>🔒</span>
+          <div>
+            <div style={{ fontFamily: "var(--head)", fontSize: 13, fontWeight: 700, color: "#6d28d9" }}>
+              Vendor-filtered view
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 2 }}>
+              Only rows assigned to your allocated vendor are shown. Client names are not visible. Downloaded files contain your vendor's rows only.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loading && (
+        <div style={{ textAlign: "center", padding: "40px 0", color: "var(--text3)", fontFamily: "var(--head)", fontSize: 14 }}>
+          Loading…
+        </div>
+      )}
+
+      {!loading && error && (
+        <div style={{
+          background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.28)",
+          borderRadius: "var(--r12)", padding: "14px 18px",
+          fontFamily: "var(--head)", fontSize: 13, color: "#b91c1c",
+        }}>
+          ⚠️ {error}
+        </div>
+      )}
+
+      {!loading && !error && uploads.length === 0 && (
+        <div style={{
+          background: "var(--card)", border: "1.5px dashed var(--border2)",
+          borderRadius: "var(--r16)", padding: "48px 24px",
+          textAlign: "center", boxShadow: "var(--shadow)",
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.25 }}>📂</div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text3)" }}>
+            No uploads yet
+          </div>
+          <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 6, maxWidth: 340, margin: "8px auto 0" }}>
+            {isVendorTeam
+              ? "No uploads contain rows for your allocated vendor yet."
+              : "The next time you use \"Upload Daily Excel\", the file will appear here."}
+          </div>
+        </div>
+      )}
+
+      {!loading && !error && groups.map(([dateLabel, items]) => (
+        <div key={dateLabel} style={{
+          background: "var(--card)", border: "1.5px solid var(--border2)",
+          borderRadius: "var(--r16)", boxShadow: "var(--shadow)", overflow: "hidden",
+        }}>
+          {/* Date group header */}
+          <div style={{
+            padding: "12px 20px",
+            background: "linear-gradient(135deg,rgba(20,184,166,0.08),rgba(37,99,235,0.05))",
+            borderBottom: "1px solid var(--border2)",
+            fontFamily: "var(--head)", fontSize: 13, fontWeight: 700, color: "var(--accent)",
+            letterSpacing: "0.04em",
+          }}>
+            📅 {dateLabel} · {items.length} upload{items.length !== 1 ? "s" : ""}
+          </div>
+
+          {/* Rows */}
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ background: "rgba(37,99,235,0.04)" }}>
+                {["Time", "File", "Uploaded By",
+                  isVendorTeam ? "Your Vendor Rows" : "Total Rows",
+                  isVendorTeam ? "Vendor Rows" : "Imported",
+                  "dl", ...(canDelete ? ["del"] : [])].map(h => (
+                  <th key={h} style={{
+                    padding: "9px 16px", textAlign: "left",
+                    fontFamily: "var(--head)", fontSize: 11, fontWeight: 600,
+                    color: "var(--text3)", letterSpacing: "0.06em",
+                    textTransform: "uppercase", borderBottom: "1px solid var(--border2)",
+                    whiteSpace: "nowrap",
+                  }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((u, i) => (
+                <tr key={u._id} style={{
+                  borderBottom: i < items.length - 1 ? "1px solid var(--border2)" : "none",
+                  background: i % 2 === 0 ? "transparent" : "rgba(37,99,235,0.02)",
+                }}>
+                  <td style={{ padding: "11px 16px", fontSize: 12, color: "var(--text3)", whiteSpace: "nowrap" }}>
+                    {new Date(u.createdAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
+                  </td>
+                  <td style={{ padding: "11px 16px", fontSize: 13, color: "var(--text)", fontFamily: "var(--head)", fontWeight: 600 }}>
+                    {u.originalFilename}
+                  </td>
+                  <td style={{ padding: "11px 16px", fontSize: 12, color: "var(--text3)" }}>
+                    {u.uploaderEmail}
+                    {u.uploaderRole && (
+                      <span style={{
+                        marginLeft: 6, fontSize: 10, fontFamily: "var(--head)", fontWeight: 600,
+                        padding: "1px 6px", borderRadius: 4,
+                        background: "rgba(37,99,235,0.10)", color: "var(--accent)",
+                        textTransform: "uppercase", letterSpacing: "0.06em",
+                      }}>
+                        {u.uploaderRole}
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ padding: "11px 16px", fontSize: 13, color: "var(--text)", textAlign: "right", paddingRight: 24 }}>
+                    {u.totalRows}
+                  </td>
+                  <td style={{ padding: "11px 16px", fontSize: 13, color: "#059669", fontFamily: "var(--head)", fontWeight: 600, textAlign: "right", paddingRight: 24 }}>
+                    {u.importedRows}
+                  </td>
+                  <td style={{ padding: "11px 16px", textAlign: "right", whiteSpace: "nowrap" }}>
+                    <button
+                      onClick={() => handleDownload(u)}
+                      disabled={downloading === u._id || deleting === u._id}
+                      style={{
+                        fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+                        padding: "6px 14px", borderRadius: "var(--r8)", border: "none", cursor: "pointer",
+                        background: downloading === u._id ? "rgba(37,99,235,0.12)" : "var(--accentg)",
+                        color: downloading === u._id ? "var(--accent)" : "#fff",
+                        opacity: (downloading === u._id || deleting === u._id) ? 0.7 : 1,
+                        transition: "all 0.15s",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {downloading === u._id ? "Downloading…" : "⬇ Download"}
+                    </button>
+                  </td>
+                  {canDelete && (
+                    <td style={{ padding: "11px 16px", textAlign: "right", whiteSpace: "nowrap" }}>
+                      <button
+                        onClick={() => handleDeleteFile(u)}
+                        disabled={deleting === u._id || downloading === u._id}
+                        style={{
+                          fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+                          padding: "6px 12px", borderRadius: "var(--r8)",
+                          border: "1.5px solid rgba(239,68,68,0.35)",
+                          background: "rgba(239,68,68,0.07)",
+                          color: deleting === u._id ? "var(--text3)" : "#b91c1c",
+                          cursor: deleting === u._id ? "not-allowed" : "pointer",
+                          opacity: deleting === u._id ? 0.6 : 1,
+                          transition: "all 0.15s",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {deleting === u._id ? "Deleting…" : "🗑 Delete file"}
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  );
+}

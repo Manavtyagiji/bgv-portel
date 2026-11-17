@@ -1,0 +1,201 @@
+// src/api/api.js
+
+const LOCAL_API = "http://localhost:5002/api";
+const SERVER_API = "https://profeix.info/api";
+
+export const BASE =
+  window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1"
+    ? LOCAL_API
+    : SERVER_API;
+
+function getToken() {
+  try {
+    const u = JSON.parse(localStorage.getItem("currentUser") || "{}");
+    if (u?.token) return u.token;
+
+    return (
+      localStorage.getItem("token") ||
+      localStorage.getItem("authToken") ||
+      localStorage.getItem("jwt") ||
+      ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function req(method, path, body = null, isFormData = false) {
+  const token = getToken();
+  const headers = {};
+
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (!isFormData && body) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers,
+    body: isFormData ? body : body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    throw new Error(data.error || data.message || `HTTP ${res.status}`);
+  }
+
+  return data;
+}
+
+export const authAPI = {
+  login: (body) => req("POST", "/auth/login", body),
+  register: (body) => req("POST", "/auth/register", body),
+  sync: (body) => req("POST", "/auth/sync", body),
+  getMe: () => req("GET", "/auth/me"),
+  getUsers: () => req("GET", "/auth/users"),
+  getAllUsers: () => req("GET", "/auth/all-users"),
+  syncUsers: (users) => req("POST", "/auth/sync-users", { users }),
+  updateUser: (id, body) => req("PATCH", `/auth/users/${id}`, body),
+};
+
+export const uploadAPI = {
+  uploadExcel: async (file, clientName, tenantId) => {
+    const form = new FormData();
+    form.append("file", file);
+
+    if (clientName) form.append("clientName", clientName);
+    if (tenantId) form.append("tenantId", tenantId);
+
+    return req("POST", "/upload", form, true);
+  },
+
+  getRecords: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.fromEntries(
+        Object.entries(params).filter(
+          ([, v]) => v !== undefined && v !== null && v !== ""
+        )
+      )
+    ).toString();
+
+    return req("GET", `/upload/records${qs ? `?${qs}` : ""}`);
+  },
+
+  addRecord: (body) => req("POST", "/upload/records", body),
+  updateRecord: (id, body) => req("PATCH", `/upload/records/${id}`, body),
+  deleteRecord: (id) => req("DELETE", `/upload/records/${id}`),
+  deleteBatch: (batchId) => req("DELETE", `/upload/batch/${batchId}`),
+  getStats: () => req("GET", "/upload/stats"),
+  getReportStatus: (since) =>
+    req("GET", `/upload/report-status${since ? `?since=${encodeURIComponent(since)}` : ""}`),
+
+  uploadReportFile: async (file, recordId) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("recordId", recordId);
+
+    return req("POST", "/upload/report-file", form, true);
+  },
+};
+
+export const clientAPI = {
+  getAll: () => req("GET", "/clients"),
+  create: (body) => req("POST", "/clients", body),
+};
+
+export const pricingAPI = {
+  getAll: () => req("GET", "/pricing"),
+  saveAll: (pricingRules) => req("PUT", "/pricing", { pricingRules }),
+  saveScope: (scopeKey, rules) =>
+    req("PATCH", `/pricing/${encodeURIComponent(scopeKey)}`, { rules }),
+  deleteScope: (scopeKey) =>
+    req("DELETE", `/pricing/${encodeURIComponent(scopeKey)}`),
+  getRate: (body) => req("POST", "/pricing/get-rate", body),
+};
+
+export const dailyUploadsAPI = {
+  save: (file, { totalRows, importedRows, tenantId }) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("totalRows",     String(totalRows    || 0));
+    form.append("importedRows",  String(importedRows || 0));
+    form.append("tenantId",      tenantId || "");
+    return req("POST", "/daily-uploads", form, true);
+  },
+
+  list: () => req("GET", "/daily-uploads"),
+
+  download: async (id, filename) => {
+    const token = getToken();
+    const res = await fetch(`${BASE}/daily-uploads/${id}/download`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = filename || "daily-upload.xlsx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+};
+
+export const exportAPI = {
+  sendReport: (body) => req("POST", "/export/send", body),
+};
+
+export const auditAPI = {
+  list: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.fromEntries(
+        Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "")
+      )
+    ).toString();
+    return req("GET", `/audit${qs ? `?${qs}` : ""}`);
+  },
+};
+
+export const vendorContactsAPI = {
+  list:        ()       => req("GET",    "/vendor-contacts"),
+  create:      (body)   => req("POST",   "/vendor-contacts", body),
+  update:      (id, b)  => req("PUT",    `/vendor-contacts/${id}`, b),
+  remove:      (id)     => req("DELETE", `/vendor-contacts/${id}`),
+  getSettings: ()       => req("GET",    "/vendor-contacts/settings"),
+  saveSettings:(body)   => req("PUT",    "/vendor-contacts/settings", body),
+  getSendLog:  ()       => req("GET",    "/vendor-contacts/send-log"),
+  triggerSend: (cases)  => req("POST",   "/vendor-contacts/trigger-send", { cases }),
+  bulkImport: async (file) => {
+    const form = new FormData();
+    form.append("file", file);
+    return req("POST", "/vendor-contacts/bulk-import", form, true);
+  },
+};
+
+export const tenantSyncAPI = {
+  getUsers: () => req("GET", "/auth/all-users"),
+  syncUsers: (users) => req("POST", "/auth/sync-users", { users }),
+
+  getState: (key) =>
+    req("GET", `/auth/portal-state/${encodeURIComponent(key)}`),
+
+  saveState: (key, value) =>
+    req("PUT", `/auth/portal-state/${encodeURIComponent(key)}`, { value }),
+
+  getTenants: () => req("GET", "/auth/portal-state/tenants"),
+  syncTenants: (tenants) =>
+    req("PUT", "/auth/portal-state/tenants", { value: tenants }),
+
+  getTenantAccessCodes: () =>
+    req("GET", "/auth/portal-state/tenantAccessCodes"),
+
+  syncTenantAccessCodes: (codes) =>
+    req("PUT", "/auth/portal-state/tenantAccessCodes", { value: codes }),
+
+  getAllocations: () => req("GET", "/auth/portal-state/allocations"),
+
+  syncAllocations: (allocations) =>
+    req("PUT", "/auth/portal-state/allocations", { value: allocations }),
+};

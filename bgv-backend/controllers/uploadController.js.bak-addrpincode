@@ -1,0 +1,1524 @@
+// bgv-backend/controllers/uploadController.js
+
+import XLSX from "xlsx";
+import { v4 as uuidv4 } from "uuid";
+import mongoose from "mongoose";
+import nodemailer from "nodemailer";
+import { saveToSentFolder } from "../utils/saveToSentFolder.js";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+import Record from "../models/Record.js";
+import MailConfig from "../models/MailConfig.js";
+import StatusAudit from "../models/StatusAudit.js";
+import PortalState from "../models/PortalState.js";
+import VendorContact from "../models/VendorContact.js";
+import User from "../models/User.js";
+
+const execFileAsync = promisify(execFile);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+/* ───────────────────────── HELPERS ───────────────────────── */
+
+function parseDate(val) {
+  if (!val || val === "") return null;
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function fmtDate(val) {
+  if (!val) return "";
+  const d = new Date(val);
+  if (isNaN(d.getTime())) return String(val);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${dd}/${mm}/${d.getFullYear()}`;
+}
+
+function cleanStr(val) {
+  return val ? String(val).trim() : "";
+}
+
+function safeTrim(val) {
+  return String(val || "").trim();
+}
+
+function normalizeStatus(val = "") {
+  const key = String(val || "Pending").trim().toLowerCase();
+  const map = {
+    pending: "Pending",
+    insuff: "Insuff",
+    insufficient: "Insuff",
+    closed: "Closed",
+    close: "Closed",
+    hold: "Hold",
+    stop: "Stop",
+    stopped: "Stop",
+    sent: "Sent",
+  };
+  return map[key] || String(val || "Pending").trim() || "Pending";
+}
+
+function flattenRecord(doc) {
+  if (!doc) return null;
+
+  const obj = doc.toObject ? doc.toObject() : doc;
+  const raw = obj.rawData || {};
+
+  return {
+    ...obj,
+    _id: obj._id,
+    id: obj._id,
+    tenantId: obj.tenantId !== undefined ? obj.tenantId : null,
+
+    "Client Name": obj.clientName || raw["Client Name"] || "",
+    "Candidate Name": obj.candidateName || raw["Candidate Name"] || "",
+    "Check Name": obj.checkName || raw["Check Name"] || "",
+
+    Status: obj.status || raw.Status || raw.status || "Pending",
+    status: obj.status || raw.status || "Pending",
+
+    rate:
+      obj.rate !== undefined
+        ? obj.rate
+        : raw.rate !== undefined
+        ? raw.rate
+        : 0,
+
+    agent: obj.agent || raw.agent || "",
+    assignDate: obj.assignDate || raw.assignDate || "",
+
+    reportFile: obj.reportFile || raw.reportFile || "",
+    reportFileName: obj.reportFileName || raw.reportFileName || "",
+    reportUploaded: obj.reportUploaded || raw.reportUploaded || false,
+    reportUploadedAt: obj.reportUploadedAt || raw.reportUploadedAt || null,
+    reportUploadedBy: obj.reportUploadedBy || raw.reportUploadedBy || "",
+
+    extraApproved:
+      obj.extraApproved !== undefined
+        ? obj.extraApproved
+        : raw.extraApproved || false,
+
+    extraAmount:
+      obj.extraAmount !== undefined
+        ? obj.extraAmount
+        : raw.extraAmount || 0,
+
+    isSpecialCase:
+      obj.isSpecialCase !== undefined
+        ? obj.isSpecialCase
+        : false,
+
+    specialBillingDate:
+      obj.specialBillingDate !== undefined
+        ? obj.specialBillingDate
+        : null,
+  };
+}
+
+/* ───────────────────────── SCOPE FILTER ───────────────────────── */
+
+function getScopeFilter(req, tenantIdFromQuery = "") {
+  const filter = {};
+
+  const role = String(req.user?.role || "").toLowerCase();
+
+  const isInternalTeam =
+    req.user?.isInternal === true ||
+    req.user?.internalTeam === true ||
+    req.user?.userType === "internal" ||
+    req.user?.teamType === "internal" ||
+    req.user?.isInternalTeam === true;
+
+  if (role === "superadmin") {
+    if (tenantIdFromQuery) {
+      filter.tenantId = tenantIdFromQuery;
+    }
+  } else if (isInternalTeam) {
+    // Internal team is scoped to SA's records (tenantId: null) by default,
+    // matching the super admin's own view — prevents fetching all tenants' data.
+    filter.tenantId = tenantIdFromQuery || null;
+  } else if (role === "admin" || role === "team") {
+    filter.tenantId = req.user?.tenantId || null;
+  }
+
+  return filter;
+}
+
+/* ─────────────────── REAL-TIME REPORT STATUS (DELTA) ───────────────────
+   Returns ONLY the records whose report was uploaded after `since`, with a
+   tiny projection (no rawData, no heavy fields). The frontend polls this every
+   few seconds so an admin sees a teammate's freshly uploaded report within
+   seconds. Because it filters on reportUploadedAt > since, each poll returns
+   only the handful of brand-new reports — payload stays small and the DB stays
+   light. Scoping matches getRecords exactly via getScopeFilter. */
+export async function getReportStatusUpdates(req, res) {
+  try {
+    const sinceRaw = req.query?.since;
+    const sinceDate = sinceRaw ? new Date(sinceRaw) : null;
+    const validSince = sinceDate && !Number.isNaN(sinceDate.getTime());
+
+    const scopeFilter = getScopeFilter(req, req.query?.tenantId || "");
+
+    // ── 1. Report uploads (existing logic) ───────────────────────────────
+    const reportFilter = { ...scopeFilter, reportUploaded: true };
+    if (validSince) {
+      reportFilter.reportUploadedAt = { $gt: sinceDate };
+    }
+    const reportRows = await Record.find(reportFilter)
+      .select("_id status reportFile reportFileName reportUploaded reportUploadedAt reportUploadedBy")
+      .sort({ reportUploadedAt: -1 })
+      .limit(500)
+      .lean();
+
+    // ── 2. Status-only changes via StatusAudit (new) ─────────────────────
+    // Returns records whose status was changed since `since`, even without
+    // a report upload — so pure status changes are visible to all members.
+    let statusRows = [];
+    if (validSince) {
+      const role = String(req.user?.role || "").toLowerCase();
+      const isInt =
+        req.user?.isInternal === true ||
+        req.user?.internalTeam === true ||
+        req.user?.isInternalTeam === true;
+      // Use the same tenantId scope as the Record query for consistency.
+      const auditTenantId =
+        role === "superadmin" || isInt
+          ? null
+          : (req.user?.tenantId ?? null);
+
+      const recentAudit = await StatusAudit.find({
+        tenantId: auditTenantId,
+        timestamp: { $gt: sinceDate },
+      })
+        .select("recordId")
+        .sort({ timestamp: -1 })
+        .limit(200)
+        .lean();
+
+      const changedIds = [
+        ...new Set(
+          recentAudit
+            .map(a => a.recordId)
+            .filter(Boolean)
+            .map(String)
+        ),
+      ];
+
+      if (changedIds.length > 0) {
+        statusRows = await Record.find({
+          _id: { $in: changedIds },
+          ...scopeFilter,
+        })
+          .select("_id status reportFile reportFileName reportUploaded reportUploadedAt reportUploadedBy")
+          .lean();
+      }
+    }
+
+    // ── Merge — deduplicate by _id; statusRows override for status field ─
+    const byId = new Map();
+    reportRows.forEach(r => byId.set(String(r._id), r));
+    statusRows.forEach(r => {
+      const prev = byId.get(String(r._id));
+      byId.set(String(r._id), prev ? { ...prev, ...r } : r);
+    });
+
+    return res.json({
+      serverTime: new Date().toISOString(),
+      updates: Array.from(byId.values()),
+    });
+  } catch (err) {
+    console.error("getReportStatusUpdates error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+function canUserAccessRecord(req, record) {
+  try {
+    if (!req.user || !record) return false;
+
+    const role = String(req.user.role || "").toLowerCase();
+
+    if (role === "superadmin") {
+      return true;
+    }
+
+    if (
+      req.user.isInternal === true ||
+      req.user.internalTeam === true ||
+      req.user.userType === "internal" ||
+      req.user.teamType === "internal" ||
+      req.user.isInternalTeam === true
+    ) {
+      return true;
+    }
+
+    if (role === "admin" || role === "team") {
+      return (
+        String(req.user.tenantId || "") ===
+        String(record.tenantId || "")
+      );
+    }
+
+    return false;
+  } catch (err) {
+    console.log("canUserAccessRecord error:", err.message);
+    return false;
+  }
+}
+
+/* ───────────────────────── UPLOAD EXCEL ───────────────────────── */
+
+export async function uploadExcel(req, res) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const workbook = XLSX.read(req.file.buffer, {
+      type: "buffer",
+    });
+
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      defval: "",
+    });
+
+    const batchId = uuidv4();
+
+    const docs = rows.map((row) => ({
+      uploadedBy: req.user?.email || "unknown",
+      tenantId: req.user?.tenantId || req.body.tenantId || null,
+      uploadBatch: batchId,
+      uploadedAt: new Date(),
+
+      clientName: cleanStr(
+        row["Client Name"] ||
+          row["clientName"] ||
+          row["Company Name"] ||
+          row["Company"] ||
+          ""
+      ),
+
+      candidateName: cleanStr(
+        row["Candidate Name"] ||
+          row["candidateName"] ||
+          row["Name"] ||
+          ""
+      ),
+
+      checkName: cleanStr(
+        row["Check Name"] ||
+          row["checkName"] ||
+          row["Check"] ||
+          ""
+      ),
+
+      status: normalizeStatus(
+        row["Status"] ||
+          row["status"] ||
+          "Pending"
+      ),
+
+      city: cleanStr(
+        row["City"] ||
+          row["District"] ||
+          ""
+      ),
+
+      state: cleanStr(
+        row["State"] || ""
+      ),
+
+      assignedDate: parseDate(
+        row["Assigned Date"] ||
+          row["Assign Date"]
+      ),
+
+      rate: Number(
+        row.rate ||
+          row.Rate ||
+          0
+      ) || 0,
+
+      agent: cleanStr(
+        row.agent ||
+          row.Agent ||
+          ""
+      ),
+
+      assignDate: cleanStr(
+        row.assignDate ||
+          row["Assign Date"] ||
+          ""
+      ),
+
+      reportFile: row.reportFile || "",
+      reportFileName: row.reportFileName || "",
+      reportUploaded: row.reportUploaded || false,
+      reportUploadedAt: row.reportUploadedAt || null,
+      reportUploadedBy: row.reportUploadedBy || "",
+
+      extraApproved: row.extraApproved || false,
+      extraAmount: Number(row.extraAmount || 0) || 0,
+
+      rawData: {
+        ...row,
+        Status: normalizeStatus(row["Status"] || row["status"] || "Pending"),
+        status: normalizeStatus(row["Status"] || row["status"] || "Pending"),
+      },
+    }));
+
+    await Record.insertMany(docs);
+
+    res.json({
+      message: "Uploaded",
+      count: docs.length,
+      uploadBatch: batchId,
+    });
+  } catch (err) {
+    console.error("uploadExcel error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── GET RECORDS ───────────────────────── */
+
+export async function getRecords(req, res) {
+  try {
+    const {
+      tenantId,
+      clientName,
+      client,
+      status,
+      search,
+      showAll,
+      page = 1,
+      limit = 100000,
+    } = req.query;
+
+    let filter = {};
+
+    if (
+      showAll === "true" &&
+      req.user.role === "superadmin"
+    ) {
+      // ALL RECORDS
+    } else {
+      filter = getScopeFilter(
+        req,
+        safeTrim(tenantId)
+      );
+
+      if (
+        req.user.role === "superadmin" &&
+        !showAll &&
+        !safeTrim(tenantId)
+      ) {
+        filter.tenantId = null;
+      }
+    }
+
+    const clientFilter = clientName || client;
+
+    if (clientFilter) {
+      filter.clientName = {
+        $regex: safeTrim(clientFilter),
+        $options: "i",
+      };
+    }
+
+    if (status) {
+      filter.status = {
+        $regex: safeTrim(status),
+        $options: "i",
+      };
+    }
+
+    if (search && safeTrim(search)) {
+      const s = safeTrim(search);
+
+      filter.$or = [
+        {
+          clientName: {
+            $regex: s,
+            $options: "i",
+          },
+        },
+        {
+          candidateName: {
+            $regex: s,
+            $options: "i",
+          },
+        },
+        {
+          checkName: {
+            $regex: s,
+            $options: "i",
+          },
+        },
+        {
+          status: {
+            $regex: s,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    const pageNum = Math.max(
+      1,
+      Number(page)
+    );
+
+    const limitNum = Math.min(
+      100000,
+      Math.max(1, Number(limit))
+    );
+
+    const skip = (pageNum - 1) * limitNum;
+
+    const records = await Record.find(filter)
+      .sort({ uploadedAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .batchSize(limitNum)
+      .lean();
+
+    res.json(
+      records.map(flattenRecord)
+    );
+  } catch (err) {
+    console.error("getRecords error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── ADD RECORD ───────────────────────── */
+
+export async function addRecord(req, res) {
+  try {
+    const body = req.body || {};
+
+    const doc = await Record.create({
+      ...body,
+
+      uploadedBy:
+        req.user?.email || "manual",
+
+      tenantId:
+        req.user?.tenantId ||
+        body.tenantId ||
+        null,
+
+      uploadBatch:   `manual_${Date.now()}`,
+      dailyUploadId: body.dailyUploadId || "", // shared across all records from one daily upload session
+      uploadedAt:    new Date(),
+
+      clientName:
+        body["Client Name"] ||
+        body.clientName ||
+        "",
+
+      candidateName:
+        body["Candidate Name"] ||
+        body.candidateName ||
+        "",
+
+      checkName:
+        body["Check Name"] ||
+        body.checkName ||
+        "",
+
+      status: normalizeStatus(
+        body.Status ||
+        body.status ||
+        "Pending"
+      ),
+
+      city:
+        body.City ||
+        body.city ||
+        "",
+
+      state:
+        body.State ||
+        body.state ||
+        "",
+
+      rate:
+        Number(body.rate || 0) || 0,
+
+      agent:
+        body.agent || "",
+
+      assignDate:
+        body.assignDate || "",
+
+      extraApproved:
+        body.extraApproved || false,
+
+      extraAmount:
+        Number(body.extraAmount || 0) || 0,
+
+      rawData: {
+        ...body,
+        Status: normalizeStatus(body.Status || body.status || "Pending"),
+        status: normalizeStatus(body.Status || body.status || "Pending"),
+      },
+    });
+
+    res.status(201).json(
+      flattenRecord(doc)
+    );
+  } catch (err) {
+    console.error("addRecord error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── UPDATE RECORD ───────────────────────── */
+
+export async function updateRecord(req, res) {
+  try {
+    const body = req.body || {};
+
+    const existing = await Record.findById(
+      req.params.id
+    );
+
+    if (!existing) {
+      return res.status(404).json({
+        error: "Record not found",
+      });
+    }
+
+    if (!canUserAccessRecord(req, existing)) {
+      return res.status(403).json({
+        error: "Not allowed for this record",
+      });
+    }
+
+    const statusFromBody =
+      body.Status !== undefined
+        ? body.Status
+        : body.status !== undefined
+        ? body.status
+        : body.rawData?.Status !== undefined
+        ? body.rawData.Status
+        : body.rawData?.status;
+
+    const hasStatusUpdate = statusFromBody !== undefined;
+    const finalStatus = hasStatusUpdate
+      ? normalizeStatus(statusFromBody)
+      : normalizeStatus(existing.status || existing.rawData?.Status || existing.rawData?.status || "Pending");
+
+    const updatedRawData = {
+      ...(existing.rawData || {}),
+      ...(body.rawData || {}),
+      ...body,
+      ...(hasStatusUpdate ? { Status: finalStatus, status: finalStatus } : {}),
+    };
+
+    delete updatedRawData._id;
+    delete updatedRawData.__v;
+
+    const update = {
+      ...body,
+      rawData: updatedRawData,
+    };
+
+    delete update._id;
+    delete update.__v;
+    delete update.tenantId;
+    delete update.uploadedBy;
+    delete update.uploadBatch;
+    delete update.dailyUploadId; // immutable — set once at import, never overwritten
+    delete update.uploadedAt;
+
+    if (body["Client Name"] || body.clientName) {
+      update.clientName =
+        body["Client Name"] ||
+        body.clientName;
+    }
+
+    if (
+      body["Candidate Name"] ||
+      body.candidateName
+    ) {
+      update.candidateName =
+        body["Candidate Name"] ||
+        body.candidateName;
+    }
+
+    if (body["Check Name"] || body.checkName) {
+      update.checkName =
+        body["Check Name"] ||
+        body.checkName;
+    }
+
+    if (hasStatusUpdate) {
+      update.status = finalStatus;
+      update.Status = finalStatus;
+      update.rawData = {
+        ...(update.rawData || {}),
+        Status: finalStatus,
+        status: finalStatus,
+      };
+    }
+
+    if (body.rate !== undefined) {
+      update.rate =
+        Number(body.rate) || 0;
+    }
+
+    if (body.agent !== undefined) {
+      update.agent = body.agent;
+    }
+
+    if (body.assignDate !== undefined) {
+      update.assignDate =
+        body.assignDate;
+    }
+
+    if (body.extraApproved !== undefined) {
+      update.extraApproved =
+        body.extraApproved;
+    }
+
+    if (body.extraAmount !== undefined) {
+      update.extraAmount =
+        Number(body.extraAmount) || 0;
+    }
+
+    if (body.isSpecialCase !== undefined) {
+      if (req.user.role !== "superadmin") {
+        return res.status(403).json({ error: "Only super admin can mark special cases" });
+      }
+      update.isSpecialCase = !!body.isSpecialCase;
+    }
+
+    if (body.specialBillingDate !== undefined) {
+      if (req.user.role !== "superadmin") {
+        return res.status(403).json({ error: "Only super admin can set special billing date" });
+      }
+      update.specialBillingDate = body.specialBillingDate
+        ? new Date(body.specialBillingDate)
+        : null;
+    }
+
+    if (body.reportFile !== undefined) {
+      update.reportFile =
+        body.reportFile;
+    }
+
+    if (body.reportFileName !== undefined) {
+      update.reportFileName =
+        body.reportFileName;
+    }
+
+    if (body.reportUploaded !== undefined) {
+      update.reportUploaded =
+        body.reportUploaded;
+    }
+
+    if (body.reportUploadedAt !== undefined) {
+      update.reportUploadedAt =
+        body.reportUploadedAt;
+    }
+
+    if (body.reportUploadedBy !== undefined) {
+      update.reportUploadedBy =
+        body.reportUploadedBy;
+    }
+
+    const updated =
+      await Record.findByIdAndUpdate(
+        req.params.id,
+        { $set: update },
+        { new: true }
+      );
+
+    // Non-blocking audit entry — status-change only, never breaks the main update
+    if (hasStatusUpdate) {
+      StatusAudit.create({
+        recordId:       existing._id,
+        clientName:     existing.clientName || existing.rawData?.["Client Name"] || "",
+        candidateName:  existing.candidateName || existing.rawData?.["Candidate Name"] || "",
+        checkId:        existing.rawData?.["Check Id"] || existing.rawData?.["Case ID"] || "",
+        oldStatus:      normalizeStatus(existing.status || existing.rawData?.Status || existing.rawData?.status || "Pending"),
+        newStatus:      finalStatus,
+        changedByEmail: req.user?.email || "unknown",
+        changedByRole:  req.user?.role  || "unknown",
+        tenantId:       existing.tenantId ?? null,
+        ownerAdminEmail: req.user?.ownerAdminEmail || "",
+        timestamp:      new Date(),
+      }).catch(err => console.warn("[statusAudit] write failed:", err.message));
+    }
+
+    res.json(
+      flattenRecord(updated)
+    );
+  } catch (err) {
+    console.error("updateRecord error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── DELETE RECORD ───────────────────────── */
+
+export async function deleteRecord(req, res) {
+  try {
+    const existing = await Record.findById(
+      req.params.id
+    );
+
+    if (!existing) {
+      return res.status(404).json({
+        error: "Record not found",
+      });
+    }
+
+    if (!canUserAccessRecord(req, existing)) {
+      return res.status(403).json({
+        error: "Not allowed for this record",
+      });
+    }
+
+    await Record.findByIdAndDelete(
+      req.params.id
+    );
+
+    res.json({
+      message: "Deleted",
+    });
+  } catch (err) {
+    console.error("deleteRecord error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── DELETE BATCH ───────────────────────── */
+
+export async function deleteBatch(req, res) {
+  try {
+    const scopeFilter =
+      getScopeFilter(req, "");
+
+    if (
+      req.user.role === "superadmin" &&
+      !scopeFilter.tenantId
+    ) {
+      scopeFilter.tenantId = null;
+    }
+
+    const filter = {
+      uploadBatch: req.params.batchId,
+      ...scopeFilter,
+    };
+
+    const result =
+      await Record.deleteMany(filter);
+
+    res.json({
+      message: "Batch deleted",
+      deletedCount: result.deletedCount,
+    });
+  } catch (err) {
+    console.error("deleteBatch error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── STATS ───────────────────────── */
+
+export async function getStats(req, res) {
+  try {
+    let filter = getScopeFilter(req, "");
+
+    if (
+      req.user.role === "superadmin" &&
+      filter.tenantId === undefined
+    ) {
+      filter.tenantId = null;
+    }
+
+    const [
+      total,
+      sent,
+      closed,
+      pending,
+      insuff,
+      hold,
+      stop,
+    ] = await Promise.all([
+      Record.countDocuments(filter),
+      Record.countDocuments({ ...filter, status: /sent/i }),
+      Record.countDocuments({ ...filter, status: /closed/i }),
+      Record.countDocuments({ ...filter, status: /pending/i }),
+      Record.countDocuments({ ...filter, status: /insuff/i }),
+      Record.countDocuments({ ...filter, status: /hold/i }),
+      Record.countDocuments({ ...filter, status: /stop/i }),
+    ]);
+
+    res.json({
+      total,
+      sent,
+      closed,
+      pending,
+      insuff,
+      hold,
+      stop,
+    });
+  } catch (err) {
+    console.error("getStats error:", err.message);
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── REPORT FILE UPLOAD ───────────────────────── */
+
+export async function uploadReportFile(req, res) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No file uploaded",
+      });
+    }
+
+    const recordId =
+      req.body.recordId ||
+      req.body.id ||
+      req.body.caseId ||
+      req.body.checkId;
+
+    if (
+      !recordId ||
+      !mongoose.Types.ObjectId.isValid(recordId)
+    ) {
+      return res.status(400).json({
+        error: "Valid recordId required",
+      });
+    }
+
+    const record = await Record.findById(
+      recordId
+    );
+
+    if (!record) {
+      return res.status(404).json({
+        error: "Record not found",
+      });
+    }
+
+    if (!canUserAccessRecord(req, record)) {
+      return res.status(403).json({
+        error:
+          "Not allowed for this company record",
+      });
+    }
+
+    const fileUrl = `/uploads/reports/${req.file.filename}`;
+
+    const now = new Date();
+
+    const updatedRawData = {
+      ...(record.rawData || {}),
+
+      reportFile: fileUrl,
+      reportFileName: req.file.originalname,
+      reportUploaded: true,
+      reportUploadedAt: now,
+      reportUploadedBy:
+        req.user?.email || "unknown",
+    };
+
+    const updated =
+      await Record.findByIdAndUpdate(
+        recordId,
+        {
+          $set: {
+            reportFile: fileUrl,
+            reportFileName:
+              req.file.originalname,
+
+            reportUploaded: true,
+            reportUploadedAt: now,
+            reportUploadedBy:
+              req.user?.email || "unknown",
+
+            rawData: updatedRawData,
+          },
+        },
+        { new: true }
+      );
+
+    res.json({
+      message:
+        "Report uploaded successfully",
+      fileUrl,
+      record: flattenRecord(updated),
+    });
+  } catch (err) {
+    console.error(
+      "uploadReportFile error:",
+      err.message
+    );
+
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+
+/* ───────────────────────── SEND CASE MAIL USING GMAIL ───────────────────────── */
+/* ───────────────────────── MAIL CONFIG HELPERS ───────────────────────── */
+
+function getMailOwnerEmail(req) {
+  const role = String(req.user?.role || "").toLowerCase();
+
+  // Super admin sends from their own configured mail
+  if (role === "superadmin") {
+    return String(req.user?.email || "").toLowerCase().trim();
+  }
+
+  // Secondary/company admin sends from their own configured mail
+  if (role === "admin") {
+    return String(req.user?.email || "").toLowerCase().trim();
+  }
+
+  // Team member sends from owner admin mail if available
+  if (role === "team") {
+    return String(
+      req.user?.ownerAdminEmail ||
+        req.user?.adminEmail ||
+        req.user?.email ||
+        ""
+    )
+      .toLowerCase()
+      .trim();
+  }
+
+  return String(req.user?.email || "").toLowerCase().trim();
+}
+
+// Flatten a MailConfig document into a list of sendable accounts.
+// The legacy top-level fields are the "primary" account (id: "primary"),
+// followed by any extra accounts in the `accounts` array (id: their _id).
+function listMailAccounts(configDoc) {
+  if (!configDoc) return [];
+  const out = [];
+
+  if (configDoc.smtpUser && configDoc.smtpPass) {
+    out.push({
+      id: "primary",
+      label: configDoc.label || configDoc.fromName || configDoc.smtpUser,
+      smtpHost: configDoc.smtpHost,
+      smtpPort: configDoc.smtpPort,
+      smtpSecure: configDoc.smtpSecure,
+      smtpUser: configDoc.smtpUser,
+      smtpPass: configDoc.smtpPass,
+      fromName: configDoc.fromName,
+      isActive: configDoc.isActive !== false,
+    });
+  }
+
+  (configDoc.accounts || []).forEach((a) => {
+    if (a && a.smtpUser && a.smtpPass) {
+      out.push({
+        id: String(a._id),
+        label: a.label || a.fromName || a.smtpUser,
+        smtpHost: a.smtpHost,
+        smtpPort: a.smtpPort,
+        smtpSecure: a.smtpSecure,
+        smtpUser: a.smtpUser,
+        smtpPass: a.smtpPass,
+        fromName: a.fromName,
+        isActive: a.isActive !== false,
+      });
+    }
+  });
+
+  return out;
+}
+
+async function getTransporterForUser(req, selectedId = "") {
+  const ownerEmail = getMailOwnerEmail(req);
+
+  let configDoc = null;
+  if (ownerEmail) {
+    configDoc = await MailConfig.findOne({ ownerEmail }).lean();
+  }
+
+  const accounts = listMailAccounts(configDoc).filter((a) => a.isActive);
+
+  // Use the selected account if a valid id was passed; otherwise the first active one.
+  let chosen = null;
+  if (selectedId) {
+    chosen = accounts.find((a) => a.id === String(selectedId)) || null;
+  }
+  if (!chosen) chosen = accounts[0] || null;
+
+  // If no DB account is available, fall back to .env (unchanged behavior)
+  if (!chosen) {
+    if (!process.env.MAIL_USER || !process.env.MAIL_PASS) {
+      throw new Error(
+        `Mail config not found for ${ownerEmail || "this user"} and MAIL_USER/MAIL_PASS fallback is missing`
+      );
+    }
+
+    return {
+      from: process.env.MAIL_FROM || process.env.MAIL_USER,
+      transporter: nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          user: process.env.MAIL_USER,
+          pass: process.env.MAIL_PASS,
+        },
+      }),
+      ownerEmail,
+      source: "env-fallback",
+      account: null, // no IMAP for env-fallback (Gmail App Password path)
+    };
+  }
+
+  return {
+    from: chosen.fromName
+      ? `"${chosen.fromName}" <${chosen.smtpUser}>`
+      : chosen.smtpUser,
+
+    transporter: nodemailer.createTransport({
+      host: chosen.smtpHost || "smtp.gmail.com",
+      port: Number(chosen.smtpPort || 465),
+      secure: chosen.smtpSecure !== false,
+      auth: {
+        user: chosen.smtpUser,
+        pass: chosen.smtpPass,
+      },
+    }),
+
+    ownerEmail,
+    source: "db-mail-config",
+    account: chosen, // exposed for IMAP Sent-folder copy
+  };
+}
+
+// GET /api/upload/mail-configs
+// Returns the active mail accounts (WITHOUT passwords) the current user can
+// send from, so the frontend can show a picker.
+export async function listMailAccountsForUser(req, res) {
+  try {
+    const ownerEmail = getMailOwnerEmail(req);
+    const configDoc = ownerEmail
+      ? await MailConfig.findOne({ ownerEmail }).lean()
+      : null;
+
+    const accounts = listMailAccounts(configDoc)
+      .filter((a) => a.isActive)
+      .map((a) => ({
+        id: a.id,
+        label: a.label,
+        smtpUser: a.smtpUser,
+        fromName: a.fromName,
+      }));
+
+    return res.json({ ownerEmail, accounts });
+  } catch (err) {
+    console.error("listMailAccountsForUser error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+export async function sendCaseMail(req, res) {
+  try {
+    const { recordId, to, cc, subject, message, mailConfigId } = req.body || {};
+
+    if (!to) {
+      return res.status(400).json({
+        error: "Recipient email required",
+      });
+    }
+
+    if (
+      !recordId ||
+      !mongoose.Types.ObjectId.isValid(recordId)
+    ) {
+      return res.status(400).json({
+        error: "Valid recordId required",
+      });
+    }
+
+    const record = await Record.findById(recordId);
+
+    if (!record) {
+      return res.status(404).json({
+        error: "Record not found",
+      });
+    }
+
+    if (!canUserAccessRecord(req, record)) {
+      return res.status(403).json({
+        error: "Not allowed for this record",
+      });
+    }
+
+    const row = flattenRecord(record);
+
+    // Assigned date: prefer the string field, fall back to the Date field
+    const assignedDateStr = row.assignDate
+      ? fmtDate(row.assignDate)
+      : fmtDate(record.assignedDate);
+
+    // Closed date: last StatusAudit entry where status became Closed/Completed
+    const closedAudit = await StatusAudit.findOne({
+      recordId: record._id,
+      newStatus: /closed|complete/i,
+    })
+      .sort({ timestamp: -1 })
+      .lean();
+    const closedDateStr = closedAudit ? fmtDate(closedAudit.timestamp) : "";
+
+    const excelData = [
+      {
+        "Candidate Name": row["Candidate Name"] || "",
+        "Check Name": row["Check Name"] || "",
+        Status: row.Status || row.status || "",
+        City: row.City || row.city || "",
+        State: row.State || row.state || "",
+        "Case ID": row["Case ID"] || row["Check Id"] || "",
+        "Assigned Date": assignedDateStr,
+        "Closed Date": closedDateStr,
+        "Report Uploaded": row.reportUploaded ? "Yes" : "No",
+      },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(excelData);
+
+    XLSX.utils.book_append_sheet(wb, ws, "Case Details");
+
+    const excelBuffer = XLSX.write(wb, {
+      type: "buffer",
+      bookType: "xlsx",
+    });
+
+    const attachments = [
+      {
+        filename: `BGV_Report_${row["Candidate Name"] || "Candidate"}.xlsx`,
+        content: excelBuffer,
+        contentType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
+    ];
+
+    if (!record.reportFile) {
+      return res.status(400).json({
+        error:
+          "PDF report not found. Please re-upload/generate report first.",
+      });
+    }
+
+    const relativePath = String(record.reportFile).replace(/^\/+/, "");
+
+    const possiblePaths = [
+      path.join(__dirname, "..", relativePath),
+      path.join(process.cwd(), relativePath),
+      path.join(
+        process.cwd(),
+        "uploads",
+        "reports",
+        path.basename(relativePath)
+      ),
+    ];
+
+    const pdfPath = possiblePaths.find((p) => fs.existsSync(p));
+
+    if (!pdfPath) {
+      return res.status(400).json({
+        error:
+          "PDF file missing on server. Please click Re-upload and upload report again.",
+      });
+    }
+
+    attachments.push({
+      filename:
+        record.reportFileName ||
+        path.basename(pdfPath),
+      path: pdfPath,
+    });
+
+      const mailer = await getTransporterForUser(req, mailConfigId);
+
+    const mailOptions = {
+      from: mailer.from,
+      to,
+      cc: cc || undefined,
+      subject:
+        subject ||
+        `BGV Report - ${row["Candidate Name"] || "Candidate"}`,
+      text:
+        message ||
+        `Dear Team,
+
+Please find attached the BGV case Excel and report.
+
+Candidate: ${row["Candidate Name"] || "-"}
+Check: ${row["Check Name"] || "-"}
+Status: ${row.Status || row.status || "-"}
+
+Regards,
+True Verification Services`,
+      attachments,
+    };
+
+    await mailer.transporter.sendMail(mailOptions);
+
+    // Non-blocking: copy to sender's IMAP Sent folder (best-effort, never blocks response)
+    if (mailer.account) {
+      saveToSentFolder(mailer.account, mailOptions).catch(() => {});
+    }
+
+      return res.json({
+      success: true,
+      message: "Mail sent successfully",
+      mailSource: mailer.source,
+      mailOwner: mailer.ownerEmail,
+    });
+  } catch (err) {
+    console.error("sendCaseMail error:", err);
+
+    return res.status(500).json({
+      error: err.message,
+    });
+  }
+}
+/* ───────────────────────── WORD TO PDF CONVERT ───────────────────────── */
+
+export async function convertDocToPdf(req, res) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No Word file uploaded",
+      });
+    }
+
+    const inputPath = req.file.path;
+
+    const ext = path
+      .extname(req.file.originalname)
+      .toLowerCase();
+
+    if (![".doc", ".docx"].includes(ext)) {
+      return res.status(400).json({
+        error:
+          "Only DOC/DOCX files are allowed",
+      });
+    }
+
+    const outputDir =
+      path.dirname(inputPath);
+
+    await execFileAsync("libreoffice", [
+      "--headless",
+      "--convert-to",
+      "pdf",
+      "--outdir",
+      outputDir,
+      inputPath,
+    ]);
+
+    const pdfName =
+      path.basename(
+        inputPath,
+        path.extname(inputPath)
+      ) + ".pdf";
+
+    const pdfPath = path.join(
+      outputDir,
+      pdfName
+    );
+
+    if (!fs.existsSync(pdfPath)) {
+      return res.status(500).json({
+        error:
+          "Word to PDF conversion failed",
+      });
+    }
+
+    return res.json({
+      success: true,
+      pdfName,
+      fileUrl: `/uploads/reports/${pdfName}`,
+    });
+  } catch (err) {
+    console.error(
+      "convertDocToPdf error:",
+      err
+    );
+
+    return res.status(500).json({
+      error:
+        err.message || "Conversion failed",
+    });
+  }
+}
+
+/* ───────────────────────── SENT REPORTS ───────────────────────── */
+
+const SUPER_ADMIN_EMAIL_SR = "superadmin@tervies.com";
+
+function normVendorKeySR(v) {
+  return String(v || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+export async function getSentReports(req, res) {
+  try {
+    const role = String(req.user?.role || "").toLowerCase();
+    const adminEmail =
+      role === "superadmin"
+        ? SUPER_ADMIN_EMAIL_SR
+        : String(req.user?.email || "").toLowerCase().trim();
+
+    if (!adminEmail) return res.status(400).json({ error: "Admin email missing" });
+
+    const tenantFilter =
+      role === "superadmin"
+        ? { $or: [{ tenantId: null }, { tenantId: "" }] }
+        : { tenantId: req.user?.tenantId || null };
+
+    // All team members under this admin's allocation bucket
+    const stateDoc = await PortalState.findOne({ key: "allocations" }).lean();
+    const bucket = stateDoc?.value?.[`vendorAllocations_${adminEmail}`] || {};
+    let teamEmails = Object.keys(bucket);
+
+    // Internal staff (isInternal=true or no-tenant/no-owner) may upload reports
+    // without being in the vendor allocation bucket. Include them in SA's view.
+    if (role === "superadmin") {
+      const internalUsers = await User.find({
+        role: "team",
+        status: "approved",
+        $or: [
+          { isInternal: true },
+          { tenantId: { $in: [null, ""] }, ownerAdminEmail: { $in: [null, ""] } },
+        ],
+      }).select("email").lean();
+      const internalEmails = internalUsers
+        .map(u => String(u.email || "").toLowerCase().trim())
+        .filter(Boolean);
+      teamEmails = [...new Set([...teamEmails, ...internalEmails])];
+    }
+
+    // vendor contact lookup map
+    const vendorContacts = await VendorContact.find({}).lean();
+    const vcByNorm = {};
+    for (const vc of vendorContacts) {
+      vcByNorm[normVendorKeySR(vc.vendorName)] = vc;
+    }
+
+    const memberVendorMap = {};
+    for (const [memberEmail, vendors] of Object.entries(bucket)) {
+      memberVendorMap[memberEmail] = Array.isArray(vendors) ? vendors : [];
+    }
+
+    const startOfToday = new Date();
+    startOfToday.setUTCHours(0, 0, 0, 0);
+
+    // Pending count — today only, unsent
+    const pendingFilter = {
+      ...tenantFilter,
+      reportUploaded: true,
+      reportUploadedAt: { $gte: startOfToday },
+      reportUploadedBy: teamEmails.length ? { $in: teamEmails } : { $in: [] },
+      reportSentAt: null,
+    };
+    const pendingCount = await Record.countDocuments(pendingFilter);
+
+    // Full pending list (across all dates, not just today) — newest first
+    const allPendingFilter = {
+      ...tenantFilter,
+      reportUploaded: true,
+      reportUploadedBy: teamEmails.length ? { $in: teamEmails } : { $in: [] },
+      reportSentAt: null,
+    };
+    const pendingList = await Record.find(allPendingFilter)
+      .select(
+        "_id clientName candidateName checkName status reportFile reportFileName " +
+        "reportUploadedAt reportUploadedBy tenantId"
+      )
+      .sort({ reportUploadedAt: -1 })
+      .limit(500)
+      .lean();
+
+    const enriched = pendingList.map((r) => {
+      const uploaderEmail = String(r.reportUploadedBy || "").toLowerCase().trim();
+      const vendorNames = memberVendorMap[uploaderEmail] || [];
+      const primaryVendorName = vendorNames[0] || "";
+      const vc = vcByNorm[normVendorKeySR(primaryVendorName)] || null;
+      return {
+        ...r,
+        uploaderEmail,
+        vendorName: primaryVendorName,
+        vendorEmail: vc?.email || "",
+        vendorCcList: vc?.ccList || [],
+      };
+    });
+
+    return res.json({ pendingCount, pendingList: enriched });
+  } catch (err) {
+    console.error("getSentReports error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+export async function markReportSent(req, res) {
+  try {
+    const { recordId, channel = "email" } = req.body || {};
+
+    if (!recordId || !mongoose.Types.ObjectId.isValid(recordId)) {
+      return res.status(400).json({ error: "Valid recordId required" });
+    }
+
+    const now = new Date();
+    const updated = await Record.findOneAndUpdate(
+      { _id: recordId, reportSentAt: null },
+      { $set: { reportSentAt: now, reportSentBy: req.user?.email || "", reportSentChannel: channel } },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.json({ alreadySent: true, message: "Already marked as sent" });
+    }
+
+    return res.json({ success: true, reportSentAt: now });
+  } catch (err) {
+    console.error("markReportSent error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}

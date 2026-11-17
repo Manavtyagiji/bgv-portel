@@ -1,0 +1,111 @@
+// bgv-backend/controllers/pricingController.js
+import Pricing from "../models/Pricing.js";
+
+function getPricingTenantId(user = {}) {
+  if (user.role === "superadmin") return "__SUPERADMIN__";
+
+  return String(
+    user.tenantId ||
+    user.companyTenantId ||
+    user.companyId ||
+    user.tenantCode ||
+    user.orgName ||
+    user.ownerAdminEmail ||
+    user.email ||
+    "__UNKNOWN_TENANT__"
+  )
+    .trim()
+    .toLowerCase();
+}
+
+/* ── GET /api/pricing ── */
+export async function getPricing(req, res) {
+  try {
+    const tenantId = getPricingTenantId(req.user);
+
+    const docs = await Pricing.find({ tenantId }).lean();
+
+    const result = {};
+    docs.forEach((d) => {
+      result[d.scopeKey] = d.rules;
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("getPricing error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/* ── PUT /api/pricing ── */
+export async function savePricing(req, res) {
+  try {
+    const tenantId = getPricingTenantId(req.user);
+    const { pricingRules } = req.body;
+
+    if (!pricingRules || typeof pricingRules !== "object") {
+      return res.status(400).json({ error: "pricingRules object required" });
+    }
+
+    const ops = Object.entries(pricingRules).map(([scopeKey, rules]) =>
+      Pricing.findOneAndUpdate(
+        { tenantId, scopeKey },
+        { $set: { rules: Array.isArray(rules) ? rules : [] } },
+        { upsert: true, new: true }
+      )
+    );
+
+    await Promise.all(ops);
+
+    const keysToKeep = Object.keys(pricingRules);
+    if (keysToKeep.length > 0) {
+      await Pricing.deleteMany({
+        tenantId,
+        scopeKey: { $nin: keysToKeep },
+      });
+    }
+
+    res.json({ ok: true, tenantId, saved: keysToKeep.length });
+  } catch (err) {
+    console.error("savePricing error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/* ── PATCH /api/pricing/:scopeKey ── */
+export async function saveScopePricing(req, res) {
+  try {
+    const tenantId = getPricingTenantId(req.user);
+    const scopeKey = decodeURIComponent(req.params.scopeKey);
+    const { rules } = req.body;
+
+    if (!Array.isArray(rules)) {
+      return res.status(400).json({ error: "rules array required" });
+    }
+
+    const doc = await Pricing.findOneAndUpdate(
+      { tenantId, scopeKey },
+      { $set: { rules } },
+      { upsert: true, new: true }
+    );
+
+    res.json({ ok: true, tenantId, scopeKey, count: doc.rules.length });
+  } catch (err) {
+    console.error("saveScopePricing error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/* ── DELETE /api/pricing/:scopeKey ── */
+export async function deleteScopePricing(req, res) {
+  try {
+    const tenantId = getPricingTenantId(req.user);
+    const scopeKey = decodeURIComponent(req.params.scopeKey);
+
+    await Pricing.deleteOne({ tenantId, scopeKey });
+    res.json({ ok: true, tenantId, deleted: scopeKey });
+  } catch (err) {
+    console.error("deleteScopePricing error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+}

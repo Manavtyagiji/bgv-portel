@@ -1,0 +1,16 @@
+// bgv-backend/routes/inboxRoutes.js
+// Stage 1 — read-only inbox. Every route requires auth; mailbox scoping is
+// resolved server-side from req.user inside the controller (never from any
+// client-supplied parameter), so cross-mailbox access is not possible.
+
+import express from "express";
+import { protect } from "../middleware/authMiddleware.js";
+import { listMessages, getMessage, getAttachment } from "../controllers/inboxController.js";
+
+const router = express.Router();
+
+router.get("/messages", protect, listMessages);
+router.get("/messages/:uid", protect, getMessage);
+router.get("/messages/:uid/attachments/:index", protect, getAttachment);
+
+export default router;

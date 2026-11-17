@@ -1,0 +1,26 @@
+// bgv-backend/routes/inboxRoutes.js
+// Stage 1 — read-only inbox. Every route requires auth; mailbox scoping is
+// resolved server-side from req.user inside the controller (never from any
+// client-supplied parameter), so cross-mailbox access is not possible.
+
+import express from "express";
+import multer from "multer";
+import { protect } from "../middleware/authMiddleware.js";
+import { listMessages, getMessage, getAttachment, replyToMessage } from "../controllers/inboxController.js";
+
+const router = express.Router();
+
+// Memory storage only — reply attachments pass straight from the upload
+// buffer into the outgoing email and are never written to disk, same
+// no-disk-storage principle as the rest of the Inbox feature.
+const replyAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 5 },
+});
+
+router.get("/messages", protect, listMessages);
+router.get("/messages/:uid", protect, getMessage);
+router.get("/messages/:uid/attachments/:index", protect, getAttachment);
+router.post("/messages/:uid/reply", protect, replyAttachmentUpload.array("attachments", 5), replyToMessage);
+
+export default router;

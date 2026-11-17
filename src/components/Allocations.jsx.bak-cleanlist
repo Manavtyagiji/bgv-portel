@@ -1,0 +1,1007 @@
+/**
+ * Allocations.jsx — CLIENT + VENDOR + CHECK ALLOCATION
+ *
+ * Existing client/vendor allocation logic is preserved.
+ * Added check allocation (3rd mode):
+ *   - Client allocation saves in: clientAllocations_${adminEmail}
+ *   - Vendor allocation saves in: vendorAllocations_${adminEmail}
+ *   - Check allocation saves in: checkAllocations_${adminEmail}
+ *   - Check mode restricts a team member to only see records matching their allocated check names.
+ *   - Client names remain visible in check mode (unlike vendor-only mode).
+ */
+
+import { useState, useMemo, useEffect } from "react";
+import { tenantSyncAPI } from "../api/api";
+
+/* ─────────────────────────── CSS ────────────────────────────────────────── */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+.alloc-root { font-family:'Plus Jakarta Sans',sans-serif; color:#0f1c3f; }
+.alloc-page-title {
+  font-family:'Space Grotesk',sans-serif; font-size:22px; font-weight:700;
+  letter-spacing:-0.3px;
+  background:linear-gradient(135deg,#2563eb,#06b6d4);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
+  margin-bottom:4px;
+}
+.alloc-page-sub {
+  font-size:13px; color:#8ba3c0;
+  display:flex; align-items:center; gap:8px; margin-bottom:18px;
+}
+
+.alloc-mode-tabs {
+  display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px;
+}
+.alloc-mode-btn {
+  font-family:'Space Grotesk',sans-serif; font-size:13px; font-weight:800;
+  border:1.5px solid rgba(59,130,246,0.22); border-radius:12px;
+  padding:10px 18px; cursor:pointer; background:#fff; color:#2563eb;
+  box-shadow:0 3px 14px rgba(37,99,235,0.07); transition:all .18s;
+}
+.alloc-mode-btn:hover { transform:translateY(-1px); }
+.alloc-mode-btn.active {
+  background:linear-gradient(135deg,#2563eb,#06b6d4); color:#fff; border-color:transparent;
+  box-shadow:0 6px 20px rgba(37,99,235,0.20);
+}
+
+/* Summary strip */
+.alloc-summary {
+  background:#fff; border:1.5px solid rgba(59,130,246,0.18); border-radius:14px;
+  padding:16px 24px; display:flex; align-items:center; gap:24px;
+  box-shadow:0 4px 18px rgba(37,99,235,0.07); flex-wrap:wrap; margin-bottom:20px;
+}
+.alloc-summary-item { display:flex; flex-direction:column; align-items:flex-start; }
+.alloc-summary-label {
+  font-family:'Space Grotesk',sans-serif; font-size:10px; font-weight:700;
+  text-transform:uppercase; letter-spacing:0.09em; color:#8ba3c0;
+}
+.alloc-summary-val {
+  font-family:'Space Grotesk',sans-serif; font-size:24px; font-weight:700;
+  background:linear-gradient(135deg,#2563eb,#06b6d4);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
+}
+.alloc-summary-div { width:1px; height:36px; background:rgba(59,130,246,0.14); }
+
+/* Notices */
+.alloc-notice {
+  display:flex; align-items:flex-start; gap:12px;
+  border-radius:12px; padding:14px 18px; margin-bottom:20px;
+}
+.alloc-notice-icon { font-size:20px; flex-shrink:0; margin-top:1px; }
+.alloc-notice-title { font-family:'Space Grotesk',sans-serif; font-size:13px; font-weight:700; }
+.alloc-notice-sub   { font-size:12px; margin-top:4px; line-height:1.6; }
+.notice-amber {
+  background:linear-gradient(135deg,rgba(245,158,11,0.06),rgba(251,191,36,0.04));
+  border:1.5px dashed rgba(245,158,11,0.32);
+}
+.notice-amber .alloc-notice-title { color:#92400e; }
+.notice-amber .alloc-notice-sub   { color:#78350f; }
+.notice-blue {
+  background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(6,182,212,0.04));
+  border:1.5px solid rgba(37,99,235,0.20);
+}
+.notice-blue .alloc-notice-title { color:#2563eb; }
+.notice-blue .alloc-notice-sub   { color:#8ba3c0; }
+.notice-green {
+  background:linear-gradient(135deg,rgba(16,185,129,0.06),rgba(52,211,153,0.04));
+  border:1.5px solid rgba(16,185,129,0.22);
+}
+.notice-green .alloc-notice-title { color:#059669; }
+.notice-green .alloc-notice-sub   { color:#065f46; }
+.notice-red {
+  background:rgba(239,68,68,0.05); border:1.5px dashed rgba(239,68,68,0.28);
+}
+.notice-red .alloc-notice-title { color:#b91c1c; }
+.notice-red .alloc-notice-sub   { color:#7f1d1d; }
+
+/* Code box */
+.alloc-code-box {
+  font-family:monospace; font-size:12px;
+  background:rgba(37,99,235,0.08); border:1px solid rgba(37,99,235,0.20);
+  color:#2563eb; padding:3px 10px; border-radius:6px;
+  margin-top:4px; display:inline-block; word-break:break-all;
+}
+
+/* Card grid */
+.alloc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:18px; }
+.alloc-card {
+  background:#fff; border:1.5px solid rgba(59,130,246,0.18); border-radius:16px;
+  box-shadow:0 4px 20px rgba(37,99,235,0.07); overflow:hidden;
+  transition:box-shadow 0.22s, transform 0.22s;
+}
+.alloc-card:hover { box-shadow:0 10px 36px rgba(37,99,235,0.13); transform:translateY(-2px); }
+
+.alloc-card-head {
+  display:flex; align-items:center; gap:14px; padding:18px 20px 14px;
+  border-bottom:1px solid rgba(59,130,246,0.10);
+  background:linear-gradient(135deg,rgba(37,99,235,0.04),rgba(6,182,212,0.03));
+}
+.alloc-avatar {
+  width:42px; height:42px; border-radius:12px; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  font-family:'Space Grotesk',sans-serif; font-size:17px; font-weight:700; color:#fff;
+  background:linear-gradient(135deg,#2563eb,#06b6d4);
+  box-shadow:0 4px 12px rgba(37,99,235,0.28);
+}
+.alloc-member-name  { font-family:'Space Grotesk',sans-serif; font-size:14px; font-weight:700; color:#0f1c3f; }
+.alloc-member-email {
+  font-size:12px; color:#8ba3c0; margin-top:2px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px;
+}
+.alloc-role-pill {
+  margin-left:auto; flex-shrink:0;
+  font-family:'Space Grotesk',sans-serif; font-size:10.5px; font-weight:700;
+  padding:3px 10px; border-radius:99px; text-transform:uppercase; letter-spacing:0.05em;
+  background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.22); color:#059669;
+}
+
+.alloc-card-body { padding:16px 20px 18px; display:flex; flex-direction:column; gap:12px; }
+
+.alloc-assigned-label {
+  font-family:'Space Grotesk',sans-serif; font-size:10.5px; font-weight:700;
+  text-transform:uppercase; letter-spacing:0.09em; color:#8ba3c0;
+  display:flex; align-items:center; gap:6px;
+}
+
+.alloc-chips { display:flex; flex-wrap:wrap; gap:7px; min-height:28px; }
+.alloc-chip {
+  display:inline-flex; align-items:center; gap:6px;
+  background:rgba(37,99,235,0.08); border:1px solid rgba(37,99,235,0.22);
+  color:#2563eb; font-family:'Space Grotesk',sans-serif;
+  font-size:12px; font-weight:600; padding:4px 6px 4px 11px; border-radius:99px;
+  transition:all 0.15s;
+}
+.alloc-chip.vendor-chip {
+  background:rgba(16,185,129,0.08); border-color:rgba(16,185,129,0.24); color:#059669;
+}
+.alloc-chip:hover { background:rgba(37,99,235,0.14); }
+.alloc-chip-del {
+  width:16px; height:16px; border-radius:50%;
+  background:rgba(37,99,235,0.12); border:1px solid rgba(37,99,235,0.25);
+  display:flex; align-items:center; justify-content:center;
+  font-size:9px; cursor:pointer; color:#2563eb; transition:all 0.15s; flex-shrink:0;
+}
+.alloc-chip-del:hover { background:#ef4444; border-color:#ef4444; color:#fff; }
+.alloc-empty-clients { font-size:12.5px; color:#8ba3c0; font-style:italic; padding:4px 0; }
+
+.alloc-divider { height:1px; background:rgba(59,130,246,0.10); margin:4px 0; }
+.alloc-count-pill {
+  background:rgba(37,99,235,0.07); border:1px solid rgba(37,99,235,0.18);
+  color:#2563eb; font-family:'Space Grotesk',sans-serif;
+  font-size:11px; font-weight:700; padding:2px 9px; border-radius:99px;
+  display:inline-flex; align-items:center;
+}
+
+.alloc-add-row { display:flex; gap:8px; align-items:center; }
+.alloc-select {
+  flex:1; font-family:'Plus Jakarta Sans',sans-serif; font-size:13px;
+  background:#f8faff; border:1.5px solid rgba(59,130,246,0.20);
+  border-radius:8px; padding:8px 12px; color:#0f1c3f;
+  outline:none; cursor:pointer; appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right 10px center;
+  padding-right:28px; transition:all 0.18s;
+}
+.alloc-select:focus { border-color:#2563eb; background-color:#fff; box-shadow:0 0 0 3px rgba(37,99,235,0.09); }
+.alloc-select option { background:#fff; color:#0f1c3f; }
+
+.alloc-text-input {
+  font-family:'Plus Jakarta Sans',sans-serif; font-size:13px;
+  background:#f8faff; border:1.5px solid rgba(59,130,246,0.20);
+  border-radius:8px; padding:8px 12px; color:#0f1c3f;
+  outline:none; transition:all 0.18s; min-width:180px;
+}
+.alloc-text-input:focus { border-color:#2563eb; background-color:#fff; box-shadow:0 0 0 3px rgba(37,99,235,0.09); }
+
+.alloc-add-btn {
+  font-family:'Space Grotesk',sans-serif; font-size:12.5px; font-weight:700;
+  background:linear-gradient(135deg,#2563eb,#06b6d4); color:#fff;
+  border:none; border-radius:8px; padding:8px 16px; cursor:pointer;
+  display:inline-flex; align-items:center; gap:5px;
+  box-shadow:0 3px 12px rgba(37,99,235,0.24); transition:all 0.18s; flex-shrink:0;
+}
+.alloc-add-btn.vendor-btn { background:linear-gradient(135deg,#10b981,#06b6d4); }
+.alloc-add-btn.check-btn  { background:linear-gradient(135deg,#f97316,#fb923c); }
+.alloc-chip.check-chip { background:rgba(249,115,22,0.08); border-color:rgba(249,115,22,0.24); color:#ea580c; }
+.alloc-chip.check-chip .alloc-chip-del { background:rgba(249,115,22,0.12); border-color:rgba(249,115,22,0.28); color:#ea580c; }
+.alloc-add-btn:hover { filter:brightness(1.07); transform:translateY(-1px); }
+.alloc-add-btn:active { transform:scale(0.97); }
+.alloc-add-btn:disabled { opacity:0.4; cursor:not-allowed; transform:none; }
+
+/* Empty state */
+.alloc-no-users {
+  text-align:center; padding:64px 20px; color:#8ba3c0;
+  display:flex; flex-direction:column; align-items:center; gap:10px;
+}
+.alloc-no-users-icon { font-size:40px; opacity:0.25; }
+.alloc-no-users-text { font-family:'Space Grotesk',sans-serif; font-size:15px; }
+.alloc-no-users-sub  { font-size:13px; max-width:320px; line-height:1.6; opacity:0.75; text-align:center; }
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("alloc-css")) {
+  const s = document.createElement("style");
+  s.id = "alloc-css";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+/* ─────────────────────────── HELPERS ────────────────────────────────────── */
+const ne = (email = "") => String(email).trim().toLowerCase();
+
+/* 7 default check types — always available, admin can add more on top. */
+const DEFAULT_CHECK_TYPES = [
+  "Address Check",
+  "Employment Check",
+  "Asset Check",
+  "UAN Check",
+  "Education Check",
+  "Court Check",
+  "Passport Check",
+];
+
+function getAllUsers() {
+  try { return JSON.parse(localStorage.getItem("users") || "[]"); } catch { return []; }
+}
+
+function getAllTenants() {
+  try { return JSON.parse(localStorage.getItem("tenants") || "{}"); } catch { return {}; }
+}
+
+function safeArr(v) {
+  return Array.isArray(v) ? v : [];
+}
+
+function uniqueClean(list = []) {
+  return Array.from(
+    new Set(
+      safeArr(list)
+        .map(v => String(v || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function normName(v = "") {
+  return String(v || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeAllocationMapUserKeys(map = {}) {
+  const out = {};
+  if (!map || typeof map !== "object" || Array.isArray(map)) return out;
+
+  Object.entries(map).forEach(([rawEmail, rawList]) => {
+    const email = ne(rawEmail);
+    if (!email) return;
+    out[email] = uniqueClean([...(out[email] || []), ...safeArr(rawList)]);
+  });
+
+  return out;
+}
+
+function listIncludesName(list = [], name = "") {
+  const target = normName(name);
+  return !!target && safeArr(list).some(item => normName(item) === target);
+}
+
+function removeNameFromList(list = [], name = "") {
+  const target = normName(name);
+  return safeArr(list).filter(item => normName(item) !== target);
+}
+
+function differenceByName(base = [], assigned = []) {
+  const assignedSet = new Set(safeArr(assigned).map(normName).filter(Boolean));
+  return uniqueClean(base).filter(item => !assignedSet.has(normName(item)));
+}
+
+function readJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+async function syncAllocationMapToServer(clientKey, clientMap, vendorKey, vendorMap, checkKey, checkMap, extraKey, extraValue) {
+  try {
+    const localMap = JSON.parse(localStorage.getItem("clientAllocations_server_map") || "{}");
+    const serverMap = await tenantSyncAPI.getAllocations().catch(() => ({}));
+    const next = {
+      ...(serverMap && typeof serverMap === "object" ? serverMap : {}),
+      ...(localMap && typeof localMap === "object" ? localMap : {}),
+      [clientKey]: normalizeAllocationMapUserKeys(clientMap),
+      [vendorKey]: normalizeAllocationMapUserKeys(vendorMap),
+      ...(checkKey ? { [checkKey]: normalizeAllocationMapUserKeys(checkMap || {}) } : {}),
+      ...(extraKey ? { [extraKey]: extraValue } : {}),
+    };
+    localStorage.setItem("clientAllocations_server_map", JSON.stringify(next));
+    await tenantSyncAPI.syncAllocations(next);
+  } catch (err) {
+    console.warn("Allocation server sync failed:", err?.message || err);
+  }
+}
+
+function getScopedVendorKeys(currentUser = {}, safeEmail = "") {
+  const role = String(currentUser?.role || "").toLowerCase();
+  const email = ne(safeEmail || currentUser?.email || "");
+  const tenant = String(currentUser?.tenantId || currentUser?.subTenantId || "").trim();
+  const owner = ne(currentUser?.ownerAdminEmail || "");
+  const org = String(currentUser?.orgName || currentUser?.companyName || currentUser?.company || "").trim();
+
+  /*
+    STRICT VENDOR SCOPE:
+    - Super Admin can assign only Super Admin/Tervies vendors.
+    - Company Admin can assign only that company's/admin's vendors.
+    - We intentionally DO NOT read old shared keys like saved_upload_vendors
+      or vendors_superadmin for company admins, otherwise Super Admin vendors
+      leak into secondary/company admin screens.
+  */
+  const scopes = role === "superadmin"
+    ? uniqueClean(["superadmin", "__SUPERADMIN__", email])
+    : uniqueClean([tenant, email, owner, org]);
+
+  const keys = [];
+  scopes.forEach(scope => {
+    keys.push(`saved_upload_vendors__${scope}`);
+    keys.push(`deleted_upload_vendors__${scope}`);
+    keys.push(`vendors_${scope}`);
+    keys.push(`vendorPricing_${scope}`);
+  });
+
+  return keys;
+}
+
+function loadVendorsForAccount(currentUser = {}, safeEmail = "") {
+  const fromKeys = getScopedVendorKeys(currentUser, safeEmail);
+  let list = [];
+  const deleted = new Set();
+
+  fromKeys.forEach(key => {
+    const val = readJson(key, null);
+
+    if (key.toLowerCase().includes("deleted_upload_vendors")) {
+      if (Array.isArray(val)) val.forEach(v => deleted.add(String(v || "").trim()));
+      return;
+    }
+
+    if (Array.isArray(val)) list = [...list, ...val];
+    if (val && typeof val === "object" && Array.isArray(val.value)) list = [...list, ...val.value];
+  });
+
+  return uniqueClean(list).filter(v => !deleted.has(v));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MAIN COMPONENT
+═══════════════════════════════════════════════════════════════════════════ */
+export default function Allocations({ setAllocations, clients, checkNames, currentUserEmail, tenantId }) {
+  const currentUser  = JSON.parse(localStorage.getItem("currentUser") || "{}");
+  const safeEmail    = ne(currentUserEmail || currentUser?.email || "");
+  const isSA         = currentUser?.role === "superadmin";
+  const isAdmin      = currentUser?.role === "admin";
+  const allUsers     = getAllUsers();
+  const allTenants   = getAllTenants();
+
+  const [mode, setMode] = useState("client"); // client | vendor | check
+  const [vendorList, setVendorList] = useState(() => loadVendorsForAccount(currentUser, safeEmail));
+
+  /* ══════════════════════════════════════════════════════════════════
+     STRICT RULE — WHO IS "MY TEAM"
+  ══════════════════════════════════════════════════════════════════ */
+  const myTeam = useMemo(() => {
+    if (isSA) {
+      return allUsers.filter(u =>
+        u.role === "team" &&
+        u.status === "approved" &&
+        (u.isInternal === true || !u.tenantId) &&
+        u.email !== "superadmin@tervies.com"
+      );
+    }
+
+    if (isAdmin) {
+      return allUsers.filter(u =>
+        u.role === "team" &&
+        u.status === "approved" &&
+        ne(u.ownerAdminEmail || "") === safeEmail
+      );
+    }
+
+    return [];
+  }, [isSA, isAdmin, safeEmail, allUsers]);
+
+  /* Storage keys — scoped to THIS admin's email */
+  const storageKey          = `clientAllocations_${safeEmail}`;
+  const vendorStorageKey    = `vendorAllocations_${safeEmail}`;
+  const checkStorageKey     = `checkAllocations_${safeEmail}`;
+  const checkTypeListStorageKey = `checkTypeList_${safeEmail}`;
+
+  /* ── Allocation state ── */
+  const [localAlloc, setLocalAlloc] = useState(() => {
+    try { return normalizeAllocationMapUserKeys(JSON.parse(localStorage.getItem(storageKey) || "{}")); } catch { return {}; }
+  });
+
+  const [vendorAlloc, setVendorAlloc] = useState(() => {
+    try { return normalizeAllocationMapUserKeys(JSON.parse(localStorage.getItem(vendorStorageKey) || "{}")); } catch { return {}; }
+  });
+
+  const [checkAlloc, setCheckAlloc] = useState(() => {
+    try { return normalizeAllocationMapUserKeys(JSON.parse(localStorage.getItem(checkStorageKey) || "{}")); } catch { return {}; }
+  });
+
+  /* Managed check type list — 7 defaults + anything the admin adds. */
+  const [checkTypeList, setCheckTypeList] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(checkTypeListStorageKey) || "null");
+      if (Array.isArray(saved) && saved.length > 0) return uniqueClean(saved);
+    } catch { /* fall through to defaults */ }
+    return uniqueClean(DEFAULT_CHECK_TYPES);
+  });
+  const [newCheckTypeInput, setNewCheckTypeInput] = useState("");
+
+  const [selections, setSelections] = useState({});
+
+  /* Reload when currentUser changes + pull allocation data from server */
+  useEffect(() => {
+    let cancelled = false;
+
+    const applyClientAlloc = (saved) => {
+      if (cancelled) return;
+      const safe = normalizeAllocationMapUserKeys(saved || {});
+      setLocalAlloc(safe);
+      if (typeof setAllocations === "function") setAllocations(safe);
+    };
+
+    const applyVendorAlloc = (saved) => {
+      if (cancelled) return;
+      setVendorAlloc(normalizeAllocationMapUserKeys(saved || {}));
+    };
+
+    const applyCheckAlloc = (saved) => {
+      if (cancelled) return;
+      setCheckAlloc(normalizeAllocationMapUserKeys(saved || {}));
+    };
+
+    const applyCheckTypeList = (saved) => {
+      if (cancelled) return;
+      const arr = Array.isArray(saved) ? uniqueClean(saved) : [];
+      if (arr.length > 0) setCheckTypeList(arr);
+    };
+
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
+      applyClientAlloc(saved || {});
+    } catch {
+      applyClientAlloc({});
+    }
+
+    try {
+      const savedV = JSON.parse(localStorage.getItem(vendorStorageKey) || "{}");
+      applyVendorAlloc(savedV || {});
+    } catch {
+      applyVendorAlloc({});
+    }
+
+    try {
+      const savedCk = JSON.parse(localStorage.getItem(checkStorageKey) || "{}");
+      applyCheckAlloc(savedCk || {});
+    } catch {
+      applyCheckAlloc({});
+    }
+
+    try {
+      const savedList = JSON.parse(localStorage.getItem(checkTypeListStorageKey) || "null");
+      applyCheckTypeList(savedList);
+    } catch { /* keep default state */ }
+
+    setVendorList(loadVendorsForAccount(currentUser, safeEmail));
+
+    // Backend sync: allocations are stored as { [storageKey]: allocationMap }
+    tenantSyncAPI
+      .getAllocations()
+      .then((all) => {
+        const map = all && typeof all === "object" ? all : {};
+        Object.entries(map).forEach(([k, v]) => {
+          try { localStorage.setItem(k, JSON.stringify(v || {})); } catch (_) {}
+        });
+        if (map[storageKey])       applyClientAlloc(map[storageKey]);
+        if (map[vendorStorageKey]) applyVendorAlloc(map[vendorStorageKey]);
+        if (map[checkStorageKey])  applyCheckAlloc(map[checkStorageKey]);
+
+        const serverList = map[checkTypeListStorageKey];
+        if (Array.isArray(serverList) && serverList.length > 0) {
+          applyCheckTypeList(serverList);
+        } else if (!cancelled) {
+          // No managed check type list exists yet for this admin — seed it with
+          // the 7 defaults and push once. Does not touch client/vendor allocations.
+          const seeded = uniqueClean(DEFAULT_CHECK_TYPES);
+          setCheckTypeList(seeded);
+          localStorage.setItem(checkTypeListStorageKey, JSON.stringify(seeded));
+          const nextMap = { ...map, [checkTypeListStorageKey]: seeded };
+          tenantSyncAPI.syncAllocations(nextMap).catch(() => {});
+        }
+      })
+      .catch(() => {});
+
+    setSelections({});
+    return () => { cancelled = true; };
+  }, [storageKey, vendorStorageKey, checkStorageKey, checkTypeListStorageKey, safeEmail]);
+
+  /* Persist helpers — keeps old localStorage logic, plus server sync */
+  const persist = (updated) => {
+    const safeUpdated = normalizeAllocationMapUserKeys(updated);
+    setLocalAlloc(safeUpdated);
+    localStorage.setItem(storageKey, JSON.stringify(safeUpdated));
+    if (typeof setAllocations === "function") setAllocations(safeUpdated);
+
+    syncAllocationMapToServer(
+      storageKey,   safeUpdated,
+      vendorStorageKey, normalizeAllocationMapUserKeys(vendorAlloc),
+      checkStorageKey,  normalizeAllocationMapUserKeys(checkAlloc)
+    );
+  };
+
+  const persistVendors = (updated) => {
+    const safeUpdated = normalizeAllocationMapUserKeys(updated);
+    setVendorAlloc(safeUpdated);
+    localStorage.setItem(vendorStorageKey, JSON.stringify(safeUpdated));
+
+    syncAllocationMapToServer(
+      storageKey,   normalizeAllocationMapUserKeys(localAlloc),
+      vendorStorageKey, safeUpdated,
+      checkStorageKey,  normalizeAllocationMapUserKeys(checkAlloc)
+    );
+  };
+
+  const persistChecks = (updated) => {
+    const safeUpdated = normalizeAllocationMapUserKeys(updated);
+    setCheckAlloc(safeUpdated);
+    localStorage.setItem(checkStorageKey, JSON.stringify(safeUpdated));
+
+    syncAllocationMapToServer(
+      storageKey,   normalizeAllocationMapUserKeys(localAlloc),
+      vendorStorageKey, normalizeAllocationMapUserKeys(vendorAlloc),
+      checkStorageKey,  safeUpdated
+    );
+  };
+
+  const persistCheckTypeList = (updated) => {
+    const safeUpdated = uniqueClean(updated);
+    setCheckTypeList(safeUpdated);
+    localStorage.setItem(checkTypeListStorageKey, JSON.stringify(safeUpdated));
+
+    syncAllocationMapToServer(
+      storageKey,       normalizeAllocationMapUserKeys(localAlloc),
+      vendorStorageKey, normalizeAllocationMapUserKeys(vendorAlloc),
+      checkStorageKey,  normalizeAllocationMapUserKeys(checkAlloc),
+      checkTypeListStorageKey, safeUpdated
+    );
+  };
+
+  const addCheckType = (rawName) => {
+    const name = String(rawName || "").trim();
+    if (!name) return;
+    if (listIncludesName(checkTypeList, name)) return;
+    persistCheckTypeList([...checkTypeList, name]);
+  };
+
+  /* ── Available items ── */
+  const availableFor = (memberEmail) => {
+    const email = ne(memberEmail);
+    const assigned = localAlloc[email] || [];
+    return differenceByName(clients, assigned);
+  };
+
+  const availableVendorFor = (memberEmail) => {
+    const email = ne(memberEmail);
+    const assigned = vendorAlloc[email] || [];
+    return differenceByName(vendorList, assigned);
+  };
+
+  // Combined check type list = managed list (7 defaults + admin additions)
+  // UNION any Check Name values already present in uploaded records — never
+  // drops real data, only supplements it.
+  const combinedCheckTypes = uniqueClean([
+    ...checkTypeList,
+    ...(Array.isArray(checkNames) ? checkNames : []),
+  ]);
+
+  const availableCheckFor = (memberEmail) => {
+    const email = ne(memberEmail);
+    const assigned = checkAlloc[email] || [];
+    return differenceByName(combinedCheckTypes, assigned);
+  };
+
+  const assignClient = (email) => {
+    const safeMemberEmail = ne(email);
+    const chosen = selections[`client:${safeMemberEmail}`];
+    if (!chosen) return;
+    const existing = localAlloc[safeMemberEmail] || [];
+    if (listIncludesName(existing, chosen)) return;
+    persist({ ...localAlloc, [safeMemberEmail]: uniqueClean([...existing, chosen]) });
+    setSelections(s => ({ ...s, [`client:${safeMemberEmail}`]: "" }));
+  };
+
+  const assignVendor = (email) => {
+    const safeMemberEmail = ne(email);
+    const chosen = selections[`vendor:${safeMemberEmail}`];
+    if (!chosen) return;
+    const existing = vendorAlloc[safeMemberEmail] || [];
+    if (listIncludesName(existing, chosen)) return;
+    persistVendors({ ...vendorAlloc, [safeMemberEmail]: uniqueClean([...existing, chosen]) });
+    setSelections(s => ({ ...s, [`vendor:${safeMemberEmail}`]: "" }));
+  };
+
+  const removeClient = (email, client) => {
+    const safeMemberEmail = ne(email);
+    persist({ ...localAlloc, [safeMemberEmail]: removeNameFromList(localAlloc[safeMemberEmail] || [], client) });
+  };
+
+  const removeVendor = (email, vendor) => {
+    const safeMemberEmail = ne(email);
+    persistVendors({ ...vendorAlloc, [safeMemberEmail]: removeNameFromList(vendorAlloc[safeMemberEmail] || [], vendor) });
+  };
+
+  const assignCheck = (email) => {
+    const safeMemberEmail = ne(email);
+    const chosen = selections[`check:${safeMemberEmail}`];
+    if (!chosen) return;
+    const existing = checkAlloc[safeMemberEmail] || [];
+    if (listIncludesName(existing, chosen)) return;
+    persistChecks({ ...checkAlloc, [safeMemberEmail]: uniqueClean([...existing, chosen]) });
+    setSelections(s => ({ ...s, [`check:${safeMemberEmail}`]: "" }));
+  };
+
+  const removeCheck = (email, check) => {
+    const safeMemberEmail = ne(email);
+    persistChecks({ ...checkAlloc, [safeMemberEmail]: removeNameFromList(checkAlloc[safeMemberEmail] || [], check) });
+  };
+
+  /* ── Summary ── */
+  const myAssignedSet     = new Set(Object.values(localAlloc).flat().map(normName).filter(Boolean));
+  const vendorAssignedSet = new Set(Object.values(vendorAlloc).flat().map(normName).filter(Boolean));
+  const checkAssignedSet  = new Set(Object.values(checkAlloc).flat().map(normName).filter(Boolean));
+
+  const totalAssigned        = myAssignedSet.size;
+  const totalVendorsAssigned = vendorAssignedSet.size;
+  const totalChecksAssigned  = checkAssignedSet.size;
+  const membersActive        = Object.values(localAlloc).filter(a => a.length > 0).length;
+  const vendorMembersActive  = Object.values(vendorAlloc).filter(a => a.length > 0).length;
+  const checkMembersActive   = Object.values(checkAlloc).filter(a => a.length > 0).length;
+
+  const cleanClients  = uniqueClean(clients);
+  const cleanVendors  = uniqueClean(vendorList);
+  const cleanChecks   = uniqueClean(combinedCheckTypes);
+  const unallocated        = cleanClients.filter(c => !myAssignedSet.has(normName(c)));
+  const unallocatedVendors = cleanVendors.filter(v => !vendorAssignedSet.has(normName(v)));
+  const unallocatedChecks  = cleanChecks.filter(ch => !checkAssignedSet.has(normName(ch)));
+
+  const activeTotal       = mode === "vendor" ? cleanVendors.length  : mode === "check" ? cleanChecks.length  : cleanClients.length;
+  const activeAssigned    = mode === "vendor" ? totalVendorsAssigned  : mode === "check" ? totalChecksAssigned  : totalAssigned;
+  const activeMembers     = mode === "vendor" ? vendorMembersActive   : mode === "check" ? checkMembersActive   : membersActive;
+  const activeUnallocated = mode === "vendor" ? unallocatedVendors    : mode === "check" ? unallocatedChecks    : unallocated;
+
+  /* Org name for this admin */
+  const orgName = (() => {
+    if (isSA) return "Tervies (Internal)";
+    if (tenantId && allTenants[tenantId]) return allTenants[tenantId].name || tenantId;
+    return currentUser.orgName || tenantId || "Your Company";
+  })();
+
+  /* ════════════════════════════ RENDER ════════════════════════════ */
+  return (
+    <div className="alloc-root">
+
+      <div className="alloc-page-title">
+        {mode === "vendor" ? "Vendor Allocations" : mode === "check" ? "Check Allocations" : "Client Allocations"}
+      </div>
+      <div className="alloc-page-sub">
+        <span style={{
+          width:7, height:7, borderRadius:"50%", background:"#10b981",
+          boxShadow:"0 0 0 3px rgba(16,185,129,0.20)",
+          display:"inline-block", flexShrink:0,
+        }}/>
+        {mode === "vendor"
+          ? "Assign vendors to your team · Vendor mode does not show client names"
+          : mode === "check"
+          ? "Assign check types to your team · Member sees only their allocated check name rows"
+          : "Assign clients to your team · Only YOUR team members appear here · Saves instantly"}
+      </div>
+
+      <div className="alloc-mode-tabs">
+        <button
+          type="button"
+          className={`alloc-mode-btn ${mode === "client" ? "active" : ""}`}
+          onClick={() => setMode("client")}
+        >
+          📂 Client Allocation
+        </button>
+        <button
+          type="button"
+          className={`alloc-mode-btn ${mode === "vendor" ? "active" : ""}`}
+          onClick={() => setMode("vendor")}
+        >
+          🏢 Vendor Allocation
+        </button>
+        <button
+          type="button"
+          className={`alloc-mode-btn ${mode === "check" ? "active" : ""}`}
+          onClick={() => setMode("check")}
+        >
+          🔍 Check Allocation
+        </button>
+      </div>
+
+      {/* ── Manage check types — only in Check mode ── */}
+      {mode === "check" && (
+        <div className="alloc-notice notice-blue" style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+          <span className="alloc-notice-icon">🔍</span>
+          <div style={{ flex:1, minWidth:220 }}>
+            <div className="alloc-notice-title">Manage Check Types</div>
+            <div className="alloc-notice-sub">
+              7 defaults are always available. Add more below — they become assignable to your team immediately.
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <input
+              type="text"
+              className="alloc-text-input"
+              value={newCheckTypeInput}
+              onChange={e => setNewCheckTypeInput(e.target.value)}
+              placeholder="e.g. CIBIL Check"
+              onKeyDown={e => {
+                if (e.key === "Enter") {
+                  addCheckType(newCheckTypeInput);
+                  setNewCheckTypeInput("");
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="alloc-add-btn check-btn"
+              onClick={() => { addCheckType(newCheckTypeInput); setNewCheckTypeInput(""); }}
+              disabled={!newCheckTypeInput.trim()}
+            >
+              + Add
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Super Admin notice — explains they see only internal staff ── */}
+      {isSA && (
+        <div className="alloc-notice notice-blue">
+          <span className="alloc-notice-icon">👑</span>
+          <div>
+            <div className="alloc-notice-title">Super Admin — Internal Staff Only</div>
+            <div className="alloc-notice-sub">
+              You see only <strong>Tervies internal staff</strong> here (joined via "Join as Staff").<br/>
+              Company admins manage their own team members independently — you cannot allocate
+              clients/vendors to another company's team. Each company admin controls their own
+              allocations from their own Allocations page.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Company admin: show their access code as a reminder ── */}
+      {isAdmin && currentUser.adminAccessCode && (
+        <div className="alloc-notice notice-blue">
+          <span className="alloc-notice-icon">🔑</span>
+          <div>
+            <div className="alloc-notice-title">Your Team Access Code — {orgName}</div>
+            <div className="alloc-notice-sub">
+              Share this code with your team members so they can register under your company.
+              Only members who joined with <em>your specific code</em> appear below.
+            </div>
+            <code className="alloc-code-box">{currentUser.adminAccessCode}</code>
+          </div>
+        </div>
+      )}
+
+      {/* ── Unallocated warning ── */}
+      {activeUnallocated.length > 0 && myTeam.length > 0 && (
+        <div className="alloc-notice notice-amber">
+          <span className="alloc-notice-icon">⚠️</span>
+          <div>
+            <div className="alloc-notice-title">
+              {mode === "vendor" ? "Unallocated Vendors" : mode === "check" ? "Unallocated Check Types" : "Unallocated Clients"} ({activeUnallocated.length})
+            </div>
+            <div className="alloc-notice-sub">
+              Not yet assigned to anyone on your team: {" "}
+              <strong>{activeUnallocated.join(", ")}</strong>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Summary strip ── */}
+      <div className="alloc-summary">
+        {[
+          { label:"My Team", val: myTeam.length },
+          { label: mode === "vendor" ? "Total Vendors" : mode === "check" ? "Total Checks" : "Total Clients", val: activeTotal },
+          { label: mode === "vendor" ? "Vendors Assigned" : mode === "check" ? "Checks Assigned" : "Clients Assigned", val: activeAssigned },
+          { label:"Members Active", val: activeMembers },
+          {
+            label:"Unallocated",
+            val: activeUnallocated.length,
+            style: {
+              background: activeUnallocated.length > 0
+                ? "linear-gradient(135deg,#f59e0b,#fbbf24)"
+                : "linear-gradient(135deg,#10b981,#34d399)",
+            },
+          },
+        ].map((s, i, arr) => (
+          <div key={s.label} style={{ display:"flex", alignItems:"center", gap:24 }}>
+            <div className="alloc-summary-item">
+              <span className="alloc-summary-label">{s.label}</span>
+              <span className="alloc-summary-val" style={s.style || {}}>{s.val}</span>
+            </div>
+            {i < arr.length - 1 && <div className="alloc-summary-div"/>}
+          </div>
+        ))}
+      </div>
+
+      {mode === "vendor" && cleanVendors.length === 0 && (
+        <div className="alloc-notice notice-amber">
+          <span className="alloc-notice-icon">🏢</span>
+          <div>
+            <div className="alloc-notice-title">No saved vendors found</div>
+            <div className="alloc-notice-sub">
+              Add vendors first from Add Clients / Vendor Company Name section. After that, vendors will appear here for assignment.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {mode === "check" && cleanChecks.length === 0 && (
+        <div className="alloc-notice notice-amber">
+          <span className="alloc-notice-icon">🔍</span>
+          <div>
+            <div className="alloc-notice-title">No check types found</div>
+            <div className="alloc-notice-sub">
+              Check types are derived from the "Check Name" column in uploaded records. Upload records with a Check Name column first, then return here to allocate them.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── No team members ── */}
+      {myTeam.length === 0 ? (
+        <div className="alloc-no-users">
+          <div className="alloc-no-users-icon">👥</div>
+          <div className="alloc-no-users-text">
+            {isSA
+              ? "No internal Tervies staff yet"
+              : "No team members linked to your account yet"}
+          </div>
+          <div className="alloc-no-users-sub">
+            {isSA ? (
+              'Internal staff register via the "Join as Staff" tab on the login page. Once you approve them, they appear here.'
+            ) : (
+              <>
+                Team members must register using <strong>your specific access code</strong>{" "}
+                on the "Company Access → Join Company" tab.
+                {currentUser.adminAccessCode && (
+                  <>
+                    <br/><br/>
+                    Your code: {" "}
+                    <code className="alloc-code-box">{currentUser.adminAccessCode}</code>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="alloc-grid">
+          {myTeam.map(member => {
+            const email     = ne(member.email);
+            const assigned  = mode === "vendor" ? (vendorAlloc[email] || []) : mode === "check" ? (checkAlloc[email] || []) : (localAlloc[email] || []);
+            const available = mode === "vendor" ? availableVendorFor(email) : mode === "check" ? availableCheckFor(email) : availableFor(email);
+            const initial   = (member.name || member.email || "?")[0].toUpperCase();
+            const selectionKey = `${mode}:${email}`;
+
+            return (
+              <div key={email} className="alloc-card">
+
+                {/* Card header */}
+                <div className="alloc-card-head">
+                  <div className="alloc-avatar">{initial}</div>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div className="alloc-member-name">{member.name || "—"}</div>
+                    <div className="alloc-member-email">{email}</div>
+                    {member.registeredAt && (
+                      <div style={{ fontSize:11, color:"#8ba3c0", marginTop:2, fontFamily:"'Space Grotesk',sans-serif" }}>
+                        Joined: {member.registeredAt}
+                      </div>
+                    )}
+                  </div>
+                  <span className="alloc-role-pill">👤 Team</span>
+                </div>
+
+                {/* Card body */}
+                <div className="alloc-card-body">
+
+                  {/* Assigned clients/vendors/checks */}
+                  <div>
+                    <div className="alloc-assigned-label">
+                      {mode === "vendor" ? "🏢 Assigned Vendors" : mode === "check" ? "🔍 Assigned Checks" : "📂 Assigned Clients"}
+                      {assigned.length > 0 && (
+                        <span className="alloc-count-pill">{assigned.length}</span>
+                      )}
+                    </div>
+                    <div className="alloc-chips" style={{ marginTop:8 }}>
+                      {assigned.length === 0 ? (
+                        <span className="alloc-empty-clients">
+                          {mode === "vendor" ? "No vendors assigned yet" : mode === "check" ? "No check types assigned yet" : "No clients assigned yet"}
+                        </span>
+                      ) : (
+                        assigned.map(item => (
+                          <span key={item} className={`alloc-chip ${mode === "vendor" ? "vendor-chip" : mode === "check" ? "check-chip" : ""}`}>
+                            {item}
+                            <span
+                              className="alloc-chip-del"
+                              onClick={() => mode === "vendor" ? removeVendor(email, item) : mode === "check" ? removeCheck(email, item) : removeClient(email, item)}
+                              title={`Remove ${item}`}>
+                              ✕
+                            </span>
+                          </span>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="alloc-divider"/>
+
+                  {/* Assign new client/vendor/check */}
+                  <div>
+                    <div className="alloc-assigned-label" style={{ marginBottom:8 }}>
+                      {mode === "vendor" ? "➕ Assign Vendor" : mode === "check" ? "➕ Assign Check Type" : "➕ Assign Client"}
+                    </div>
+                    <div className="alloc-add-row">
+                      <select
+                        className="alloc-select"
+                        value={selections[selectionKey] || ""}
+                        onChange={e => setSelections(s => ({ ...s, [selectionKey]: e.target.value }))}>
+                        <option value="">{mode === "vendor" ? "Choose vendor…" : mode === "check" ? "Choose check type…" : "Choose client…"}</option>
+                        {available.map(c => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                      <button
+                        className={`alloc-add-btn ${mode === "vendor" ? "vendor-btn" : mode === "check" ? "check-btn" : ""}`}
+                        onClick={() => mode === "vendor" ? assignVendor(email) : mode === "check" ? assignCheck(email) : assignClient(email)}
+                        disabled={!selections[selectionKey]}>
+                        + Assign
+                      </button>
+                    </div>
+
+                    {available.length === 0 && activeTotal > 0 && (
+                      <div style={{
+                        fontSize:11.5, color:"#10b981",
+                        fontFamily:"'Space Grotesk',sans-serif",
+                        fontWeight:600, marginTop:8,
+                      }}>
+                        ✅ All available {mode === "vendor" ? "vendors" : mode === "check" ? "check types" : "clients"} assigned to this member
+                      </div>
+                    )}
+
+                    {activeTotal === 0 && (
+                      <div style={{ fontSize:11.5, color:"#8ba3c0", marginTop:8, fontStyle:"italic" }}>
+                        {mode === "vendor" ? "No vendors yet — add vendors first" : mode === "check" ? "No check types yet — upload records with Check Name first" : "No clients yet — upload data first"}
+                      </div>
+                    )}
+                  </div>
+
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+    </div>
+  );
+}

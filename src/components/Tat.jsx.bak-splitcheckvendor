@@ -1,0 +1,1684 @@
+/**
+ * TAT.jsx — VENDOR + CLIENT TAT with Day-4 Drill-down
+ *
+ * PENDING-ONLY FILTER (this version):
+ * ─────────────────────────────────────────────────────────────
+ * TAT now only tracks cases where Status === "Pending".
+ * All other statuses (Sent, Closed, Insuff, Hold, Stop) are
+ * completely ignored by the TAT tracker.
+ *
+ * INSUFF TAT LOGIC (Client TAT only):
+ * ─────────────────────────────────────────────────────────────
+ * When a case status is "Insuff" in Client TAT mode:
+ *   - Sent Date  → reads from "Insuff Date" column
+ *   - Completed  → reads from "Insuff Clear Date" column
+ *   - If Insuff Clear Date is empty → case is ongoing (TAT keeps counting)
+ *   - Table shows purple ⚠️ INSUFF DATE / ✅ INSUFF CLEARED labels
+ *
+ * All other logic (Vendor TAT, non-insuff Client TAT, Day-4, penalties,
+ * worker, virtual scroll, filters) is completely unchanged.
+ */
+
+import {
+  useState, useEffect, useRef,
+  useMemo, memo, startTransition,
+} from "react";
+import * as XLSX from "xlsx";
+import { saveAs } from "file-saver";
+import { uploadAPI } from "../api/api";
+
+/* ─────────────────────────── CSS ────────────────────────────────────────── */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+.tat{font-family:'Plus Jakarta Sans',sans-serif;color:#0f1c3f;}
+
+/* TAT Mode Tabs */
+.tat-mode-bar{display:flex;gap:0;margin-bottom:18px;background:#fff;border:1.5px solid rgba(59,130,246,0.18);border-radius:13px;overflow:hidden;box-shadow:0 3px 12px rgba(37,99,235,0.07);}
+.tat-mode-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:13px 18px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.18s;color:#8ba3c0;border:none;background:transparent;position:relative;}
+.tat-mode-tab.active-vendor{background:linear-gradient(135deg,#1d4ed8,#0891b2);color:#fff;}
+.tat-mode-tab.active-client{background:linear-gradient(135deg,#7c3aed,#a21caf);color:#fff;}
+.tat-mode-tab:not(.active-vendor):not(.active-client):hover{background:rgba(37,99,235,0.05);color:#2563eb;}
+.tat-mode-div{width:1px;background:rgba(59,130,246,0.18);}
+.mode-icon{font-size:16px;}
+.mode-badge{font-size:9px;font-weight:800;padding:2px 7px;border-radius:99px;background:rgba(255,255,255,0.22);letter-spacing:0.08em;text-transform:uppercase;}
+.tat-mode-tab:not(.active-vendor):not(.active-client) .mode-badge{background:rgba(37,99,235,0.09);color:#2563eb;}
+
+/* Day-4 Alert Banner */
+.day4-banner{display:flex;align-items:center;gap:10px;border-radius:12px;padding:13px 18px;margin-bottom:14px;cursor:pointer;transition:all 0.16s;position:relative;overflow:hidden;}
+.day4-banner-v{background:linear-gradient(135deg,rgba(245,158,11,0.10),rgba(251,191,36,0.06));border:2px solid rgba(245,158,11,0.35);}
+.day4-banner-c{background:linear-gradient(135deg,rgba(124,58,237,0.10),rgba(167,139,250,0.06));border:2px solid rgba(124,58,237,0.35);}
+.day4-banner.active-d4{box-shadow:0 4px 18px rgba(245,158,11,0.18);}
+.day4-banner-c.active-d4{box-shadow:0 4px 18px rgba(124,58,237,0.18);}
+.day4-icon{font-size:22px;flex-shrink:0;}
+.day4-text{flex:1;}
+.day4-title{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:700;color:#92400e;}
+.day4-title-c{color:#5b21b6;}
+.day4-sub{font-size:11.5px;color:#8ba3c0;margin-top:2px;}
+.day4-ct{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:800;color:#b45309;}
+.day4-ct-c{color:#6d28d9;}
+.day4-btn{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;padding:5px 13px;border-radius:99px;border:none;cursor:pointer;transition:all 0.14s;}
+.day4-btn-v{background:rgba(245,158,11,0.15);color:#92400e;border:1px solid rgba(245,158,11,0.35);}
+.day4-btn-v:hover,.day4-banner.active-d4 .day4-btn-v{background:#f59e0b;color:#fff;}
+.day4-btn-c{background:rgba(124,58,237,0.12);color:#5b21b6;border:1px solid rgba(124,58,237,0.30);}
+.day4-btn-c:hover,.day4-banner-c.active-d4 .day4-btn-c{background:#7c3aed;color:#fff;}
+
+/* Summary cards */
+.tat-sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:11px;margin-bottom:18px;}
+.tat-sc{background:#fff;border:1.5px solid rgba(59,130,246,0.18);border-radius:13px;padding:15px 17px;display:flex;align-items:center;gap:11px;box-shadow:0 3px 12px rgba(37,99,235,0.07);}
+.tat-sc-v{border-color:rgba(37,99,235,0.18);}
+.tat-sc-c{border-color:rgba(124,58,237,0.18);}
+.tat-si{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.si-b{background:rgba(37,99,235,0.10);border:1px solid rgba(37,99,235,0.20);}
+.si-g{background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.20);}
+.si-a{background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.20);}
+.si-r{background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.20);}
+.si-p{background:rgba(124,58,237,0.10);border:1px solid rgba(124,58,237,0.20);}
+.tat-sl{font-family:'Space Grotesk',sans-serif;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.09em;color:#8ba3c0;margin-bottom:2px;}
+.tat-sv{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;line-height:1.1;}
+.sv-b{background:linear-gradient(135deg,#2563eb,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.sv-g{background:linear-gradient(135deg,#10b981,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.sv-a{background:linear-gradient(135deg,#f59e0b,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.sv-r{background:linear-gradient(135deg,#ef4444,#f87171);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.sv-p{background:linear-gradient(135deg,#7c3aed,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.tat-ss{font-size:10px;color:#8ba3c0;margin-top:2px;font-family:'Space Grotesk',sans-serif;}
+
+/* Client dropdown */
+.tat-client-filter{display:flex;align-items:center;gap:10px;margin-bottom:13px;flex-wrap:wrap;}
+.tat-client-label{font-family:'Space Grotesk',sans-serif;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.09em;color:#8ba3c0;}
+.tat-client-select{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;background:#f8faff;border:1.5px solid rgba(59,130,246,0.18);border-radius:10px;padding:9px 34px 9px 12px;color:#0f1c3f;outline:none;cursor:pointer;appearance:none;min-width:260px;max-width:360px;transition:all 0.16s;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+.tat-client-select:focus{background-color:#fff;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.09);}
+.tat-client-select option{background:#fff;color:#0f1c3f;}
+.tat-client-clear{display:inline-flex;align-items:center;gap:5px;font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;padding:7px 12px;border-radius:99px;cursor:pointer;border:1px solid rgba(37,99,235,0.20);background:rgba(37,99,235,0.07);color:#2563eb;transition:all 0.14s;}
+.tat-client-clear:hover{background:rgba(37,99,235,0.12);}
+
+/* Controls */
+.tat-ctrl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:#fff;border:1.5px solid rgba(59,130,246,0.18);border-radius:12px;padding:12px 15px;margin-bottom:14px;box-shadow:0 2px 7px rgba(37,99,235,0.05);}
+.tat-sw{position:relative;display:inline-flex;align-items:center;}
+.tat-sico{position:absolute;left:10px;font-size:13px;color:#8ba3c0;pointer-events:none;}
+.tat-inp{font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;background:#f8faff;border:1.5px solid rgba(59,130,246,0.18);border-radius:8px;padding:7px 11px;color:#0f1c3f;outline:none;transition:all 0.14s;}
+.tat-inp:focus{background:#fff;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.09);}
+.tat-inp::placeholder{color:#8ba3c0;}
+.tat-sw .tat-inp{padding-left:30px;width:200px;}
+.tat-chip{display:inline-flex;align-items:center;gap:3px;background:rgba(37,99,235,0.07);border:1px solid rgba(37,99,235,0.20);color:#2563eb;font-size:11px;font-weight:600;padding:4px 10px;border-radius:99px;font-family:'Space Grotesk',sans-serif;cursor:pointer;transition:all 0.12s;white-space:nowrap;}
+.tat-chip:hover{background:rgba(37,99,235,0.12);}
+.tat-chip.on{background:linear-gradient(135deg,#2563eb,#06b6d4);color:#fff;border-color:transparent;box-shadow:0 2px 7px rgba(37,99,235,0.24);}
+.tat-chip.on-p{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;border-color:transparent;box-shadow:0 2px 7px rgba(124,58,237,0.24);}
+.tat-rdiv{width:1px;height:22px;background:rgba(59,130,246,0.14);}
+
+/* Table */
+.tat-tw{background:#fff;border:1.5px solid rgba(59,130,246,0.18);border-radius:13px;overflow:hidden;box-shadow:0 4px 18px rgba(37,99,235,0.07);}
+.tat-tw-c{border-color:rgba(124,58,237,0.18);}
+.tat-vs{max-height:510px;overflow:auto;scroll-behavior:auto;will-change:auto;width:100%;}
+.tat-vs::-webkit-scrollbar{height:5px;width:5px;}
+.tat-vs::-webkit-scrollbar-track{background:#f0f6ff;}
+.tat-vs::-webkit-scrollbar-thumb{background:rgba(37,99,235,0.22);border-radius:99px;}
+table.tat-t{width:max-content;min-width:1680px;border-collapse:separate;border-spacing:0;font-size:13px;table-layout:fixed;}
+.tat-thead-v tr{background:linear-gradient(135deg,#1d4ed8,#0891b2);}
+.tat-thead-c tr{background:linear-gradient(135deg,#5b21b6,#7c3aed);}
+.tat-th{font-family:'Space Grotesk',sans-serif;font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.86);padding:12px 14px;text-align:left;white-space:nowrap;border-right:1px solid rgba(255,255,255,0.10);position:sticky;top:0;z-index:10;cursor:pointer;user-select:none;overflow:hidden;text-overflow:ellipsis;}
+.tat-th-v{background:linear-gradient(135deg,#1d4ed8,#0891b2);}
+.tat-th-c{background:linear-gradient(135deg,#5b21b6,#7c3aed);}
+.tat-th:last-child{border-right:none;}
+.tat-tr{border-bottom:1px solid rgba(59,130,246,0.09);height:46px;}
+.tat-tr:nth-child(even){background:#f8faff;}
+.tat-tr:hover{background:#eef4ff!important;}
+.tat-td{padding:10px 14px;color:#0f1c3f;vertical-align:middle;white-space:nowrap;border-right:1px solid rgba(59,130,246,0.07);overflow:hidden;text-overflow:ellipsis;height:46px;}
+.tat-td:last-child{border-right:none;}
+.tat-vpad td{padding:0;border:none;}
+
+/* Badges */
+.pb{display:inline-flex;align-items:center;gap:4px;font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;white-space:nowrap;}
+.p0 {background:rgba(16,185,129,0.09);border:1px solid rgba(16,185,129,0.25);color:#059669;}
+.p10{background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.28);color:#b45309;}
+.p20{background:rgba(249,115,22,0.10);border:1px solid rgba(249,115,22,0.28);color:#c2410c;}
+.p50{background:rgba(127,0,255,0.09);border:1px solid rgba(127,0,255,0.28);color:#6d28d9;}
+.p4d{background:rgba(245,158,11,0.15);border:2px solid rgba(245,158,11,0.50);color:#92400e;}
+.ddb{display:inline-flex;align-items:center;gap:3px;font-family:'Space Grotesk',sans-serif;font-size:12.5px;font-weight:700;padding:3px 9px;border-radius:7px;}
+.dok{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.22);color:#059669;}
+.dw1{background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);color:#b45309;}
+.dw2{background:rgba(249,115,22,0.08);border:1px solid rgba(249,115,22,0.25);color:#c2410c;}
+.dda{background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);color:#b91c1c;}
+.ddc{background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.25);color:#6d28d9;}
+.dlv{background:rgba(37,99,235,0.07);border:1px solid rgba(37,99,235,0.20);color:#2563eb;}
+
+/* Bar */
+.tat-bw{display:flex;align-items:center;gap:6px;}
+.tat-bg{flex:1;height:5px;border-radius:99px;background:rgba(59,130,246,0.10);overflow:hidden;min-width:44px;}
+.tat-bf{height:100%;border-radius:99px;}
+.bk{background:linear-gradient(90deg,#10b981,#34d399);}
+.bw1{background:linear-gradient(90deg,#f59e0b,#fbbf24);}
+.bw2{background:linear-gradient(90deg,#f97316,#fb923c);}
+.bda{background:linear-gradient(90deg,#ef4444,#f87171);}
+.bdc{background:linear-gradient(90deg,#7c3aed,#a78bfa);}
+
+/* Live dot */
+@keyframes tdot{0%,100%{box-shadow:0 0 0 3px rgba(37,99,235,0.18);}50%{box-shadow:0 0 0 7px rgba(37,99,235,0.06);}}
+.tdot{width:6px;height:6px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.18);animation:tdot 2s ease infinite;display:inline-block;flex-shrink:0;}
+
+/* Footer */
+.tat-ft{display:flex;align-items:center;justify-content:space-between;background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(6,182,212,0.04));border:1.5px solid rgba(37,99,235,0.16);border-radius:12px;padding:15px 24px;margin-top:13px;flex-wrap:wrap;gap:12px;}
+.tat-ft-c{background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(168,85,247,0.04));border-color:rgba(124,58,237,0.16);}
+.tat-fl{font-family:'Space Grotesk',sans-serif;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.09em;color:#8ba3c0;margin-bottom:3px;}
+.tat-fv{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;}
+
+
+/* Pagination controls */
+.tat-pagebar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;background:#fff;border:1.5px solid rgba(59,130,246,0.18);border-radius:12px;padding:10px 14px;margin:12px 0;box-shadow:0 2px 7px rgba(37,99,235,0.05);}
+.tat-page-left,.tat-page-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.tat-page-info{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;color:#4a6080;}
+.tat-page-btn{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;border:1.5px solid rgba(59,130,246,0.20);background:#f8faff;color:#2563eb;border-radius:8px;padding:7px 11px;cursor:pointer;transition:all 0.14s;}
+.tat-page-btn:hover:not(:disabled){background:rgba(37,99,235,0.09);transform:translateY(-1px);}
+.tat-page-btn:disabled{opacity:0.45;cursor:not-allowed;transform:none;}
+.tat-page-select{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;background:#f8faff;border:1.5px solid rgba(59,130,246,0.20);border-radius:8px;padding:7px 30px 7px 10px;color:#0f1c3f;outline:none;cursor:pointer;appearance:none;}
+.tat-sheet-note{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;color:#8ba3c0;background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.14);border-radius:99px;padding:5px 11px;}
+
+.tat-mail-btn{display:inline-flex;align-items:center;gap:6px;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:800;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;background:linear-gradient(135deg,#f97316,#fb923c);color:#fff;box-shadow:0 4px 14px rgba(249,115,22,0.24);transition:all 0.15s;}
+.tat-mail-btn:hover{filter:brightness(1.06);transform:translateY(-1px);}
+.tat-mail-btn:disabled{opacity:0.45;cursor:not-allowed;transform:none;filter:none;}
+.tat-mail-note{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;color:#8ba3c0;background:rgba(249,115,22,0.07);border:1px solid rgba(249,115,22,0.18);border-radius:99px;padding:5px 10px;}
+
+/* Empty */
+.tat-empty{text-align:center;padding:52px 20px;color:#8ba3c0;}
+.tat-ei{font-size:36px;opacity:0.22;margin-bottom:10px;}
+.tat-et{font-family:'Space Grotesk',sans-serif;font-size:14px;}
+
+/* Processing indicator */
+.tat-proc{display:inline-flex;align-items:center;gap:5px;font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:600;color:#2563eb;background:rgba(37,99,235,0.07);border:1px solid rgba(37,99,235,0.18);padding:3px 10px;border-radius:99px;}
+.ts{width:8px;height:8px;border:1.5px solid rgba(37,99,235,0.20);border-top-color:#2563eb;border-radius:50%;animation:tsp 0.6s linear infinite;}
+@keyframes tsp{to{transform:rotate(360deg);}}
+
+/* No-data notice */
+.tat-nd{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,rgba(245,158,11,0.06),rgba(251,191,36,0.04));border:1.5px dashed rgba(245,158,11,0.30);border-radius:12px;padding:16px 20px;margin-bottom:14px;}
+.tat-ndi{font-size:20px;flex-shrink:0;opacity:0.7;}
+.tat-ndt{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;color:#92400e;}
+.tat-nds{font-size:12px;color:#8ba3c0;margin-top:3px;}
+
+.si-arrow{font-size:8px;opacity:0.55;}
+
+/* Pending-only notice banner */
+.tat-pending-notice{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,rgba(245,158,11,0.07),rgba(251,191,36,0.04));border:1.5px solid rgba(245,158,11,0.28);border-radius:12px;padding:11px 16px;margin-bottom:14px;}
+.tat-pending-notice-icon{font-size:16px;flex-shrink:0;}
+.tat-pending-notice-text{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;color:#92400e;}
+.tat-pending-notice-sub{font-size:11px;color:#8ba3c0;margin-top:1px;}
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("tat-css3")) {
+  const s = document.createElement("style");
+  s.id = "tat-css3";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+/* ─────────────────────────── CONSTANTS ──────────────────────────────────── */
+const MASTER_KEY = "__MASTER_TABLE__";
+const ROW_H = 46;
+const OVER = 5;
+
+/* ─────────────────────────── DATE HELPERS ───────────────────────────────── */
+const D_CACHE = new Map();
+
+function parseDate(str) {
+  if (!str) return null;
+
+  // Already a JS Date object — keep row's original value, no overwrite.
+  if (str instanceof Date && !Number.isNaN(str.getTime())) return str;
+
+  const s = String(str).trim();
+  if (!s) return null;
+  if (D_CACHE.has(s)) return D_CACHE.get(s);
+
+  let dt = null;
+
+  // Excel serial number (example: 46148). This keeps every row independent.
+  const serial = Number(s);
+  if (Number.isFinite(serial) && serial > 1000 && serial < 80000 && s === String(Math.floor(serial))) {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    const candidate = new Date(excelEpoch.getTime() + serial * 86400000);
+    if (!Number.isNaN(candidate.getTime()) && candidate.getFullYear() > 1950 && candidate.getFullYear() < 2100) {
+      D_CACHE.set(s, candidate);
+      return candidate;
+    }
+  }
+
+  // ISO / DB format: 2026-05-06 or 2026-05-06T...
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    const y = Number(iso[1]);
+    const m = Number(iso[2]);
+    const d = Number(iso[3]);
+    const candidate = new Date(y, m - 1, d);
+    if (!Number.isNaN(candidate.getTime()) && candidate.getFullYear() > 1950 && candidate.getFullYear() < 2100) dt = candidate;
+  }
+
+  // Slash / hyphen dates.
+  // Important: no static date is used here. Each row is parsed from its own cell value.
+  // In your portal, Excel short date like 5/6/26 should display as 06 May 2026.
+  if (!dt) {
+    const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
+    if (m) {
+      const first = Number(m[1]);
+      const second = Number(m[2]);
+      let year = Number(m[3]);
+      const shortYear = m[3].length === 2;
+      if (year < 100) year += 2000;
+
+      let day;
+      let month;
+
+      if (first > 12) {
+        day = first;
+        month = second;
+      } else if (second > 12) {
+        month = first;
+        day = second;
+      } else if (shortYear) {
+        // 5/6/26 => 06 May 2026, 4/29/26 => 29 Apr 2026
+        month = first;
+        day = second;
+      } else {
+        // 02/05/2026 => 02 May 2026
+        day = first;
+        month = second;
+      }
+
+      const candidate = new Date(year, month - 1, day);
+      if (!Number.isNaN(candidate.getTime()) && candidate.getFullYear() > 1950 && candidate.getFullYear() < 2100) dt = candidate;
+    }
+  }
+
+  // Text date like 06 May 2026 / 05 Jun 2026.
+  if (!dt) {
+    const candidate = new Date(s);
+    if (!Number.isNaN(candidate.getTime()) && candidate.getFullYear() > 1950 && candidate.getFullYear() < 2100) dt = candidate;
+  }
+
+  D_CACHE.set(s, dt);
+  return dt;
+}
+
+function fmtINR(n) {
+  return "₹\u202f" + Number(n || 0).toLocaleString("en-IN");
+}
+
+function fmtDate(dt) {
+  if (!dt) return null;
+  return dt.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function cleanMailText(value) {
+  return String(value ?? "-").replace(/\s+/g, " ").trim() || "-";
+}
+
+function limitMailText(value, max = 60) {
+  const text = cleanMailText(value);
+  return text.length > max ? text.slice(0, max - 3) + "..." : text;
+}
+
+function safeFilename(value) {
+  return String(value || "vendor")
+    .replace(/[\/:*?"<>|]+/g, "")
+    .replace(/\s+/g, "_")
+    .trim() || "vendor";
+}
+
+function downloadVendorPendingExcel(vendorName, rows) {
+  const today = new Date().toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+
+  const excelRows = rows.map((r, i) => ({
+    "S.No": i + 1,
+    "Candidate Name": cleanMailText(r.cand),
+    "Candidate Phone": cleanMailText(r.phone),
+    "Address": cleanMailText(r.address),
+    "Check / Vendor": cleanMailText(r.chk),
+    "Sent Date": cleanMailText(r.sentStr || "Not sent"),
+    "TAT Days": r.tatDays !== null ? r.tatDays : "No sent date",
+    "Status": "Pending",
+  }));
+
+  const ws = XLSX.utils.json_to_sheet(excelRows);
+  ws["!cols"] = [
+    { wch: 8 },
+    { wch: 24 },
+    { wch: 18 },
+    { wch: 55 },
+    { wch: 22 },
+    { wch: 15 },
+    { wch: 12 },
+    { wch: 14 },
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Pending Cases");
+
+  const filename = `Pending_Cases_${safeFilename(vendorName)}_${safeFilename(today)}.xlsx`;
+  const buffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([buffer], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  saveAs(blob, filename);
+  return filename;
+}
+
+function buildVendorPendingMail(vendorName, rows) {
+  const today = new Date().toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+
+  const lines = rows.map((r, i) => {
+    return `${i + 1}. Candidate: ${cleanMailText(r.cand)}\n` +
+      `   Phone: ${cleanMailText(r.phone)}\n` +
+      `   Address: ${limitMailText(r.address, 120)}\n` +
+      `   Sent Date: ${cleanMailText(r.sentStr || "Not sent")}\n` +
+      `   TAT: ${r.tatDays !== null ? `${r.tatDays} day(s)` : "No sent date"}\n`;
+  }).join("\n");
+
+  return {
+    subject: `Pending Cases - ${vendorName} - ${today}`,
+    body:
+`Dear ${vendorName},
+
+Please find below the pending BGV cases assigned to you.
+
+Total Pending Cases: ${rows.length}
+Date: ${today}
+
+${lines}
+Kindly complete these cases on priority and share the updates.
+
+Regards,
+Tervies Team`,
+  };
+}
+
+// FINAL TAT DAY LOGIC
+// Fix: old Date/timezone calculation was showing 1 day less.
+// This uses calendar-date UTC difference only.
+// Example: 21 Apr to 30 Apr = 9 days, not 8 and not 10.
+function dateOnlyUTC(dt) {
+  if (!dt) return null;
+  return Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate());
+}
+
+function todayOnlyUTC() {
+  const t = new Date();
+  return Date.UTC(t.getFullYear(), t.getMonth(), t.getDate());
+}
+
+function calcTatDays(startDate, endDate = null) {
+  if (!startDate) return null;
+  const start = dateOnlyUTC(startDate);
+  const end = endDate ? dateOnlyUTC(endDate) : todayOnlyUTC();
+  if (start === null || end === null) return null;
+
+  const diff = Math.floor((end - start) / 86400000);
+  return Math.max(0, diff);
+}
+
+/* ─────────────────────────── TAT TIER LOGIC ─────────────────────────────── */
+function penTier(days, isOngoing) {
+  if (isOngoing || days === null) return [0, "—", "p0", "bk", "dlv"];
+  if (days <= 5) return [0, "0%", "p0", "bk", "dok"];
+  if (days <= 8) return [10, "10%", "p10", "bw1", "dw1"];
+  if (days <= 10) return [20, "20%", "p20", "bw2", "dw2"];
+  return [50, "50%", "p50", "bdc", "ddc"];
+}
+
+/* ─────────────────────────── BUILD ROWS ─────────────────────────────────── */
+function buildAllRows(clientsData, tatMode) {
+  const clientList = Object.keys(clientsData).filter((k) => k !== MASTER_KEY);
+  const rows = [];
+  let idx = 0;
+
+  for (const ck of clientList) {
+    const list = clientsData[ck] || [];
+
+    for (const row of list) {
+      // ── PENDING ONLY FILTER ──
+      // TAT tracker only processes Pending cases.
+      // All other statuses (Sent, Closed, Insuff, Hold, Stop) are skipped.
+      const rowStatusCheck = (
+        row.Status       ||
+        row.status       ||
+        row.STATUS       ||
+        row["Case Status"]         ||
+        row["BGV Status"]          ||
+        row["Verification Status"] ||
+        row["Current Status"]      ||
+        ""
+      ).toString().trim().toLowerCase();
+
+      if (rowStatusCheck !== "pending") continue;
+      // ─────────────────────────
+
+      let sentRaw = "";
+      let compRaw = "";
+      let isInsuffTAT = false;
+
+      if (tatMode === "vendor") {
+        /* ── Vendor TAT — unchanged ── */
+        sentRaw =
+          row["Assigned Date"] ||
+          row["Assign Date"] ||
+          row.assignDate ||
+          row["Sent Date"] ||
+          row.vendorSentDate ||
+          row["Vendor Sent Date"] ||
+          row["Vendor Assign Date"] ||
+          row["Vendor Assigned Date"] ||
+          row["Vendor Date"] ||
+          row["Sent to Vendor"] ||
+          "";
+
+        compRaw =
+          row.vendorCompleteDate ||
+          row["Vendor Complete Date"] ||
+          "";
+
+      } else {
+        /* ── Client TAT ── */
+        // Since we already filtered to Pending-only above,
+        // isInsuffTAT will never be true here (Insuff rows are skipped).
+        // Keeping the logic intact for safety.
+        const rowStatus = rowStatusCheck;
+
+        if (rowStatus === "insuff") {
+          isInsuffTAT = true;
+
+          sentRaw =
+            row["Insuff Date"]       ||
+            row["insuff date"]       ||
+            row["InsuffDate"]        ||
+            row["Insuff_Date"]       ||
+            row.insuffDate           ||
+            row["Insufficient Date"] ||
+            "";
+
+          compRaw =
+            row["Insuff Clear Date"]       ||
+            row["insuff clear date"]       ||
+            row["InsuffClearDate"]         ||
+            row["Insuff_Clear_Date"]       ||
+            row.insuffClearDate            ||
+            row["Insufficient Clear Date"] ||
+            "";
+
+        } else {
+          /* Normal client TAT — original logic untouched */
+          sentRaw =
+            row.clientSentDate         ||
+            row["Client Sent Date"]    ||
+            row["Sent Date"]           ||
+            row["Client Assign Date"]  ||
+            row["Assigned Date"]       ||
+            row.assignDate             ||
+            "";
+
+          compRaw =
+            row.clientCompletedDate          ||
+            row["Completed Date"]            ||
+            row["Client Close Date"]         ||
+            row["Client Completed Date"]     ||
+            row["Completion Date"]           ||
+            "";
+        }
+      }
+
+      const sd = parseDate(sentRaw);
+      const cd = parseDate(compRaw);
+
+      let tatDays = null;
+      let isOngoing = false;
+
+      if (sd) {
+        if (cd) {
+          tatDays = calcTatDays(sd, cd);
+        } else {
+          tatDays = calcTatDays(sd);
+          isOngoing = true;
+        }
+      }
+
+      const [pct, label, pCls, barCls, dayCls] = penTier(tatDays, isOngoing);
+
+      const amount =
+        tatMode === "vendor"
+          ? Number(
+              row.vendorRate    ||
+              row["Vendor Rate"]   ||
+              row["Vendor Amount"] ||
+              row["Vendor Price"]  ||
+              row.rate             ||
+              row.Amount           ||
+              row["Case Amount"]   ||
+              0
+            )
+          : Number(
+              row.clientRate    ||
+              row["Client Rate"]   ||
+              row["Client Amount"] ||
+              row["Client Price"]  ||
+              row.rate             ||
+              row.Amount           ||
+              row["Case Amount"]   ||
+              0
+            );
+
+      const penAmount = Math.round((amount * pct) / 100);
+
+      rows.push({
+        _i: idx++,
+        _k: `${ck}|${idx}`,
+        ck,
+        cand: row["Candidate Name"] || "—",
+        phone:
+          row["Candidate Phone"] ||
+          row["Candidate Phone Number"] ||
+          row["Candidate Mobile"] ||
+          row["Candidate Mobile Number"] ||
+          row["Phone Number"] ||
+          row["Mobile Number"] ||
+          row["Phone"] ||
+          row.phone ||
+          "—",
+        address:
+          row["Address"] ||
+          row["Full Address"] ||
+          row["Candidate Address"] ||
+          row["Current Address"] ||
+          row["Permanent Address"] ||
+          row.address ||
+          "—",
+        comp: row["Company Name"] || row["Client Name"] || ck,
+        chk:
+          tatMode === "vendor"
+            ? row["Vendor Name"] || row.vendorName || row["Check Name"] || "—"
+            : row["Check Name"] || "—",
+        sentStr: fmtDate(sd),
+        compStr: fmtDate(cd),
+        tatDays,
+        isOngoing,
+        isDay4: tatDays === 4,
+        isInsuffTAT,
+        pct,
+        label,
+        pCls,
+        barCls,
+        dayCls,
+        amount,
+        penAmount,
+        status: row.Status || row.status || "Pending",
+        _search: [
+          row["Candidate Name"] || "",
+          row["Candidate Phone"] || row["Phone Number"] || row["Mobile Number"] || row["Phone"] || row.phone || "",
+          row["Address"] || row["Full Address"] || row["Candidate Address"] || row["Current Address"] || row["Permanent Address"] || row.address || "",
+          ck,
+          row["Check Name"] || "",
+          row["Vendor Name"] || "",
+          row.vendorName || "",
+          row["Company Name"] || row["Client Name"] || "",
+        ]
+          .join("|")
+          .toLowerCase(),
+      });
+    }
+  }
+
+  return rows;
+}
+
+/* ─────────────────────────── WEB WORKER ────────────────────────────────── */
+const WORKER_CODE = `
+self.onmessage = function(e) {
+  const { rows, q, pf, cf, vf, sc, sd } = e.data;
+  let out = rows;
+  if (cf !== "all") out = out.filter(r => r.ck === cf);
+  if (vf !== "all") out = out.filter(r => r.chk === vf);
+  if (q) out = out.filter(r => r._search.includes(q));
+  if      (pf === "clean") out = out.filter(r => !r.isOngoing && r.pct === 0 && r.tatDays !== null);
+  else if (pf === "10")    out = out.filter(r => r.pct === 10);
+  else if (pf === "20")    out = out.filter(r => r.pct === 20);
+  else if (pf === "50")    out = out.filter(r => r.pct === 50);
+  else if (pf === "open")  out = out.filter(r => r.isOngoing);
+  else if (pf === "day4")  out = out.filter(r => r.tatDays === 4);
+
+  out = out.slice().sort((a, b) => {
+    let av = a[sc], bv = b[sc];
+    if (av == null) av = sd === "asc" ? Infinity : -Infinity;
+    if (bv == null) bv = sd === "asc" ? Infinity : -Infinity;
+    if (typeof av === "string") return sd === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+    return sd === "asc" ? av - bv : bv - av;
+  });
+
+  self.postMessage(out.map(r => r._i));
+};
+`;
+
+let _worker = null;
+
+function getWorker() {
+  if (_worker) return _worker;
+  if (typeof Worker === "undefined") return null;
+
+  try {
+    const blob = new Blob([WORKER_CODE], { type: "application/javascript" });
+    _worker = new Worker(URL.createObjectURL(blob));
+    return _worker;
+  } catch {
+    return null;
+  }
+}
+
+/* ─────────────────────────── STABLE PAGINATED TABLE ──────────────────────── */
+const VTable = memo(function VTable({ rows, cols, theadCls, thCls }) {
+  /* Pagination is already applied before this component.
+     Virtual padding was removed because variable row content caused scroll jumping. */
+  return (
+    <div className="tat-vs">
+      <table className="tat-t">
+        <colgroup>
+          {cols.map((c, i) => (
+            <col key={i} style={{ width: c.w || c.mw || 130 }} />
+          ))}
+        </colgroup>
+        <thead className={theadCls}>
+          <tr>
+            {cols.map((c, i) => (
+              <th
+                key={i}
+                className={`tat-th ${thCls}`}
+                onClick={c.fn}
+              >
+                {c.l} <span className="si-arrow">{c.s}</span>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <TRow key={r._k} r={r} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+});
+
+/* ─────────────────────────── TABLE ROW ─────────────────────────────────── */
+const TRow = memo(function TRow({ r }) {
+  const bp = Math.min(100, ((r.tatDays || 0) / 15) * 100);
+
+  return (
+    <tr className="tat-tr">
+      <td className="tat-td" style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600 }} title={r.cand}>
+        {r.cand}
+      </td>
+
+      <td className="tat-td" title={r.phone}>
+        <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: 12 }}>
+          {r.phone || "—"}
+        </span>
+      </td>
+
+      <td className="tat-td" title={r.address}>
+        {r.address || "—"}
+      </td>
+
+      <td className="tat-td">
+        <span
+          style={{
+            background: "rgba(37,99,235,0.07)",
+            border: "1px solid rgba(37,99,235,0.18)",
+            color: "#2563eb",
+            borderRadius: 99,
+            padding: "2px 9px",
+            fontFamily: "'Space Grotesk',sans-serif",
+            fontSize: 11,
+            fontWeight: 700,
+          }}
+        >
+          {r.ck}
+        </span>
+      </td>
+
+      <td className="tat-td" title={r.chk}>{r.chk}</td>
+
+      {/* Sent Date cell */}
+      <td className="tat-td">
+        {r.sentStr ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{
+              fontFamily: "'Space Grotesk',sans-serif",
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: r.isInsuffTAT ? "#6d28d9" : "#2563eb",
+            }}>
+              {r.sentStr}
+            </span>
+            {r.isInsuffTAT && (
+              <span style={{
+                fontSize: 9,
+                fontFamily: "'Space Grotesk',sans-serif",
+                fontWeight: 700,
+                color: "#6d28d9",
+                background: "rgba(124,58,237,0.08)",
+                border: "1px solid rgba(124,58,237,0.22)",
+                borderRadius: 4,
+                padding: "1px 5px",
+                display: "inline-block",
+                whiteSpace: "nowrap",
+              }}>
+                ⚠️ INSUFF DATE
+              </span>
+            )}
+          </div>
+        ) : (
+          <span style={{ color: "#8ba3c0", fontStyle: "italic", fontSize: 11.5 }}>
+            {r.isInsuffTAT ? "No insuff date" : "Not sent"}
+          </span>
+        )}
+      </td>
+
+      {/* Completed cell */}
+      <td className="tat-td">
+        {r.compStr ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{
+              fontFamily: "'Space Grotesk',sans-serif",
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: r.isInsuffTAT ? "#6d28d9" : "#059669",
+            }}>
+              {r.compStr}
+            </span>
+            {r.isInsuffTAT && (
+              <span style={{
+                fontSize: 9,
+                fontFamily: "'Space Grotesk',sans-serif",
+                fontWeight: 700,
+                color: "#059669",
+                background: "rgba(16,185,129,0.08)",
+                border: "1px solid rgba(16,185,129,0.22)",
+                borderRadius: 4,
+                padding: "1px 5px",
+                display: "inline-block",
+                whiteSpace: "nowrap",
+              }}>
+                ✅ INSUFF CLEARED
+              </span>
+            )}
+          </div>
+        ) : r.isOngoing ? (
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              color: r.isInsuffTAT ? "#6d28d9" : "#2563eb",
+              fontFamily: "'Space Grotesk',sans-serif",
+              fontSize: 11.5,
+              fontWeight: 600,
+            }}
+          >
+            <span className="tdot" style={r.isInsuffTAT ? { background: "#7c3aed", boxShadow: "0 0 0 3px rgba(124,58,237,0.18)" } : {}} />
+            {r.isInsuffTAT ? "Insuff Pending" : "In Progress"}
+          </span>
+        ) : (
+          <span style={{ color: "#8ba3c0", fontStyle: "italic", fontSize: 11.5 }}>—</span>
+        )}
+      </td>
+
+      <td className="tat-td" style={{ minWidth: 150 }}>
+        {r.tatDays !== null ? (
+          <div className="tat-bw">
+            <span
+              className={`ddb ${r.isOngoing ? (r.isInsuffTAT ? "ddc" : "dlv") : r.dayCls} ${r.isDay4 ? "p4d" : ""}`}
+              style={r.isDay4 ? { border: "2px solid rgba(245,158,11,0.6)", fontWeight: 800 } : {}}
+            >
+              {r.isOngoing && <span className="tdot" style={{ width: 5, height: 5, ...(r.isInsuffTAT ? { background: "#7c3aed", boxShadow: "0 0 0 3px rgba(124,58,237,0.18)" } : {}) }} />}
+              {r.tatDays}d{r.isOngoing ? (r.isInsuffTAT ? " insuff" : " elapsed") : ""}
+              {r.isDay4 ? " ⚡" : ""}
+            </span>
+            <div className="tat-bg">
+              <div className={`tat-bf ${r.isInsuffTAT && r.isOngoing ? "bdc" : r.barCls}`} style={{ width: `${bp}%` }} />
+            </div>
+          </div>
+        ) : (
+          <span style={{ color: "#8ba3c0", fontSize: 11.5, fontStyle: "italic" }}>
+            {r.isInsuffTAT ? "No insuff date" : "No sent date"}
+          </span>
+        )}
+      </td>
+
+      <td className="tat-td">
+        {r.isOngoing ? (
+          <span className="pb dlv" style={{ fontSize: 10.5, ...(r.isInsuffTAT ? { background: "rgba(124,58,237,0.08)", border: "1px solid rgba(124,58,237,0.25)", color: "#6d28d9" } : {}) }}>
+            ⏳ {r.tatDays}d
+          </span>
+        ) : r.tatDays !== null ? (
+          <span className={`pb ${r.pCls}`}>{r.label}</span>
+        ) : (
+          <span style={{ color: "#8ba3c0", fontSize: 11.5 }}>—</span>
+        )}
+      </td>
+
+      <td className="tat-td">
+        {r.amount > 0 ? (
+          <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 12.5 }}>
+            {fmtINR(r.amount)}
+          </span>
+        ) : (
+          <span style={{ color: "#8ba3c0", fontSize: 11.5 }}>—</span>
+        )}
+      </td>
+
+      <td className="tat-td">
+        {r.penAmount > 0 ? (
+          <span
+            style={{
+              fontFamily: "'Space Grotesk',sans-serif",
+              fontWeight: 700,
+              fontSize: 12.5,
+              color:
+                r.pct >= 50 ? "#6d28d9" :
+                r.pct >= 20 ? "#c2410c" :
+                r.pct >= 10 ? "#b45309" : "#0f1c3f",
+            }}
+          >
+            {fmtINR(r.penAmount)}
+          </span>
+        ) : (
+          <span style={{ color: "#059669", fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: 12.5 }}>
+            —
+          </span>
+        )}
+      </td>
+
+      <td className="tat-td">
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            background: "rgba(245,158,11,0.09)",
+            border: "1px solid rgba(245,158,11,0.25)",
+            color: "#b45309",
+            padding: "3px 8px",
+            borderRadius: 99,
+            fontFamily: "'Space Grotesk',sans-serif",
+            fontSize: 10.5,
+            fontWeight: 700,
+            textTransform: "uppercase",
+          }}
+        >
+          ⏳ Pending
+        </span>
+      </td>
+    </tr>
+  );
+});
+
+/* ═══════════════════════════ MAIN COMPONENT ═════════════════════════════ */
+export default function TAT({ selectedClient = "", currentUser = null }) {
+  const [tatMode, setTatMode] = useState("vendor");
+
+  // Fetches only Pending records directly from the server — TAT only ever
+  // tracks Pending cases (see file header), so it never needed Sent/Closed/
+  // Insuff/Hold/Stop rows at all. Avoids depending on the full eager-loaded
+  // dataset, which doesn't scale as record volume grows. Grouped into the
+  // same {[clientName]: rows[], [MASTER_KEY]: rows[]} shape the rest of this
+  // file already expects, so none of the calculation logic below changes.
+  const [clientsData, setClientsData] = useState({});
+  const [tatLoading, setTatLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTatLoading(true);
+    // Team members (including vendor-only-allocated ones) get server-side
+    // allocation scoping here, same mechanism Records already uses — without
+    // it, TAT Tracker showed every vendor/client's pending cases to everyone,
+    // regardless of what was actually allocated to them.
+    const isTeamRole = String(currentUser?.role || "").trim().toLowerCase() === "team";
+    uploadAPI.getRecords({
+      status: "pending",
+      limit: 100000,
+      ...(isTeamRole ? { scopeToAllocations: "true" } : {}),
+    })
+      .then(rows => {
+        if (cancelled) return;
+        const grouped = {};
+        const all = Array.isArray(rows) ? rows : [];
+        all.forEach(row => {
+          const clientName = String(row["Company Name"] || row["Client Name"] || "Unknown").trim() || "Unknown";
+          if (!grouped[clientName]) grouped[clientName] = [];
+          grouped[clientName].push(row);
+        });
+        grouped[MASTER_KEY] = all;
+        setClientsData(grouped);
+      })
+      .catch(err => console.warn("TAT fetch failed:", err.message))
+      .finally(() => { if (!cancelled) setTatLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const [search, setSearch] = useState("");
+  const [dSearch, setDSearch] = useState("");
+  const [pf, setPf] = useState("all");
+  const [cf, setCf] = useState("all");
+  const [vf, setVf] = useState("all");
+  const [sc, setSc] = useState("tatDays");
+  const [sd, setSd] = useState("desc");
+  const [pageSize, setPageSize] = useState(25);
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const [allRows, setAllRows] = useState([]);
+  const [visIdx, setVisIdx] = useState([]);
+  const [building, setBuilding] = useState(false);
+  const [filtering, setFiltering] = useState(false);
+
+  const workerRef = useRef(null);
+  const idleRef = useRef(null);
+  const dataRef = useRef(clientsData);
+
+  const clientList = useMemo(
+    () => Object.keys(clientsData).filter((k) => k !== MASTER_KEY),
+    [clientsData]
+  );
+
+  const clientCounts = useMemo(() => {
+    const m = {};
+    clientList.forEach((k) => {
+      // Count only pending rows per client
+      m[k] = (clientsData[k] || []).filter(r => {
+        const s = (r.Status || r.status || r.STATUS || r["Case Status"] || "").toString().trim().toLowerCase();
+        return s === "pending";
+      }).length;
+    });
+    return m;
+  }, [clientsData, clientList]);
+
+  const vendorCounts = useMemo(() => {
+    const m = {};
+    allRows.forEach((r) => {
+      const vendor = r.chk || "Unassigned";
+      m[vendor] = (m[vendor] || 0) + 1;
+    });
+    return m;
+  }, [allRows]);
+
+  const vendorList = useMemo(
+    () => Object.keys(vendorCounts).sort((a, b) => a.localeCompare(b)),
+    [vendorCounts]
+  );
+
+  const day4Count = useMemo(() => allRows.filter((r) => r.isDay4).length, [allRows]);
+
+  const vendorDay4Count = useMemo(() => {
+    return buildAllRows(clientsData, "vendor").filter((r) => r.isDay4).length;
+  }, [clientsData]);
+
+  const clientDay4Count = useMemo(() => {
+    return buildAllRows(clientsData, "client").filter((r) => r.isDay4).length;
+  }, [clientsData]);
+
+  useEffect(() => {
+    workerRef.current = getWorker();
+    if (workerRef.current) {
+      workerRef.current.onmessage = (e) => {
+        startTransition(() => {
+          setVisIdx(e.data);
+          setFiltering(false);
+        });
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    dataRef.current = clientsData;
+
+    if (idleRef.current) {
+      if (typeof cancelIdleCallback !== "undefined") cancelIdleCallback(idleRef.current);
+      else clearTimeout(idleRef.current);
+    }
+
+    setBuilding(true);
+
+    const run = () => {
+      const rows = buildAllRows(dataRef.current, tatMode);
+      startTransition(() => {
+        setAllRows(rows);
+        setBuilding(false);
+      });
+    };
+
+    if (typeof requestIdleCallback !== "undefined") {
+      idleRef.current = requestIdleCallback(run, { timeout: 600 });
+    } else {
+      idleRef.current = setTimeout(run, 0);
+    }
+
+    return () => {
+      if (idleRef.current) {
+        if (typeof cancelIdleCallback !== "undefined") cancelIdleCallback(idleRef.current);
+        else clearTimeout(idleRef.current);
+      }
+    };
+  }, [clientsData, tatMode]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDSearch(search.trim().toLowerCase()), 250);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  useEffect(() => {
+    if (cf !== "all" && !clientList.includes(cf)) setCf("all");
+  }, [clientList, cf]);
+
+  useEffect(() => {
+    if (vf !== "all" && !vendorList.includes(vf)) setVf("all");
+  }, [vendorList, vf]);
+
+  useEffect(() => {
+    setVf("all");
+  }, [tatMode]);
+
+  useEffect(() => {
+    if (selectedClient && selectedClient !== MASTER_KEY && clientList.includes(selectedClient)) {
+      setCf(selectedClient);
+    } else if (!selectedClient || selectedClient === MASTER_KEY) {
+      setCf("all");
+    }
+  }, [selectedClient, clientList]);
+
+  useEffect(() => {
+    if (tatMode === "vendor") {
+      setCf("all");
+    } else {
+      setVf("all");
+    }
+  }, [tatMode]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [dSearch, pf, cf, vf, sc, sd, tatMode, pageSize]);
+
+  useEffect(() => {
+    if (!allRows.length) {
+      setVisIdx([]);
+      return;
+    }
+
+    setFiltering(true);
+
+    const slim = allRows.map((r) => ({
+      _i: r._i,
+      ck: r.ck,
+      _search: r._search,
+      tatDays: r.tatDays,
+      pct: r.pct,
+      isOngoing: r.isOngoing,
+      isInsuffTAT: r.isInsuffTAT,
+      penAmount: r.penAmount,
+      amount: r.amount,
+      status: r.status,
+      cand: r.cand,
+      phone: r.phone,
+      address: r.address,
+      chk: r.chk,
+      sentStr: r.sentStr,
+      compStr: r.compStr,
+    }));
+
+    if (workerRef.current) {
+      workerRef.current.postMessage({ rows: slim, q: dSearch, pf, cf: tatMode === "vendor" ? "all" : cf, vf: tatMode === "vendor" ? vf : "all", sc, sd });
+    } else {
+      let out = allRows;
+      if (tatMode !== "vendor" && cf !== "all") out = out.filter((r) => r.ck === cf);
+      if (tatMode === "vendor" && vf !== "all") out = out.filter((r) => r.chk === vf);
+      if (dSearch) out = out.filter((r) => r._search.includes(dSearch));
+      if (pf === "clean") out = out.filter((r) => !r.isOngoing && r.pct === 0 && r.tatDays !== null);
+      else if (pf === "10") out = out.filter((r) => r.pct === 10);
+      else if (pf === "20") out = out.filter((r) => r.pct === 20);
+      else if (pf === "50") out = out.filter((r) => r.pct === 50);
+      else if (pf === "open") out = out.filter((r) => r.isOngoing);
+      else if (pf === "day4") out = out.filter((r) => r.tatDays === 4);
+
+      out = [...out].sort((a, b) => {
+        let av = a[sc];
+        let bv = b[sc];
+        if (av == null) av = sd === "asc" ? Infinity : -Infinity;
+        if (bv == null) bv = sd === "asc" ? Infinity : -Infinity;
+        if (typeof av === "string") return sd === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+        return sd === "asc" ? av - bv : bv - av;
+      });
+
+      startTransition(() => {
+        setVisIdx(out.map((r) => r._i));
+        setFiltering(false);
+      });
+    }
+  }, [allRows, dSearch, pf, cf, vf, sc, sd]);
+
+  const byIdx = useMemo(() => {
+    const m = {};
+    allRows.forEach((r) => {
+      m[r._i] = r;
+    });
+    return m;
+  }, [allRows]);
+
+  const visRows = useMemo(() => visIdx.map((i) => byIdx[i]).filter(Boolean), [visIdx, byIdx]);
+
+  const totalPages = Math.max(1, Math.ceil(visRows.length / pageSize));
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
+
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageEnd = Math.min(visRows.length, pageStart + pageSize);
+  const pagedRows = useMemo(
+    () => visRows.slice(pageStart, pageStart + pageSize),
+    [visRows, pageStart, pageSize]
+  );
+
+  const PaginationBar = ({ bottom = false }) => (
+    <div className="tat-pagebar" style={bottom ? { marginTop: 12, marginBottom: 0 } : {}}>
+      <div className="tat-page-left">
+        <span className="tat-page-info">
+          Showing {visRows.length ? pageStart + 1 : 0}-{pageEnd} of {visRows.length.toLocaleString()} cases
+        </span>
+        <span className="tat-sheet-note">Paginated sheet view for fast loading</span>
+      </div>
+      <div className="tat-page-right">
+        <select
+          className="tat-page-select"
+          value={pageSize}
+          onChange={(e) => setPageSize(Number(e.target.value))}
+        >
+          {[25, 50, 100, 200].map((n) => (
+            <option key={n} value={n}>{n} / page</option>
+          ))}
+        </select>
+        <button className="tat-page-btn" disabled={currentPage <= 1} onClick={() => setCurrentPage(1)}>First</button>
+        <button className="tat-page-btn" disabled={currentPage <= 1} onClick={() => setCurrentPage(p => Math.max(1, p - 1))}>Prev</button>
+        <span className="tat-page-info">Page {currentPage} / {totalPages}</span>
+        <button className="tat-page-btn" disabled={currentPage >= totalPages} onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}>Next</button>
+        <button className="tat-page-btn" disabled={currentPage >= totalPages} onClick={() => setCurrentPage(totalPages)}>Last</button>
+      </div>
+    </div>
+  );
+
+  const sendPendingToVendorHostinger = async () => {
+    if (!isVendor) return;
+    if (!vf || vf === "all") {
+      alert("Please select a specific vendor first.");
+      return;
+    }
+
+    const rowsForVendor = allRows
+      .filter((r) => r.chk === vf)
+      .sort((a, b) => (b.tatDays || 0) - (a.tatDays || 0));
+
+    if (!rowsForVendor.length) {
+      alert("No pending cases found for this vendor.");
+      return;
+    }
+
+    const fileName = downloadVendorPendingExcel(vf, rowsForVendor);
+    const { subject, body } = buildVendorPendingMail(vf, rowsForVendor);
+    const fullText = `Subject: ${subject}\n\n${body}\n\nExcel file downloaded: ${fileName}\nPlease attach this Excel file before sending.`;
+
+    try {
+      await navigator.clipboard.writeText(fullText);
+      alert("Excel file downloaded and mail content copied. Hostinger Mail is opening now. Attach the downloaded Excel file and send it to the vendor.");
+    } catch (_) {
+      window.prompt("Copy this email content:", fullText);
+    }
+
+    window.open("https://mail.hostinger.com", "_blank", "noopener,noreferrer");
+  };
+
+  // Export ONLY the out-of-TAT cases (TAT over 5 days) from the current view.
+  // Includes both completed-late cases (10/20/50% penalty) and ongoing cases
+  // that have already crossed 5 days. Respects the filters currently applied.
+  const exportOutOfTatExcel = () => {
+    const outRows = visRows.filter((r) => r.tatDays !== null && r.tatDays > 5);
+
+    if (!outRows.length) {
+      alert("No out-of-TAT cases to export in the current view.");
+      return;
+    }
+
+    const today = new Date().toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+
+    const excelRows = outRows.map((r, i) => ({
+      "S.No": i + 1,
+      "Candidate Name": cleanMailText(r.cand),
+      "Phone": cleanMailText(r.phone),
+      "Address": cleanMailText(r.address),
+      "Client": cleanMailText(r.ck),
+      "Check / Vendor": cleanMailText(r.chk),
+      "Sent Date": cleanMailText(r.sentStr || "Not sent"),
+      "Completed Date": cleanMailText(r.compStr || (r.isOngoing ? "In Progress" : "-")),
+      "TAT Days": r.tatDays,
+      "TAT State": r.isOngoing ? "Ongoing (Overdue)" : "Completed (Late)",
+      "Penalty %": r.label,
+      "Case Amount": r.amount || 0,
+      "Penalty Amount": r.penAmount || 0,
+      "Case Status": r.status || "Pending",
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(excelRows);
+    ws["!cols"] = [
+      { wch: 7 }, { wch: 24 }, { wch: 16 }, { wch: 50 }, { wch: 18 },
+      { wch: 20 }, { wch: 14 }, { wch: 16 }, { wch: 10 }, { wch: 18 },
+      { wch: 12 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Out of TAT");
+
+    const buffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    saveAs(blob, `Out_of_TAT_${tatMode}_${safeFilename(today)}.xlsx`);
+  };
+
+  const stats = useMemo(() => {
+    let onTime = 0;
+    let ongoing = 0;
+    let totalPen = 0;
+    let totalAmt = 0;
+    let tatSum = 0;
+    let tatCnt = 0;
+
+    for (const r of allRows) {
+      if (r.isOngoing) ongoing++;
+      else if (r.tatDays !== null) {
+        if (r.pct === 0) onTime++;
+        tatSum += r.tatDays;
+        tatCnt++;
+      }
+      totalPen += r.penAmount;
+      totalAmt += r.amount;
+    }
+
+    return {
+      total: allRows.length,
+      onTime,
+      ongoing,
+      totalPen,
+      totalAmt,
+      avgTat: tatCnt ? (tatSum / tatCnt).toFixed(1) : "—",
+    };
+  }, [allRows]);
+
+  const sico = (col) => (sc === col ? (sd === "asc" ? "↑" : "↓") : "↕");
+  const tog = (col) => () => {
+    if (sc === col) setSd((d) => (d === "asc" ? "desc" : "asc"));
+    else {
+      setSc(col);
+      setSd("desc");
+    }
+  };
+
+  const cols = [
+    { l: "Candidate",       fn: tog("cand"),      s: sico("cand"),      w: 180 },
+    { l: "Phone Number",    fn: tog("phone"),     s: sico("phone"),     w: 150 },
+    { l: "Address",         fn: tog("address"),   s: sico("address"),   w: 360 },
+    { l: "Client",          fn: tog("ck"),         s: sico("ck"),        w: 150 },
+    { l: "Check / Vendor",  fn: tog("chk"),        s: sico("chk"),       w: 170 },
+    { l: "Sent Date",       fn: tog("sentStr"),    s: sico("sentStr"),   w: 135 },
+    { l: "Completed",       fn: tog("compStr"),    s: sico("compStr"),   w: 150 },
+    { l: "TAT",             fn: tog("tatDays"),    s: sico("tatDays"),   w: 180 },
+    { l: "Penalty %",       fn: tog("pct"),        s: sico("pct"),       w: 120 },
+    { l: "Case Amt",        fn: tog("amount"),     s: sico("amount"),    w: 115 },
+    { l: "Penalty Amt",     fn: tog("penAmount"),  s: sico("penAmount"), w: 135 },
+    { l: "Status",          fn: () => {},           s: "",                w: 130 },
+  ];
+
+  const isVendor = tatMode === "vendor";
+  const theadCls = isVendor ? "tat-thead-v" : "tat-thead-c";
+  const thCls    = isVendor ? "tat-th-v"    : "tat-th-c";
+  const twCls    = isVendor ? "tat-tw"      : "tat-tw tat-tw-c";
+  const ftCls    = isVendor ? "tat-ft"      : "tat-ft tat-ft-c";
+
+  const PEN_F = [
+    { k: "all",   l: "All"             },
+    { k: "clean", l: "✅ 0%"           },
+    { k: "10",    l: "⚠️ 10% (6–8d)"  },
+    { k: "20",    l: "🔶 20% (8–10d)" },
+    { k: "50",    l: "🟣 50% (>10d)"  },
+    { k: "open",  l: "⏳ Ongoing"      },
+  ];
+
+  const handleDay4Click = (mode) => {
+    if (tatMode === mode && pf === "day4") {
+      setPf("all");
+      return;
+    }
+    setTatMode(mode);
+    setPf("day4");
+  };
+
+  return (
+    <div className="tat">
+      <div className="tat-mode-bar">
+        <button
+          className={`tat-mode-tab ${tatMode === "vendor" ? "active-vendor" : ""}`}
+          onClick={() => { setTatMode("vendor"); setPf("all"); }}
+        >
+          <span className="mode-icon">🏭</span>
+          Vendor TAT
+          <span className="mode-badge">Pending Cases Only</span>
+        </button>
+
+        <div className="tat-mode-div" />
+
+        <button
+          className={`tat-mode-tab ${tatMode === "client" ? "active-client" : ""}`}
+          onClick={() => { setTatMode("client"); setPf("all"); }}
+        >
+          <span className="mode-icon">🏢</span>
+          Client TAT
+          <span className="mode-badge">Pending Cases Only</span>
+        </button>
+      </div>
+
+      {/* Pending-only notice */}
+      <div className="tat-pending-notice">
+        <span className="tat-pending-notice-icon">⏳</span>
+        <div>
+          <div className="tat-pending-notice-text">TAT Tracker — Pending Cases Only</div>
+          <div className="tat-pending-notice-sub">Only cases with status "Pending" are included. Sent, Closed, Insuff, Hold and Stop cases are excluded.</div>
+        </div>
+      </div>
+
+      {clientList.length === 0 && !building && !tatLoading && (
+        <div className="tat-nd">
+          <span className="tat-ndi">📭</span>
+          <div>
+            <div className="tat-ndt">No data yet</div>
+            <div className="tat-nds">Upload an Excel file to start tracking TAT.</div>
+          </div>
+        </div>
+      )}
+
+      {allRows.length > 0 && (
+        <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+          <div
+            className={`day4-banner day4-banner-v ${tatMode === "vendor" && pf === "day4" ? "active-d4" : ""}`}
+            style={{ flex: 1, minWidth: 220 }}
+            onClick={() => handleDay4Click("vendor")}
+          >
+            <span className="day4-icon">⚡</span>
+            <div className="day4-text">
+              <div className="day4-title">Vendor — Day 4 Pending Cases</div>
+              <div className="day4-sub">Pending cases exactly on 4th day (approaching 6-day threshold)</div>
+            </div>
+            <div style={{ textAlign: "center", marginRight: 8 }}>
+              <div className="day4-ct">{(building || tatLoading) ? "…" : vendorDay4Count}</div>
+              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 9, color: "#8ba3c0", fontWeight: 600, textTransform: "uppercase" }}>cases</div>
+            </div>
+            <button className="day4-btn day4-btn-v" onClick={(e) => { e.stopPropagation(); handleDay4Click("vendor"); }}>
+              {tatMode === "vendor" && pf === "day4" ? "✕ Clear" : "View Cases →"}
+            </button>
+          </div>
+
+          <div
+            className={`day4-banner day4-banner-c ${tatMode === "client" && pf === "day4" ? "active-d4" : ""}`}
+            style={{ flex: 1, minWidth: 220 }}
+            onClick={() => handleDay4Click("client")}
+          >
+            <span className="day4-icon">🔔</span>
+            <div className="day4-text">
+              <div className="day4-title day4-title-c">Client — Day 4 Pending Cases</div>
+              <div className="day4-sub">Pending cases exactly on 4th day (approaching 6-day threshold)</div>
+            </div>
+            <div style={{ textAlign: "center", marginRight: 8 }}>
+              <div className="day4-ct day4-ct-c">{(building || tatLoading) ? "…" : clientDay4Count}</div>
+              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 9, color: "#8ba3c0", fontWeight: 600, textTransform: "uppercase" }}>cases</div>
+            </div>
+            <button className="day4-btn day4-btn-c" onClick={(e) => { e.stopPropagation(); handleDay4Click("client"); }}>
+              {tatMode === "client" && pf === "day4" ? "✕ Clear" : "View Cases →"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="tat-sum">
+        {[
+          { i: "⏳", l: "Pending Cases",  v: (building || tatLoading) ? "…" : stats.total,                                           c: "si-a", vc: "sv-a" },
+          { i: "✅", l: "On Time (≤5d)",  v: (building || tatLoading) ? "…" : stats.onTime,                                          c: "si-g", vc: "sv-g" },
+          { i: "⏱️", l: "Avg TAT (days)", v: (building || tatLoading) ? "…" : stats.avgTat,                                          c: "si-b", vc: "sv-b" },
+          { i: "⚠️", l: "10% Penalty",    v: (building || tatLoading) ? "…" : allRows.filter((r) => r.pct === 10).length,            c: "si-a", vc: "sv-a" },
+          { i: "🔶", l: "20% Penalty",    v: (building || tatLoading) ? "…" : allRows.filter((r) => r.pct === 20).length,            c: "si-a", vc: "sv-a" },
+          { i: "🟣", l: "50% Penalty",    v: (building || tatLoading) ? "…" : allRows.filter((r) => r.pct === 50).length,            c: "si-p", vc: "sv-p" },
+          { i: "🔄", l: "Ongoing",        v: (building || tatLoading) ? "…" : stats.ongoing,                                         c: "si-b", vc: "sv-b" },
+          { i: "💸", l: "Total Penalty",  v: (building || tatLoading) ? "…" : fmtINR(stats.totalPen), c: "si-r", vc: "sv-r",
+            sub: building ? undefined : `of ${fmtINR(stats.totalAmt)}` },
+        ].map((s, i) => (
+          <div key={i} className={`tat-sc ${isVendor ? "tat-sc-v" : "tat-sc-c"}`}>
+            <div className={`tat-si ${s.c}`}>{s.i}</div>
+            <div>
+              <div className="tat-sl">{s.l}</div>
+              <div className={`tat-sv ${s.vc}`}>{s.v}</div>
+              {s.sub && <div className="tat-ss">{s.sub}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {!isVendor && clientList.length > 0 && (
+        <div className="tat-client-filter">
+          <span className="tat-client-label">Filter by Client:</span>
+          <select className="tat-client-select" value={cf} onChange={(e) => setCf(e.target.value)}>
+            <option value="all">All Clients ({allRows.length} pending)</option>
+            {clientList.map((c) => (
+              <option key={c} value={c}>{c} ({clientCounts[c] || 0} pending)</option>
+            ))}
+          </select>
+          {cf !== "all" && (
+            <button type="button" className="tat-client-clear" onClick={() => setCf("all")}>✕ Clear</button>
+          )}
+        </div>
+      )}
+
+      {isVendor && vendorList.length > 0 && (
+        <div className="tat-client-filter">
+          <span className="tat-client-label">Filter by Vendor:</span>
+          <select className="tat-client-select" value={vf} onChange={(e) => setVf(e.target.value)}>
+            <option value="all">All Vendors ({allRows.length} pending)</option>
+            {vendorList.map((v) => (
+              <option key={v} value={v}>{v} ({vendorCounts[v] || 0} pending)</option>
+            ))}
+          </select>
+          {vf !== "all" && (
+            <button type="button" className="tat-client-clear" onClick={() => setVf("all")}>✕ Clear</button>
+          )}
+          <button
+            type="button"
+            className="tat-mail-btn"
+            disabled={vf === "all"}
+            onClick={sendPendingToVendorHostinger}
+            title={vf === "all" ? "Select a vendor first" : `Copy pending cases and open Hostinger Mail for ${vf}`}
+          >
+            ✉️ Send Pending to Vendor
+          </button>
+          {vf !== "all" && (
+            <span className="tat-mail-note">Copies {vendorCounts[vf] || 0} pending cases</span>
+          )}
+        </div>
+      )}
+
+      <div className="tat-ctrl">
+        <div className="tat-sw">
+          <span className="tat-sico">🔍</span>
+          <input
+            className="tat-inp"
+            placeholder={isVendor ? "Search candidate / client / vendor…" : "Search candidate / client…"}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+
+        <div className="tat-rdiv" />
+
+        {PEN_F.map((f) => (
+          <span
+            key={f.k}
+            className={`tat-chip ${pf === f.k ? (isVendor ? "on" : "on-p") : ""}`}
+            onClick={() => setPf(f.k)}
+          >
+            {f.l}
+          </span>
+        ))}
+
+        <span
+          className={`tat-chip ${pf === "day4" ? (isVendor ? "on" : "on-p") : ""}`}
+          onClick={() => setPf(pf === "day4" ? "all" : "day4")}
+        >
+          ⚡ Day 4 {day4Count > 0 && `(${day4Count})`}
+        </span>
+
+        <button
+          type="button"
+          onClick={exportOutOfTatExcel}
+          title="Download an Excel of out-of-TAT cases (TAT over 5 days) in the current view"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            fontFamily: "'Space Grotesk',sans-serif",
+            fontSize: 12,
+            fontWeight: 800,
+            border: "none",
+            borderRadius: 10,
+            padding: "8px 13px",
+            cursor: "pointer",
+            background: "linear-gradient(135deg,#059669,#10b981)",
+            color: "#fff",
+            boxShadow: "0 4px 14px rgba(16,185,129,0.24)",
+          }}
+        >
+          ⬇️ Export Out-of-TAT
+        </button>
+
+        {(building || filtering) && (
+          <span className="tat-proc">
+            <span className="ts" />
+            {building ? "Building…" : "Filtering…"}
+          </span>
+        )}
+
+        <span style={{ marginLeft: "auto", fontFamily: "'Space Grotesk',sans-serif", fontSize: 11.5, fontWeight: 700, color: "#8ba3c0" }}>
+          {pagedRows.length.toLocaleString()} on page · {visRows.length.toLocaleString()} filtered / {allRows.length.toLocaleString()} pending
+        </span>
+      </div>
+
+      {visRows.length > 0 && <PaginationBar />}
+
+      <div className={twCls}>
+        {visRows.length === 0 ? (
+          <div>
+            <table className="tat-t">
+              <colgroup>
+                {cols.map((c, i) => (
+                  <col key={i} style={{ width: c.w || c.mw || 130 }} />
+                ))}
+              </colgroup>
+              <thead className={theadCls}>
+                <tr>
+                  {cols.map((c, i) => (
+                    <th key={i} className={`tat-th ${thCls}`} onClick={c.fn}>
+                      {c.l} <span className="si-arrow">{c.s}</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+            </table>
+            <div className="tat-empty">
+              <div className="tat-ei">{isVendor ? "🏭" : "🏢"}</div>
+              <div className="tat-et">
+                {building
+                  ? "Loading data…"
+                  : filtering
+                  ? "Filtering…"
+                  : pf === "day4"
+                  ? "No pending cases are on Day 4 TAT right now"
+                  : allRows.length === 0
+                  ? "No Pending cases found — TAT tracks Pending cases only"
+                  : "No cases match your filters"}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <VTable rows={pagedRows} cols={cols} theadCls={theadCls} thCls={thCls} />
+        )}
+      </div>
+
+      {visRows.length > 0 && <PaginationBar bottom />}
+
+      <div className={ftCls}>
+        <div>
+          <div className="tat-fl">Mode</div>
+          <div className="tat-fv" style={{ fontSize: 14, fontWeight: 800, letterSpacing: "0.03em" }}>
+            {isVendor ? "🏭 Vendor TAT" : "🏢 Client TAT"}
+          </div>
+        </div>
+
+        <div>
+          <div className="tat-fl">Scope</div>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(245,158,11,0.09)", border: "1px solid rgba(245,158,11,0.25)", color: "#b45309", padding: "4px 12px", borderRadius: 99, fontFamily: "'Space Grotesk',sans-serif", fontSize: 11, fontWeight: 700 }}>
+            ⏳ Pending Only
+          </div>
+        </div>
+
+        {pf === "day4" && (
+          <div style={{ background: "rgba(245,158,11,0.10)", border: "1.5px solid rgba(245,158,11,0.30)", borderRadius: 10, padding: "8px 14px" }}>
+            <div className="tat-fl">Day-4 Filter Active</div>
+            <div className="tat-fv sv-a">{visRows.length} pending cases on Day 4</div>
+          </div>
+        )}
+
+        <div>
+          <div className="tat-fl">Cases Shown</div>
+          <div className="tat-fv sv-b">{visRows.length.toLocaleString()}</div>
+        </div>
+
+        <div>
+          <div className="tat-fl">Total Amount</div>
+          <div className="tat-fv sv-b">{fmtINR(visRows.reduce((s, r) => s + r.amount, 0))}</div>
+        </div>
+
+        <div>
+          <div className="tat-fl">Total Penalty</div>
+          <div className="tat-fv sv-r">{fmtINR(visRows.reduce((s, r) => s + r.penAmount, 0))}</div>
+        </div>
+
+        <div>
+          <div className="tat-fl">Penalty Rules ({isVendor ? "Vendor" : "Client"})</div>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 3 }}>
+            {[["≤5d: 0%","p0"],["6–8d: 10%","p10"],["8–10d: 20%","p20"],["10d+: 50%","p50"]].map(([l,c]) => (
+              <span key={l} className={`pb ${c}`} style={{ fontSize: 9.5, padding: "2px 6px" }}>{l}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

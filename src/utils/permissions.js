@@ -1,0 +1,51 @@
+// src/utils/permissions.js
+// Centralized permission map — ONLY for the new "manager" and "tl" roles.
+// Existing superadmin/admin/team visibility is completely untouched; those
+// three keep using NAV_ITEMS' existing adminOnly/superOnly/teamHidden flags
+// in App.jsx exactly as before. This file exists purely so Manager/TL's
+// access list lives in one place to read and edit later, instead of
+// scattered role checks across every screen component.
+
+// Every screen id a Manager can reach — everything super admin has access
+// to except Cost Summary, Manage Users, and All Tenants (per spec). Total
+// Business is included in the exclusion list defensively — it's the same
+// financial-sensitivity category as Cost Summary (overall/monthly revenue
+// and profit), even though it didn't exist when this spec was written.
+// Manager can never create/edit/delete user accounts either way, since
+// Manage Users itself is unreachable.
+export const MANAGER_ALLOWED_SCREENS = new Set([
+  "dashboard", "upload", "records", "inbox", "tat", "admindata",
+  "allocations", "auditlog", "sentreports", "clientcontacts", "vendorcontacts",
+  "dailyfollowup", "bgvreport", "digitaladdress",
+]);
+
+// TL can only reach these screens — everything else is hidden and
+// inaccessible. "inbox" added so TL can read the shared super-admin mailbox,
+// same as Manager. "dailyfollowup" added the same way — TL only ever sees
+// their own entries there (enforced server-side), not everyone's.
+export const TL_ALLOWED_SCREENS = new Set([
+  "dashboard", "records", "upload", "allocations", "inbox", "dailyfollowup", "bgvreport", "digitaladdress",
+]);
+
+// Returns true/false for manager/tl, or null if the role isn't one of the
+// two new roles at all — callers should fall back to the existing
+// adminOnly/superOnly/teamHidden logic in that case, unchanged.
+export function canAccessScreen(role, screenId) {
+  const r = String(role || "").trim().toLowerCase();
+  if (r === "manager") return MANAGER_ALLOWED_SCREENS.has(screenId);
+  if (r === "tl") return TL_ALLOWED_SCREENS.has(screenId);
+  return null;
+}
+
+export function isManagerRole(role) {
+  return String(role || "").trim().toLowerCase() === "manager";
+}
+
+export function isTLRole(role) {
+  return String(role || "").trim().toLowerCase() === "tl";
+}
+
+export function isManagerOrTL(role) {
+  const r = String(role || "").trim().toLowerCase();
+  return r === "manager" || r === "tl";
+}

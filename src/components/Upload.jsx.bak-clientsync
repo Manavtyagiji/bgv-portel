@@ -1,0 +1,2738 @@
+/**
+ * Upload.jsx — MANUAL CLIENT/VENDOR + TIER AUTO-DETECTION + SCOPED PINCODE SHEET
+ *              + DB-PERSISTED PRICING RULES (survives page refresh)
+ *
+ * PRICING PERSISTENCE:
+ * ─────────────────────────────────────────────────────────────────
+ * • On mount  → loads pricingRules from  GET  /api/pricing
+ * • On every add/delete → saves via      PATCH /api/pricing/:scopeKey
+ * • The parent's setPricingRules is kept in sync so other components
+ *   (e.g. data table) still see the latest rules immediately.
+ *
+ * PINCODE SHEET SCOPING (unchanged):
+ * ─────────────────────────────────────────────────────────────────
+ * • Super Admin + their internal team  → see the built-in
+ *   PINCODE_TIER / DISTRICT_TIER master sheet (read-only).
+ * • Company Admin + their team         → Company Pincode Sheet
+ *   (admin can upload; team members read-only).
+ *   Stored at localStorage key: tenant_<tenantId>_pincodeSheet
+ *
+ * PROPS:
+ *   isSuperAdmin  {bool}  — true for the super admin user
+ *   isTeamMember  {bool}  — true for team-member role
+ *   (tenantId already existed)
+ */
+
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import * as XLSX from "xlsx";
+import { uploadAPI, pricingAPI, clientAPI } from "../api/api";
+import { getTierForRow, PINCODE_TIER, DISTRICT_TIER } from "./tierLookup";
+
+/* ─────────────────────────── CSS ────────────────────────────────────────── */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root{
+  --bg:#f0f6ff;--card:#ffffff;--border:rgba(59,130,246,0.12);
+  --border2:rgba(59,130,246,0.22);--text:#0f1c3f;--text2:#4a6080;
+  --text3:#8ba3c0;--accent:#2563eb;--accent2:#06b6d4;
+  --accentg:linear-gradient(135deg,#2563eb 0%,#06b6d4 100%);
+  --green:#10b981;--amber:#f59e0b;
+  --r8:8px;--r12:12px;--r16:16px;
+  --head:'Space Grotesk',sans-serif;
+  --body:'Plus Jakarta Sans',sans-serif;
+  --ease:cubic-bezier(.4,0,.2,1);
+}
+.upl-root{font-family:var(--body);background:transparent;color:var(--text);position:relative;}
+.upl-wrap{position:relative;z-index:1;padding:20px 24px 24px;}
+.upl-topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;}
+.upl-title{font-family:var(--head);font-size:18px;font-weight:700;background:var(--accentg);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.upl-subtitle{font-size:12px;color:var(--text3);margin-top:2px;}
+.upl-glass{background:var(--card);border:1.5px solid var(--border2);border-radius:var(--r16);box-shadow:0 4px 24px rgba(37,99,235,0.09);margin-bottom:16px;}
+.upl-grid{display:flex;flex-wrap:wrap;gap:0;align-items:stretch;}
+.upl-section{padding:20px 24px;border-right:1px solid var(--border2);flex:1 1 220px;min-width:200px;display:flex;flex-direction:column;gap:10px;}
+.upl-section:last-child{border-right:none;}
+.upl-label{font-family:var(--head);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.09em;color:var(--text3);display:flex;align-items:center;gap:7px;margin-bottom:2px;}
+.upl-label-icon{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;}
+.licon-blue  {background:rgba(37,99,235,0.10);border:1px solid rgba(37,99,235,0.20);}
+.licon-cyan  {background:rgba(6,182,212,0.10);border:1px solid rgba(6,182,212,0.20);}
+.licon-green {background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.20);}
+.licon-amber {background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.20);}
+.licon-purple{background:rgba(139,92,246,0.10);border:1px solid rgba(139,92,246,0.20);}
+.upl-input{font-family:var(--body);font-size:13.5px;background:#f8faff;border:1.5px solid var(--border2);border-radius:var(--r8);padding:9px 13px;color:var(--text);outline:none;transition:all 0.18s var(--ease);width:100%;}
+.upl-input:focus{background:#fff;border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,0.09);}
+.upl-input::placeholder{color:var(--text3);}
+.upl-input option{background:#fff;color:var(--text);}
+.upl-select{font-family:var(--body);font-size:13.5px;background:#f8faff;border:1.5px solid var(--border2);border-radius:var(--r8);padding:9px 32px 9px 13px;color:var(--text);outline:none;transition:all 0.18s var(--ease);width:100%;cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+.upl-select:focus{background-color:#fff;border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,0.09);}
+.upl-select option{background:#fff;color:var(--text);}
+.upl-file-wrap{position:relative;display:flex;align-items:center;gap:10px;}
+.upl-file-label{flex:1;background:#f8faff;border:1.5px dashed rgba(37,99,246,0.30);border-radius:var(--r8);padding:9px 13px;font-size:13px;color:var(--text3);cursor:pointer;transition:all 0.18s var(--ease);display:flex;align-items:center;gap:8px;overflow:hidden;white-space:nowrap;}
+.upl-file-label:hover{border-color:var(--accent);background:#f0f6ff;color:var(--text);}
+.upl-file-label.has-file{border-style:solid;border-color:var(--accent);color:var(--accent);background:rgba(37,99,235,0.05);}
+.upl-file-label span.fname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px;}
+input[type="file"].upl-hidden{display:none;}
+.upl-inline{display:flex;gap:8px;align-items:center;}
+.upl-inline .upl-input{flex:1;}
+.upl-btn{font-family:var(--head);font-size:13px;font-weight:600;border:none;border-radius:var(--r8);padding:9px 16px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:all 0.18s var(--ease);white-space:nowrap;flex-shrink:0;}
+.upl-btn:active{transform:scale(0.97);}
+.upl-btn-green {background:linear-gradient(135deg,#10b981,#34d399);color:#001a0d;box-shadow:0 4px 12px rgba(16,185,129,0.22);}
+.upl-btn-green:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-cyan  {background:linear-gradient(135deg,#06b6d4,#22d3ee);color:#001217;box-shadow:0 4px 12px rgba(6,182,212,0.22);}
+.upl-btn-cyan:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-blue  {background:var(--accentg);color:#fff;box-shadow:0 4px 12px rgba(37,99,235,0.26);}
+.upl-btn-blue:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-amber {background:linear-gradient(135deg,#f59e0b,#fbbf24);color:#1a0e00;box-shadow:0 4px 12px rgba(245,158,11,0.22);}
+.upl-btn-amber:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-red   {background:linear-gradient(135deg,#ef4444,#f87171);color:#fff;box-shadow:0 4px 12px rgba(239,68,68,0.22);}
+.upl-btn-red:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-purple{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:#fff;box-shadow:0 4px 12px rgba(124,58,237,0.22);}
+.upl-btn-purple:hover{filter:brightness(1.08);transform:translateY(-1px);}
+.upl-btn-sm{padding:8px 13px;font-size:13px;}
+.upl-btn:disabled{opacity:0.45;cursor:not-allowed;transform:none;filter:none;}
+.upl-pill-row{display:flex;flex-wrap:wrap;gap:6px;}
+.upl-pill{background:rgba(37,99,235,0.07);border:1.5px solid rgba(37,99,235,0.20);color:var(--accent);font-size:12px;font-weight:600;padding:3px 11px;border-radius:99px;font-family:var(--head);cursor:pointer;transition:all 0.15s var(--ease);}
+.upl-pill:hover{background:rgba(37,99,235,0.12);}
+.upl-pill.active{background:var(--accentg);color:#fff;border-color:transparent;box-shadow:0 2px 10px rgba(37,99,235,0.28);}
+.upl-action-strip{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-top:1px solid var(--border2);gap:12px;flex-wrap:wrap;}
+.upl-status{font-size:12.5px;color:var(--text3);display:flex;align-items:center;gap:7px;font-family:var(--head);}
+.upl-status-dot{width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0;}
+.upl-status-dot.ready{background:var(--green);box-shadow:0 0 0 3px rgba(16,185,129,0.18);animation:sdot 2s ease infinite;}
+@keyframes sdot{0%,100%{box-shadow:0 0 0 3px rgba(16,185,129,0.18);}50%{box-shadow:0 0 0 6px rgba(16,185,129,0.06);}}
+.sync-badge{display:inline-flex;align-items:center;gap:6px;font-family:var(--head);font-size:11.5px;font-weight:600;padding:4px 12px;border-radius:99px;}
+.sync-ok  {background:rgba(16,185,129,0.09);border:1px solid rgba(16,185,129,0.25);color:#059669;}
+.sync-err {background:rgba(245,158,11,0.09);border:1px solid rgba(245,158,11,0.25);color:#b45309;}
+.sync-ing {background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.20);color:var(--accent);}
+.sync-spin{width:10px;height:10px;border:2px solid rgba(37,99,235,0.20);border-top-color:var(--accent);border-radius:50%;animation:ss 0.7s linear infinite;flex-shrink:0;}
+@keyframes ss{to{transform:rotate(360deg);}}
+.upl-file-history{display:flex;flex-direction:column;gap:6px;margin-top:6px;}
+.upl-file-chip{display:inline-flex;align-items:center;gap:8px;background:rgba(37,99,235,0.06);border:1.5px solid rgba(37,99,235,0.20);color:var(--accent);font-size:12px;font-weight:600;padding:5px 12px;border-radius:var(--r8);font-family:var(--head);cursor:pointer;transition:all 0.15s;}
+.upl-file-chip:hover{background:rgba(37,99,235,0.12);border-color:rgba(37,99,235,0.35);}
+.upl-file-chip.active{background:var(--accentg);color:#fff;border-color:transparent;}
+.upl-file-chip-icon{font-size:13px;flex-shrink:0;}
+.upl-file-chip-rows{font-size:10px;opacity:0.75;font-weight:500;}
+.pricing-glass{background:var(--card);border:1.5px solid var(--border2);border-radius:var(--r16);box-shadow:0 4px 24px rgba(37,99,235,0.09);overflow:hidden;}
+.pricing-header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px 14px;border-bottom:1.5px solid var(--border2);gap:10px;flex-wrap:wrap;}
+.pricing-header-left{display:flex;align-items:center;gap:10px;}
+.pricing-header-icon{width:32px;height:32px;border-radius:var(--r8);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.22);}
+.pricing-header-title{font-family:var(--head);font-size:13.5px;font-weight:600;color:var(--text);}
+.pricing-header-sub{font-size:12px;color:var(--text3);margin-top:1px;}
+.pricing-active-pill{background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.20);color:var(--accent);font-size:11.5px;font-weight:600;padding:3px 11px;border-radius:99px;font-family:var(--head);}
+.pricing-scope-bar{display:flex;align-items:center;gap:10px;padding:12px 24px;background:rgba(37,99,235,0.03);border-bottom:1px solid var(--border2);flex-wrap:wrap;}
+.pricing-scope-label{font-family:var(--head);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);flex-shrink:0;}
+.pricing-scope-pill{font-family:var(--head);font-size:12px;font-weight:600;padding:5px 14px;border-radius:99px;cursor:pointer;transition:all 0.15s;border:1.5px solid var(--border2);background:transparent;color:var(--text3);}
+.pricing-scope-pill:hover{border-color:var(--accent);color:var(--accent);}
+.pricing-scope-pill.active{background:var(--accentg);color:#fff;border-color:transparent;box-shadow:0 2px 10px rgba(37,99,235,0.26);}
+.pricing-scope-info{margin-left:auto;font-size:11.5px;color:var(--text3);font-family:var(--head);background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.15);border-radius:99px;padding:3px 12px;}
+.pricing-body{padding:18px 24px 20px;display:flex;flex-direction:column;gap:14px;}
+.pricing-vendor-section{display:flex;flex-direction:column;gap:8px;}
+.pricing-vendor-label{font-family:var(--head);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);display:flex;align-items:center;gap:6px;}
+.pricing-vendor-inputs{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.pricing-vendor-inputs .upl-input{flex:1;min-width:90px;max-width:200px;}
+.pricing-rules-grid{display:flex;flex-wrap:wrap;gap:7px;}
+.pricing-rule-chip{display:inline-flex;align-items:center;gap:6px;background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.22);color:#059669;font-size:12px;font-weight:600;padding:4px 6px 4px 12px;border-radius:99px;font-family:var(--head);cursor:pointer;transition:all 0.15s var(--ease);}
+.pricing-rule-chip:hover{background:rgba(16,185,129,0.14);border-color:rgba(16,185,129,0.38);}
+.pricing-rule-chip-del{width:17px;height:17px;border-radius:50%;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.28);display:flex;align-items:center;justify-content:center;font-size:10px;cursor:pointer;transition:all 0.15s;color:#059669;}
+.pricing-rule-chip-del:hover{background:#ef4444;border-color:#ef4444;color:#fff;}
+.pricing-divider{height:1px;background:var(--border2);margin:4px 0;}
+.vendor-name-section{display:flex;flex-direction:column;gap:6px;}
+.vendor-name-label{font-family:var(--head);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-bottom:4px;}
+.team-lock{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(245,158,11,0.06),rgba(251,191,36,0.04));border:1.5px dashed rgba(245,158,11,0.30);border-radius:var(--r12);padding:16px 20px;margin-top:4px;}
+.team-lock-icon{font-size:22px;flex-shrink:0;opacity:0.7;}
+.team-lock-text{font-family:var(--head);font-size:13px;font-weight:600;color:#92400e;}
+.team-lock-sub{font-size:12px;color:var(--text3);margin-top:2px;}
+.workspace-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(124,58,237,0.07);border:1px solid rgba(124,58,237,0.20);color:#7c3aed;font-family:var(--head);font-size:11px;font-weight:600;padding:4px 10px;border-radius:99px;}
+.tier-badge{display:inline-flex;align-items:center;gap:4px;font-family:var(--head);font-size:11px;font-weight:700;padding:3px 10px;border-radius:99px;letter-spacing:0.04em;}
+.tier1{background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.28);color:#059669;}
+.tier2{background:rgba(37,99,235,0.10);border:1px solid rgba(37,99,235,0.28);color:#1d4ed8;}
+.tier3{background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.30);color:#b45309;}
+.tier4{background:rgba(239,68,68,0.09);border:1px solid rgba(239,68,68,0.25);color:#b91c1c;}
+
+/* ── save indicator ── */
+.pricing-save-bar{display:flex;align-items:center;gap:8px;padding:8px 24px;font-family:var(--head);font-size:11.5px;border-top:1px solid var(--border2);}
+.save-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.save-dot.saving{background:#f59e0b;animation:sdot 1s ease infinite;}
+.save-dot.saved {background:#10b981;}
+.save-dot.error {background:#ef4444;}
+
+/* ── Pincode sheet shared styles ── */
+.pinsheet-glass{background:var(--card);border:1.5px solid var(--border2);border-radius:var(--r16);box-shadow:0 4px 24px rgba(37,99,235,0.09);overflow:hidden;margin-bottom:16px;}
+.pinsheet-header{display:flex;align-items:center;justify-content:space-between;padding:14px 22px;border-bottom:1.5px solid var(--border2);background:linear-gradient(135deg,rgba(124,58,237,0.05),rgba(37,99,235,0.04));flex-wrap:wrap;gap:10px;}
+.pinsheet-title{font-family:var(--head);font-size:14px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;}
+.pinsheet-stats{display:flex;gap:8px;flex-wrap:wrap;}
+.pinsheet-stat{display:inline-flex;align-items:center;gap:5px;font-family:var(--head);font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;}
+.pinsheet-filters{display:flex;gap:8px;align-items:center;padding:12px 22px;background:rgba(37,99,235,0.02);border-bottom:1px solid var(--border2);flex-wrap:wrap;}
+.pinsheet-body{max-height:400px;overflow-y:auto;overflow-x:auto;}
+.pinsheet-body::-webkit-scrollbar{width:6px;height:6px;}
+.pinsheet-body::-webkit-scrollbar-thumb{background:rgba(37,99,235,0.22);border-radius:99px;}
+.pinsheet-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+.pinsheet-table th{position:sticky;top:0;z-index:5;background:linear-gradient(135deg,#1d4ed8,#0891b2);color:rgba(255,255,255,0.85);font-family:var(--head);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;padding:10px 14px;text-align:left;white-space:nowrap;border-right:1px solid rgba(255,255,255,0.10);}
+.pinsheet-table th:last-child{border-right:none;}
+.pinsheet-table td{padding:8px 14px;border-bottom:1px solid rgba(37,99,235,0.07);white-space:nowrap;color:var(--text);vertical-align:middle;border-right:1px solid rgba(37,99,235,0.05);}
+.pinsheet-table td:last-child{border-right:none;}
+.pinsheet-table tr:nth-child(even) td{background:#f8faff;}
+.pinsheet-table tr:hover td{background:#eef4ff;}
+.pinsheet-empty{padding:40px;text-align:center;color:var(--text3);font-family:var(--head);font-size:13px;}
+
+/* ── Company pincode upload area ── */
+.cpinsheet-upload-area{border:2px dashed rgba(124,58,237,0.30);border-radius:var(--r12);padding:20px;text-align:center;cursor:pointer;transition:all 0.18s var(--ease);background:rgba(124,58,237,0.02);}
+.cpinsheet-upload-area:hover{border-color:rgba(124,58,237,0.55);background:rgba(124,58,237,0.05);}
+.cpinsheet-upload-area.drag{border-color:#7c3aed;background:rgba(124,58,237,0.08);}
+.cpinsheet-upload-icon{font-size:32px;margin-bottom:8px;opacity:0.65;}
+.cpinsheet-upload-text{font-family:var(--head);font-size:13px;font-weight:600;color:#7c3aed;margin-bottom:4px;}
+.cpinsheet-upload-sub{font-size:11.5px;color:var(--text3);}
+.cpinsheet-format-note{display:flex;align-items:flex-start;gap:8px;padding:10px 14px;background:rgba(37,99,235,0.04);border:1px solid rgba(37,99,235,0.14);border-radius:var(--r8);font-size:12px;color:var(--text2);line-height:1.55;margin-top:8px;}
+
+.upl-dropdown-box{position:relative;max-width:420px;margin-top:8px;}
+.upl-dropdown-btn{width:100%;font-family:var(--head);font-size:12.5px;font-weight:700;background:#f8faff;border:1.5px solid var(--border2);border-radius:var(--r8);padding:9px 13px;color:var(--accent);cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;transition:all .18s var(--ease);}
+.upl-dropdown-btn:hover{background:#fff;border-color:rgba(37,99,235,.35);box-shadow:0 4px 14px rgba(37,99,235,.08);}
+.upl-dropdown-panel{position:relative;left:auto;right:auto;top:auto;z-index:40;background:#fff;border:1.5px solid var(--border2);border-radius:var(--r12);box-shadow:0 14px 38px rgba(37,99,235,.16);padding:8px;max-height:260px;overflow:auto;margin-top:8px;}
+.upl-dropdown-panel::-webkit-scrollbar{width:6px;}
+.upl-dropdown-panel::-webkit-scrollbar-thumb{background:rgba(37,99,235,.22);border-radius:99px;}
+.upl-dropdown-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px;border-radius:var(--r8);font-family:var(--head);font-size:12px;font-weight:700;color:var(--text2);cursor:pointer;transition:all .15s var(--ease);}
+.upl-dropdown-row:hover{background:rgba(37,99,235,.07);color:var(--accent);}
+.upl-dropdown-row.active{background:linear-gradient(135deg,rgba(37,99,235,.12),rgba(6,182,212,.08));color:var(--accent);}
+.upl-dropdown-del{width:22px;height:22px;border:none;border-radius:50%;background:rgba(239,68,68,.08);color:#ef4444;cursor:pointer;font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;}
+.upl-dropdown-del:hover{background:#ef4444;color:#fff;}
+.upl-dropdown-empty{padding:14px;text-align:center;color:var(--text3);font-family:var(--head);font-size:12px;}
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("upl-css")) {
+  const s = document.createElement("style");
+  s.id = "upl-css";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+/* ─────────────────────────── CONSTANTS ──────────────────────────────────── */
+export const MASTER_KEY        = "__MASTER_TABLE__";
+export const GLOBAL_PRICING_KEY = "__GLOBAL__";
+const VALID_STATUSES = ["Sent", "Closed", "Pending", "Insuff", "Hold", "Stop"];
+
+const TIER_COLORS = {
+  Tier1: { bg: "rgba(16,185,129,0.10)", border: "rgba(16,185,129,0.28)", color: "#059669" },
+  Tier2: { bg: "rgba(37,99,235,0.10)",  border: "rgba(37,99,235,0.28)",  color: "#1d4ed8" },
+  Tier3: { bg: "rgba(245,158,11,0.10)", border: "rgba(245,158,11,0.30)", color: "#b45309" },
+  Tier4: { bg: "rgba(239,68,68,0.09)",  border: "rgba(239,68,68,0.25)",  color: "#b91c1c" },
+};
+
+function TierBadge({ tier }) {
+  if (!tier)
+    return <span style={{ fontSize: 11, color: "var(--text3)", fontStyle: "italic" }}>—</span>;
+  const s = TIER_COLORS[tier] || TIER_COLORS.Tier3;
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      fontFamily: "var(--head)", fontSize: 11, fontWeight: 700,
+      padding: "3px 10px", borderRadius: 99, letterSpacing: "0.04em",
+      background: s.bg, border: `1px solid ${s.border}`, color: s.color,
+    }}>
+      {tier}
+    </span>
+  );
+}
+
+/* ─────────────────────────── HELPERS ────────────────────────────────────── */
+function normaliseStatus(raw) {
+  if (!raw) return "Pending";
+  const cleaned = String(raw).trim();
+  return VALID_STATUSES.find(v => v.toLowerCase() === cleaned.toLowerCase()) || "Pending";
+}
+function cleanCell(v) {
+  if (!v) return "";
+  if (v instanceof Date) return v.toLocaleDateString("en-IN");
+  return String(v).replace(/[\r\n]+/g, " ").replace(/\u2028|\u2029/g, " ").replace(/\s+/g, " ").trim();
+}
+function scopedKey(base, tenantId) {
+  if (!tenantId) return base;
+  return `${base}__${tenantId}`;
+}
+function safeGet(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch { return fallback; }
+}
+function safeSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); }
+  catch (e) { console.warn(`localStorage full for "${key}"`, e); }
+}
+
+function getCurrentUserSafe() {
+  try {
+    return JSON.parse(sessionStorage.getItem("currentUser") || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function getClientWorkspaceId(tenantId, isSuperAdmin = false) {
+  const cu = getCurrentUserSafe();
+  const role = String(cu.role || "").trim().toLowerCase();
+  const email = String(cu.email || "").trim().toLowerCase();
+  const ownerAdminEmail = String(cu.ownerAdminEmail || "").trim().toLowerCase();
+
+  // ✅ Strict company isolation fix:
+  // Do NOT trust only the prop isSuperAdmin, because secondary/company admins can
+  // accidentally receive that prop from parent state. Super Admin workspace is used
+  // only when the logged-in user role is actually superadmin. If currentUser is not
+  // loaded yet, then the prop fallback still keeps old behaviour.
+  // Manager/TL are super admin's own internal-staff roles (not separate tenants) and
+  // must work on the SAME client workspace super admin uses, not an isolated one.
+  const actualSuperAdmin =
+    role === "superadmin" ||
+    role === "manager" ||
+    role === "tl" ||
+    (!role && isSuperAdmin === true);
+
+  // Super Admin clients must stay in their own bucket.
+  // This prevents Super Admin clients from appearing in company/secondary admin accounts.
+  if (actualSuperAdmin) return "__SUPERADMIN__";
+
+  // Company Admin / Secondary Admin must have their own workspace.
+  // Prefer tenantId if present. If tenantId is missing, use logged-in admin email.
+  if (tenantId || cu.tenantId || cu.subTenantId) {
+    return String(tenantId || cu.tenantId || cu.subTenantId).trim();
+  }
+
+  if (role === "admin" || role === "secondary_admin") {
+    return email ? `ADMIN__${email}` : "__UNKNOWN_ADMIN__";
+  }
+
+  // Company team users read their company/admin bucket.
+  if (role === "team") {
+    if (cu.tenantId || cu.subTenantId) return String(cu.tenantId || cu.subTenantId).trim();
+    if (ownerAdminEmail) return `ADMIN__${ownerAdminEmail}`;
+  }
+
+  // Final fallback is user email, never a shared/global bucket.
+  return email ? `USER__${email}` : "__LOCAL_COMPANY__";
+}
+
+function getClientRecordScope(client = {}) {
+  if (!client || typeof client !== "object") return "";
+  return String(
+    client.tenantId ||
+    client.companyTenantId ||
+    client.workspaceId ||
+    client.clientWorkspaceId ||
+    client.scopeKey ||
+    client.scope ||
+    client.companyId ||
+    client.tenantCode ||
+    client.companyCode ||
+    client.companyName ||
+    client.company ||
+    client.ownerAdminEmail ||
+    client.adminEmail ||
+    client.createdByEmail ||
+    client.createdBy ||
+    ""
+  ).trim();
+}
+
+function getClientArrayFromApi(data) {
+  return Array.isArray(data)
+    ? data
+    : Array.isArray(data?.clients)
+      ? data.clients
+      : Array.isArray(data?.data)
+        ? data.data
+        : [];
+}
+
+function filterClientRecordsByWorkspace(data, workspaceId, isSuperAdmin = false) {
+  const arr = getClientArrayFromApi(data);
+  const ws = String(workspaceId || "").trim();
+  const wsLower = ws.toLowerCase();
+  const effectiveSuperAdmin = isSuperAdmin === true && ws === "__SUPERADMIN__";
+
+  return arr.filter((client) => {
+    // ✅ Strict workspace isolation:
+    // Plain string clients are old/unscoped records. Do not load them from DB,
+    // because they can leak secondary/company clients into Super Admin.
+    // Current workspace clients are loaded from scoped portal-state/local keys.
+    if (typeof client === "string") return false;
+
+    const scope = getClientRecordScope(client);
+    const scopeLower = String(scope || "").trim().toLowerCase();
+
+    if (effectiveSuperAdmin) {
+      return scopeLower === "__superadmin__" || scopeLower === "superadmin";
+    }
+
+    // Company Admin / Secondary Admin / Team: only exact workspace match.
+    return !!scopeLower && scopeLower === wsLower;
+  });
+}
+
+function nameKey(v) {
+  return String(v || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+// Strict client matching for Excel uploads only.
+// This keeps all old portal logic unchanged, but Excel Client Name must match
+// the saved client name with the same spelling and same capital letters.
+function strictClientKey(v) {
+  return String(v || "").replace(/\s+/g, " ").trim();
+}
+function isNameDeleted(name, deletedList = []) {
+  const k = nameKey(name);
+  return !!k && (deletedList || []).some(x => nameKey(x) === k);
+}
+function removeNameFromDeleted(name, deletedList = []) {
+  const k = nameKey(name);
+  return (deletedList || []).filter(x => nameKey(x) !== k);
+}
+function removeNamesFromDeleted(names = [], deletedList = []) {
+  const keys = new Set((names || []).map(nameKey).filter(Boolean));
+  if (!keys.size) return deletedList || [];
+  return (deletedList || []).filter(x => !keys.has(nameKey(x)));
+}
+function getAuthHeaders(json = false) {
+  let token = "";
+  try {
+    const cu = JSON.parse(sessionStorage.getItem("currentUser") || "{}");
+    token = cu?.token || sessionStorage.getItem("token") || sessionStorage.getItem("authToken") || sessionStorage.getItem("jwt") || "";
+  } catch {
+    token = sessionStorage.getItem("token") || sessionStorage.getItem("authToken") || sessionStorage.getItem("jwt") || "";
+  }
+  const headers = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (json) headers["Content-Type"] = "application/json";
+  return headers;
+}
+function apiBaseUrl() {
+  return window.location.hostname === "localhost" ? "http://localhost:5002/api" : "https://profeix.info/api";
+}
+async function safeFetchDelete(url) {
+  try {
+    const res = await fetch(url, { method: "DELETE", headers: getAuthHeaders() });
+    if (res.ok || res.status === 404) return true;
+    const data = await res.json().catch(() => ({}));
+    console.warn("Delete request failed:", url, data.message || data.error || res.status);
+    return false;
+  } catch (err) {
+    console.warn("Delete request error:", url, err.message);
+    return false;
+  }
+}
+async function deletePricingScopeFromDB(scopeKey, pricingAPIRef) {
+  if (!scopeKey) return;
+  try {
+    if (pricingAPIRef?.deleteScope) {
+      await pricingAPIRef.deleteScope(scopeKey);
+      return;
+    }
+    if (pricingAPIRef?.removeScope) {
+      await pricingAPIRef.removeScope(scopeKey);
+      return;
+    }
+  } catch (err) {
+    console.warn("Pricing scope delete API failed:", err.message);
+  }
+  await safeFetchDelete(`${apiBaseUrl()}/pricing/${encodeURIComponent(scopeKey)}`);
+}
+async function deleteClientFromDBByName(clientName, tenantId, clientAPIRef) {
+  const target = nameKey(clientName);
+  const workspace = String(tenantId || "").trim();
+  const workspaceLower = workspace.toLowerCase();
+  if (!target) return false;
+
+  let matchedId = "";
+  try {
+    const data = await clientAPIRef.getAll();
+    const arr = Array.isArray(data) ? data : Array.isArray(data?.clients) ? data.clients : Array.isArray(data?.data) ? data.data : [];
+    const match = arr.find(c => {
+      const nm = nameKey(typeof c === "string" ? c : c?.name || c?.clientName || c?.companyName || c?.label);
+      if (nm !== target) return false;
+
+      // Never delete another workspace's client with the same name.
+      if (!workspaceLower) return false;
+      if (typeof c === "string") return workspace === "__SUPERADMIN__";
+      const scope = getClientRecordScope(c);
+      const scopeLower = String(scope || "").trim().toLowerCase();
+      if (workspace === "__SUPERADMIN__") return !scopeLower || scopeLower === "__superadmin__" || scopeLower === "superadmin";
+      return scopeLower === workspaceLower;
+    });
+    matchedId = String(match?._id || match?.id || match?.clientId || "").trim();
+  } catch (err) {
+    console.warn("Client lookup before delete failed:", err.message);
+  }
+
+  try {
+    if (matchedId && clientAPIRef?.delete) { await clientAPIRef.delete(matchedId); return true; }
+    if (matchedId && clientAPIRef?.remove) { await clientAPIRef.remove(matchedId); return true; }
+    if (clientAPIRef?.deleteByName) { await clientAPIRef.deleteByName(clientName, tenantId); return true; }
+  } catch (err) {
+    console.warn("Client API delete failed:", err.message);
+  }
+
+  const base = apiBaseUrl();
+  const qs = `name=${encodeURIComponent(clientName)}${tenantId ? `&tenantId=${encodeURIComponent(tenantId)}` : ""}`;
+  const attempts = [];
+  if (matchedId) attempts.push(`${base}/clients/${encodeURIComponent(matchedId)}`);
+  attempts.push(`${base}/clients/by-name/${encodeURIComponent(clientName)}`);
+  attempts.push(`${base}/clients?${qs}`);
+
+  let ok = false;
+  for (const url of attempts) ok = (await safeFetchDelete(url)) || ok;
+  return ok;
+}
+
+function normalizeClientName(v) {
+  return String(v || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeVendorName(v) {
+  return String(v || "").replace(/\s+/g, " ").trim();
+}
+
+function extractVendorNameFromRow(row = {}) {
+  const source = {
+    ...(row?.rawData && typeof row.rawData === "object" ? row.rawData : {}),
+    ...(row && typeof row === "object" ? row : {}),
+  };
+
+  const exactKeys = [
+    "Vendor Company Name", "Vendor Company", "Vendor Name", "VendorName",
+    "Vendor", "vendor company name", "vendor company", "vendor name",
+    "vendor", "Agent Vendor", "Vendor Agency", "Vendor Partner",
+    "Agency Name", "Agency", "Field Vendor", "Vendor Assigned",
+  ];
+
+  for (const key of exactKeys) {
+    const val = normalizeVendorName(source?.[key]);
+    if (val) return val;
+  }
+
+  // Flexible header support: handles Excel headers like
+  // "Vendor company", "VENDOR_NAME", "Vendor/Agency", etc.
+  const blocked = /(price|rate|amount|status|date|tat|sent|close|closed|completed|mobile|phone|email|id|code)/i;
+
+  for (const key of Object.keys(source || {})) {
+    const cleanKey = String(key || "").trim();
+    const compact = cleanKey.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    const looksLikeVendorName =
+      compact === "vendor" ||
+      compact === "vendorname" ||
+      compact === "vendorcompany" ||
+      compact === "vendorcompanyname" ||
+      compact === "agency" ||
+      compact === "agencyname" ||
+      (compact.includes("vendor") &&
+        (compact.includes("name") || compact.includes("company") || compact.includes("agency")));
+
+    if (!looksLikeVendorName || blocked.test(cleanKey)) continue;
+
+    const val = normalizeVendorName(source[cleanKey]);
+    if (val) return val;
+  }
+
+  return "";
+}
+
+function extractVendorNamesFromRows(rows = []) {
+  const found = [];
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const v = extractVendorNameFromRow(row);
+    if (v) found.push(v);
+  });
+  return mergeVendorLists(found);
+}
+
+function extractVendorNamesFromPricingRules(rulesObj = {}, scopePrefix = "") {
+  const found = [];
+
+  if (!rulesObj || typeof rulesObj !== "object") return [];
+
+  Object.entries(rulesObj).forEach(([key, rules]) => {
+    if (scopePrefix && !String(key).startsWith(scopePrefix)) return;
+    if (!Array.isArray(rules)) return;
+
+    rules.forEach((rule) => {
+      const v = normalizeVendorName(rule?.vendorName);
+      if (v) found.push(v);
+    });
+  });
+
+  return mergeVendorLists(found);
+}
+function mergeVendorLists(...lists) {
+  const map = new Map();
+
+  lists.flat().forEach((item) => {
+    const name = normalizeVendorName(item);
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (!map.has(key)) map.set(key, name);
+  });
+
+  return Array.from(map.values()).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: "base" })
+  );
+}
+
+function mergeClientLists(...lists) {
+  const map = new Map();
+
+  lists.flat().forEach((item) => {
+    const name = normalizeClientName(item);
+    if (!name || name === MASTER_KEY) return;
+    const key = name.toLowerCase();
+    if (!map.has(key)) map.set(key, name);
+  });
+
+  return Array.from(map.values()).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: "base" })
+  );
+}
+
+function extractClientNamesFromApi(data) {
+  const arr = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.clients)
+      ? data.clients
+      : Array.isArray(data?.data)
+        ? data.data
+        : [];
+
+  return arr
+    .map((c) =>
+      normalizeClientName(
+        typeof c === "string"
+          ? c
+          : c?.name || c?.clientName || c?.companyName || c?.label
+      )
+    )
+    .filter(Boolean);
+}
+
+async function syncClientsToBackend(clientNames, tenantId) {
+  const names = mergeClientLists(clientNames);
+  if (!names.length) return [];
+
+  const workspaceId = String(tenantId || "").trim();
+  const cu = getCurrentUserSafe();
+  const userEmail = String(cu.email || "").trim().toLowerCase();
+
+  const results = await Promise.allSettled(
+    names.map((name) =>
+      clientAPI.create({
+        name,
+        clientName: name,
+        tenantId: workspaceId || null,
+        workspaceId: workspaceId || null,
+        clientWorkspaceId: workspaceId || null,
+        companyTenantId: workspaceId || null,
+        companyId: workspaceId || null,
+        scopeKey: workspaceId || null,
+        createdByEmail: userEmail || "",
+        ownerAdminEmail: userEmail || "",
+      })
+    )
+  );
+
+  const failed = results.filter((r) => r.status === "rejected");
+  if (failed.length) {
+    console.warn(
+      `Client sync skipped/failed for ${failed.length} client(s):`,
+      failed.map((r) => r.reason?.message || r.reason)
+    );
+  }
+
+  // Important: do not silently save only in localStorage.
+  // If DB save fails, another laptop will never see the client.
+  if (failed.length === results.length) {
+    throw new Error(failed[0]?.reason?.message || "Client DB sync failed");
+  }
+
+  return names;
+}
+
+/* ─────────────────────────── BUILT-IN PINCODE DATA (SA only) ────────────── */
+const PINSHEET_ROWS  = Object.entries(PINCODE_TIER).map(([pin, tier]) => ({ pincode: pin, tier }));
+const DISTRICT_ROWS  = Object.entries(DISTRICT_TIER).map(([district, tier]) => ({ district, tier }));
+
+/* ══════════════════════════════════════════════════════════════════
+   SUPER-ADMIN PINCODE PANEL  (unchanged)
+══════════════════════════════════════════════════════════════════ */
+function SuperAdminPincodePanel({ onClose }) {
+  const [search, setSearch]         = useState("");
+  const [tierFilter, setTierFilter] = useState("All");
+  const [tab, setTab]               = useState("pincode");
+
+  const tierCounts = useMemo(() => {
+    const c = { Tier1: 0, Tier2: 0, Tier3: 0, Tier4: 0 };
+    PINSHEET_ROWS.forEach(r => { if (c[r.tier] !== undefined) c[r.tier]++; });
+    return c;
+  }, []);
+
+  const filteredPins = useMemo(() => {
+    const sl = search.trim().toLowerCase();
+    return PINSHEET_ROWS.filter(r => {
+      if (tierFilter !== "All" && r.tier !== tierFilter) return false;
+      if (sl && !r.pincode.includes(sl) && !r.tier.toLowerCase().includes(sl)) return false;
+      return true;
+    });
+  }, [search, tierFilter]);
+
+  const filteredDistricts = useMemo(() => {
+    const sl = search.trim().toLowerCase();
+    return DISTRICT_ROWS.filter(r => {
+      if (tierFilter !== "All" && r.tier !== tierFilter) return false;
+      if (sl && !r.district.toLowerCase().includes(sl) && !r.tier.toLowerCase().includes(sl)) return false;
+      return true;
+    });
+  }, [search, tierFilter]);
+
+  return (
+    <div className="pinsheet-glass">
+      <div className="pinsheet-header">
+        <div className="pinsheet-title">👑 Master Pincode Tier Sheet (Super Admin)</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div className="pinsheet-stats">
+            {Object.entries(tierCounts).map(([t, c]) => {
+              const s = TIER_COLORS[t];
+              return (
+                <span key={t} className="pinsheet-stat"
+                  style={{ background: s.bg, border: `1px solid ${s.border}`, color: s.color }}>
+                  {t}: {c.toLocaleString()}
+                </span>
+              );
+            })}
+          </div>
+          <button className="upl-btn upl-btn-red upl-btn-sm"
+            style={{ fontSize: 11, padding: "6px 12px" }} onClick={onClose}>✕ Close</button>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--border2)", background: "rgba(37,99,235,0.02)" }}>
+        {[
+          { key: "pincode",  label: `📌 By Pincode (${PINSHEET_ROWS.length.toLocaleString()})` },
+          { key: "district", label: `🗺️ By District (${DISTRICT_ROWS.length.toLocaleString()})` },
+        ].map(({ key, label }) => (
+          <button key={key} onClick={() => setTab(key)}
+            style={{ fontFamily: "var(--head)", fontSize: 12, fontWeight: 700, padding: "10px 20px", border: "none", cursor: "pointer", borderBottom: tab === key ? "2.5px solid var(--accent)" : "2.5px solid transparent", background: "transparent", color: tab === key ? "var(--accent)" : "var(--text3)", transition: "all 0.15s" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="pinsheet-filters">
+        <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+          <span style={{ position: "absolute", left: 10, color: "var(--text3)", fontSize: 13 }}>🔍</span>
+          <input className="upl-input" style={{ paddingLeft: 32, width: 200, fontSize: 13 }}
+            placeholder={tab === "pincode" ? "Search pincode…" : "Search district…"}
+            value={search} onChange={e => setSearch(e.target.value)} />
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {["All", "Tier1", "Tier2", "Tier3", "Tier4"].map(t => {
+            const s = t !== "All" ? TIER_COLORS[t] : null;
+            return (
+              <button key={t} onClick={() => setTierFilter(t)}
+                style={{ fontFamily: "var(--head)", fontSize: 11.5, fontWeight: 600, padding: "5px 12px", borderRadius: 99, cursor: "pointer", transition: "all 0.14s", background: tierFilter === t ? (s ? s.bg : "var(--accentg)") : "transparent", border: tierFilter === t ? `1.5px solid ${s ? s.border : "var(--accent)"}` : "1.5px solid var(--border2)", color: tierFilter === t ? (s ? s.color : "var(--accent)") : "var(--text3)" }}>
+                {t}
+              </button>
+            );
+          })}
+        </div>
+        <span style={{ marginLeft: "auto", fontFamily: "var(--head)", fontSize: 12, color: "var(--text3)" }}>
+          {tab === "pincode" ? filteredPins.length.toLocaleString() : filteredDistricts.length.toLocaleString()} results
+        </span>
+      </div>
+      <div className="pinsheet-body">
+        {tab === "pincode" ? (
+          filteredPins.length === 0
+            ? <div className="pinsheet-empty">No pincodes match your filter.</div>
+            : (
+              <table className="pinsheet-table">
+                <thead><tr><th>Pincode</th><th>Tier</th></tr></thead>
+                <tbody>
+                  {filteredPins.slice(0, 500).map((r, i) => (
+                    <tr key={i}>
+                      <td style={{ fontFamily: "var(--head)", fontWeight: 600 }}>{r.pincode}</td>
+                      <td><TierBadge tier={r.tier} /></td>
+                    </tr>
+                  ))}
+                  {filteredPins.length > 500 && (
+                    <tr><td colSpan={2} style={{ textAlign: "center", padding: "10px", color: "var(--text3)", fontFamily: "var(--head)", fontSize: 11 }}>
+                      … showing 500 of {filteredPins.length.toLocaleString()} — use search to narrow down
+                    </td></tr>
+                  )}
+                </tbody>
+              </table>
+            )
+        ) : (
+          filteredDistricts.length === 0
+            ? <div className="pinsheet-empty">No districts match your filter.</div>
+            : (
+              <table className="pinsheet-table">
+                <thead><tr><th>District</th><th>Tier (dominant)</th></tr></thead>
+                <tbody>
+                  {filteredDistricts.map((r, i) => (
+                    <tr key={i}>
+                      <td style={{ fontFamily: "var(--head)", fontWeight: 600 }}>{r.district}</td>
+                      <td><TierBadge tier={r.tier} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   COMPANY PINCODE PANEL  (unchanged)
+══════════════════════════════════════════════════════════════════ */
+function CompanyPincodePanel({ tenantId, isTeamMember: readOnly, onClose }) {
+  const STORE_KEY = `tenant_${tenantId}_pincodeSheet`;
+  const [rows, setRows]             = useState(() => safeGet(STORE_KEY, []));
+  const [search, setSearch]         = useState("");
+  const [tierFilter, setTierFilter] = useState("All");
+  const [tab, setTab]               = useState("pincode");
+  const [uploading, setUploading]   = useState(false);
+  const [drag, setDrag]             = useState(false);
+  const fileRef                     = useRef(null);
+
+  const persist = (updated) => { setRows(updated); safeSet(STORE_KEY, updated); };
+
+  const parseFile = (file) => {
+    if (!file) return;
+    setUploading(true);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const buf  = new Uint8Array(e.target.result);
+        const wb   = XLSX.read(buf, { type: "array" });
+        const ws   = wb.Sheets[wb.SheetNames[0]];
+        const raw  = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
+        if (!raw.length) { alert("❌ File is empty"); setUploading(false); return; }
+
+        const headers = raw[0].map(h => String(h || "").trim().toLowerCase());
+        const pinCol  = headers.findIndex(h => h.includes("pincode") || h.includes("pin") || h.includes("zip"));
+        const distCol = headers.findIndex(h => h.includes("district") || h.includes("dist"));
+        const tierCol = headers.findIndex(h => h.includes("tier"));
+
+        if (tierCol === -1) { alert("❌ Sheet must have a 'Tier' column."); setUploading(false); return; }
+        if (pinCol === -1 && distCol === -1) { alert("❌ Sheet must have a 'Pincode' or 'District' column."); setUploading(false); return; }
+
+        const newRows = [];
+        for (let i = 1; i < raw.length; i++) {
+          const r    = raw[i];
+          const pin  = pinCol  !== -1 ? String(r[pinCol]  || "").trim() : "";
+          const dist = distCol !== -1 ? String(r[distCol] || "").trim() : "";
+          const rawT = String(r[tierCol] || "").trim();
+          const m    = rawT.match(/(\d)/);
+          const tier = m ? `Tier${m[1]}` : rawT;
+          if ((pin || dist) && tier) newRows.push({ pincode: pin || "", district: dist || "", tier });
+        }
+
+        if (!newRows.length) { alert("❌ No valid rows found."); setUploading(false); return; }
+        persist([...rows, ...newRows]);
+        alert(`✅ Added ${newRows.length} rows to your company pincode sheet!`);
+      } catch (err) {
+        alert("❌ " + (err.message || "Error reading file"));
+      } finally { setUploading(false); }
+    };
+    reader.onerror = () => { alert("❌ File read failed"); setUploading(false); };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleDrop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) parseFile(f); };
+  const pincodeRows  = rows.filter(r => r.pincode);
+  const districtRows = rows.filter(r => r.district);
+
+  const tierCounts = useMemo(() => {
+    const c = { Tier1: 0, Tier2: 0, Tier3: 0, Tier4: 0 };
+    rows.forEach(r => { if (c[r.tier] !== undefined) c[r.tier]++; });
+    return c;
+  }, [rows]);
+
+  const filteredPins = useMemo(() => {
+    const sl = search.trim().toLowerCase();
+    return pincodeRows.filter(r => {
+      if (tierFilter !== "All" && r.tier !== tierFilter) return false;
+      if (sl && !r.pincode.toLowerCase().includes(sl) && !r.tier.toLowerCase().includes(sl)) return false;
+      return true;
+    });
+  }, [pincodeRows, search, tierFilter]);
+
+  const filteredDists = useMemo(() => {
+    const sl = search.trim().toLowerCase();
+    return districtRows.filter(r => {
+      if (tierFilter !== "All" && r.tier !== tierFilter) return false;
+      if (sl && !r.district.toLowerCase().includes(sl) && !r.tier.toLowerCase().includes(sl)) return false;
+      return true;
+    });
+  }, [districtRows, search, tierFilter]);
+
+  const deleteRow = (idx, fromTab) => {
+    const newRows = rows.filter((r) => {
+      if (fromTab === "pincode")  return !(r.pincode  && pincodeRows.indexOf(r)  === idx);
+      if (fromTab === "district") return !(r.district && districtRows.indexOf(r) === idx);
+      return true;
+    });
+    persist(newRows);
+  };
+
+  const clearAll = () => {
+    if (!window.confirm("Delete ALL rows from your company pincode sheet?")) return;
+    persist([]);
+  };
+
+  return (
+    <div className="pinsheet-glass">
+      <div className="pinsheet-header">
+        <div className="pinsheet-title">🏢 Company Pincode Sheet</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {rows.length > 0 && (
+            <div className="pinsheet-stats">
+              {Object.entries(tierCounts).filter(([, c]) => c > 0).map(([t, c]) => {
+                const s = TIER_COLORS[t];
+                return (
+                  <span key={t} className="pinsheet-stat"
+                    style={{ background: s.bg, border: `1px solid ${s.border}`, color: s.color }}>
+                    {t}: {c.toLocaleString()}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {!readOnly && rows.length > 0 && (
+            <button className="upl-btn upl-btn-red upl-btn-sm"
+              style={{ fontSize: 11, padding: "6px 12px" }} onClick={clearAll}>🗑 Clear All</button>
+          )}
+          <button className="upl-btn upl-btn-red upl-btn-sm"
+            style={{ fontSize: 11, padding: "6px 12px" }} onClick={onClose}>✕ Close</button>
+        </div>
+      </div>
+
+      {!readOnly && (
+        <div style={{ padding: "16px 22px", borderBottom: "1px solid var(--border2)" }}>
+          <div className={`cpinsheet-upload-area ${drag ? "drag" : ""}`}
+            onDragOver={e => { e.preventDefault(); setDrag(true); }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={handleDrop}
+            onClick={() => fileRef.current?.click()}>
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }}
+              onChange={e => { parseFile(e.target.files?.[0]); e.target.value = null; }} />
+            <div className="cpinsheet-upload-icon">📋</div>
+            <div className="cpinsheet-upload-text">
+              {uploading ? "⏳ Uploading…" : "Drop your pincode Excel here, or click to browse"}
+            </div>
+            <div className="cpinsheet-upload-sub">Supports .xlsx · .xls · .csv</div>
+          </div>
+          <div className="cpinsheet-format-note">
+            <span style={{ fontSize: 14, flexShrink: 0 }}>ℹ️</span>
+            <span>
+              Your Excel must have a <strong>Pincode</strong> or <strong>District</strong> column and a <strong>Tier</strong> column
+              with values <strong>Tier1</strong> – <strong>Tier4</strong>.
+              Uploaded data is visible to your company admin and team members only.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {rows.length === 0 && (
+        <div className="pinsheet-empty" style={{ padding: "48px 20px" }}>
+          <div style={{ fontSize: 40, opacity: 0.25, marginBottom: 10 }}>📋</div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 14, fontWeight: 700, color: "var(--text3)", marginBottom: 6 }}>
+            No pincode data yet
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--text3)", maxWidth: 340, margin: "0 auto", lineHeight: 1.6 }}>
+            {readOnly
+              ? "Your admin hasn't uploaded a pincode sheet yet. Contact your administrator."
+              : "Upload an Excel file with Pincode + Tier columns above."}
+          </div>
+        </div>
+      )}
+
+      {rows.length > 0 && (
+        <>
+          <div style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--border2)", background: "rgba(124,58,237,0.02)" }}>
+            {[
+              { key: "pincode",  label: `📌 By Pincode (${pincodeRows.length.toLocaleString()})` },
+              { key: "district", label: `🗺️ By District (${districtRows.length.toLocaleString()})` },
+            ].map(({ key, label }) => (
+              <button key={key} onClick={() => setTab(key)}
+                style={{ fontFamily: "var(--head)", fontSize: 12, fontWeight: 700, padding: "10px 20px", border: "none", cursor: "pointer", borderBottom: tab === key ? "2.5px solid #7c3aed" : "2.5px solid transparent", background: "transparent", color: tab === key ? "#7c3aed" : "var(--text3)", transition: "all 0.15s" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="pinsheet-filters">
+            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+              <span style={{ position: "absolute", left: 10, color: "var(--text3)", fontSize: 13 }}>🔍</span>
+              <input className="upl-input" style={{ paddingLeft: 32, width: 200, fontSize: 13 }}
+                placeholder={tab === "pincode" ? "Search pincode…" : "Search district…"}
+                value={search} onChange={e => setSearch(e.target.value)} />
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {["All", "Tier1", "Tier2", "Tier3", "Tier4"].map(t => {
+                const s = t !== "All" ? TIER_COLORS[t] : null;
+                return (
+                  <button key={t} onClick={() => setTierFilter(t)}
+                    style={{ fontFamily: "var(--head)", fontSize: 11.5, fontWeight: 600, padding: "5px 12px", borderRadius: 99, cursor: "pointer", transition: "all 0.14s", background: tierFilter === t ? (s ? s.bg : "rgba(124,58,237,0.10)") : "transparent", border: tierFilter === t ? `1.5px solid ${s ? s.border : "rgba(124,58,237,0.35)"}` : "1.5px solid var(--border2)", color: tierFilter === t ? (s ? s.color : "#7c3aed") : "var(--text3)" }}>
+                    {t}
+                  </button>
+                );
+              })}
+            </div>
+            <span style={{ marginLeft: "auto", fontFamily: "var(--head)", fontSize: 12, color: "var(--text3)" }}>
+              {tab === "pincode" ? filteredPins.length.toLocaleString() : filteredDists.length.toLocaleString()} results
+            </span>
+          </div>
+          <div className="pinsheet-body">
+            {tab === "pincode" ? (
+              filteredPins.length === 0
+                ? <div className="pinsheet-empty">No pincodes match your filter.</div>
+                : (
+                  <table className="pinsheet-table">
+                    <thead><tr><th>Pincode</th><th>Tier</th>{!readOnly && <th style={{ width: 50 }}>Del</th>}</tr></thead>
+                    <tbody>
+                      {filteredPins.map((r, i) => (
+                        <tr key={i}>
+                          <td style={{ fontFamily: "var(--head)", fontWeight: 600 }}>{r.pincode}</td>
+                          <td><TierBadge tier={r.tier} /></td>
+                          {!readOnly && (
+                            <td>
+                              <button onClick={() => deleteRow(i, "pincode")}
+                                style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 14, padding: "2px 6px", borderRadius: 4 }}
+                                title="Delete row">✕</button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )
+            ) : (
+              filteredDists.length === 0
+                ? <div className="pinsheet-empty">No districts match your filter.</div>
+                : (
+                  <table className="pinsheet-table">
+                    <thead><tr><th>District</th><th>Tier</th>{!readOnly && <th style={{ width: 50 }}>Del</th>}</tr></thead>
+                    <tbody>
+                      {filteredDists.map((r, i) => (
+                        <tr key={i}>
+                          <td style={{ fontFamily: "var(--head)", fontWeight: 600 }}>{r.district}</td>
+                          <td><TierBadge tier={r.tier} /></td>
+                          {!readOnly && (
+                            <td>
+                              <button onClick={() => deleteRow(i, "district")}
+                                style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 14, padding: "2px 6px", borderRadius: 4 }}
+                                title="Delete row">✕</button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   UPLOAD COMPONENT
+══════════════════════════════════════════════════════════════════ */
+export default function Upload({
+  setClientData,
+  selectedClient,
+  setSelectedClient,
+  pricingRules,
+  setPricingRules,
+  clientPricing,
+  setClientPricing,
+  isTeam        = false,
+  isSuperAdmin  = false,
+  isTeamMember  = false,
+  allowedClients = null,
+  tenantId,
+}) {
+  const showSAPincodeBtn      = isSuperAdmin || (isTeamMember && !tenantId);
+  const showCompanyPincodeBtn = !isSuperAdmin;
+
+  const CLIENT_WORKSPACE_ID = getClientWorkspaceId(tenantId, isSuperAdmin);
+  const EFFECTIVE_IS_SUPER_ADMIN = CLIENT_WORKSPACE_ID === "__SUPERADMIN__";
+
+  const CLIENTS_KEY = scopedKey("saved_upload_clients", CLIENT_WORKSPACE_ID);
+  const CLIENT_PORTAL_STATE_KEY = `clients_${String(CLIENT_WORKSPACE_ID || "__LOCAL_COMPANY__").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  const DELETED_CLIENT_PORTAL_STATE_KEY = `deleted_clients_${String(CLIENT_WORKSPACE_ID || "__LOCAL_COMPANY__").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+
+  /*
+    ✅ Vendor scope fix:
+    Vendors/pricing must NOT use plain tenantId because Super Admin / Secondary Admin
+    can have tenantId empty/null, which makes everyone read same old localStorage key.
+    CLIENT_WORKSPACE_ID already resolves to:
+    - "__SUPERADMIN__" for Super Admin
+    - company tenant/workspace/email for company/secondary admin
+  */
+  const VENDOR_WORKSPACE_ID = CLIENT_WORKSPACE_ID;
+  const VENDOR_SCOPE_SAFE = String(VENDOR_WORKSPACE_ID || "__LOCAL_COMPANY__")
+    .replace(/[^a-zA-Z0-9_-]/g, "_");
+
+  const VENDORS_KEY = scopedKey("saved_upload_vendors", VENDOR_WORKSPACE_ID);
+  const HISTORY_KEY = scopedKey("upload_file_history",   tenantId);
+  const DELETED_CLIENTS_KEY = scopedKey("deleted_upload_clients", CLIENT_WORKSPACE_ID);
+  const DELETED_VENDORS_KEY = scopedKey("deleted_upload_vendors", VENDOR_WORKSPACE_ID);
+
+  const [file, setFile]           = useState(null);
+  const [clients, setClients]     = useState(() => []);
+  const [newClient, setNewClient] = useState("");
+
+  const [clientStateName, setClientStateName]     = useState("");
+  const [newLocationPrice, setNewLocationPrice]   = useState("");
+  const [clientStateEmail, setClientStateEmail]   = useState("");
+  const [clientStateCc, setClientStateCc]         = useState([]);   // array of validated CC emails
+  const [clientStateCcInput, setClientStateCcInput] = useState(""); // raw chip input
+
+  // Check-wise client pricing (Super Admin + internal team only) — separate
+  // from the state-wise pricing above, does not touch any of it.
+  const [checkPriceName, setCheckPriceName]       = useState("");
+  const [newCheckPrice, setNewCheckPrice]         = useState("");
+  const [checkPriceDropdownOpen, setCheckPriceDropdownOpen] = useState(false);
+
+  const [vendors, setVendors]     = useState(() => safeGet(VENDORS_KEY, []));
+  const [newVendor, setNewVendor] = useState("");
+
+  const [stateName, setStateName]   = useState("");
+  const [district, setDistrict]     = useState("");
+  const [price, setPrice]           = useState("");
+  const [vendorName, setVendorName] = useState("");
+
+  const [syncStatus, setSyncStatus]   = useState(null);
+  const [syncMsg, setSyncMsg]         = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+
+  const [fileHistory, setFileHistory] = useState(() => safeGet(HISTORY_KEY, []));
+
+  /* Pricing persistence state */
+  const [pricingLoading, setPricingLoading]   = useState(false);
+  const [pricingSaveState, setPricingSaveState] = useState("saved"); // "saving" | "saved" | "error"
+  const saveTimerRef = useRef(null);
+
+  const [showSASheet, setShowSASheet]           = useState(false);
+  const [showCompanySheet, setShowCompanySheet] = useState(false);
+  const [clientDropdownOpen, setClientDropdownOpen] = useState(false);
+  const [clientPriceDropdownOpen, setClientPriceDropdownOpen] = useState(false);
+  const [vendorListDropdownOpen, setVendorListDropdownOpen] = useState(false);
+  const [activeRulesDropdownOpen, setActiveRulesDropdownOpen] = useState(false);
+  const [globalRulesDropdownOpen, setGlobalRulesDropdownOpen] = useState(false);
+  const [clientRulesDropdownOpen, setClientRulesDropdownOpen] = useState(false);
+  const clientDropdownRef = useRef(null);
+  const [pricingScope, setPricingScope] = useState("global");
+
+  /*
+    ✅ Vendor pricing scope fix:
+    Vendor rules are saved in account-specific pricing keys, so Super Admin pricing
+    cannot appear inside Company/Secondary Admin accounts.
+  */
+  const VENDOR_SCOPE_PREFIX = `__VENDOR_PRICING__${VENDOR_SCOPE_SAFE}__`;
+  const VENDOR_GLOBAL_PRICING_KEY = `${VENDOR_SCOPE_PREFIX}GLOBAL`;
+
+  const activePricingKey =
+    pricingScope === "client" && selectedClient && selectedClient !== MASTER_KEY
+      ? `${VENDOR_SCOPE_PREFIX}CLIENT__${nameKey(selectedClient)}`
+      : VENDOR_GLOBAL_PRICING_KEY;
+
+  /* Vendor names are shared across laptops using account-scoped portal-state. */
+  const VENDOR_PORTAL_STATE_KEY = `vendors_${VENDOR_SCOPE_SAFE}`;
+
+  const saveClientsToPortalState = async (updatedClients = []) => {
+    try {
+      await fetch(`${apiBaseUrl()}/auth/portal-state/${CLIENT_PORTAL_STATE_KEY}`, {
+        method: "PUT",
+        headers: getAuthHeaders(true),
+        body: JSON.stringify({ value: mergeClientLists(updatedClients) }),
+      });
+    } catch (err) {
+      console.warn("Client portal-state save failed:", err.message);
+    }
+  };
+
+  const loadClientsFromPortalState = async () => {
+    try {
+      const res = await fetch(`${apiBaseUrl()}/auth/portal-state/${CLIENT_PORTAL_STATE_KEY}`, {
+        headers: getAuthHeaders(),
+      });
+      const data = await res.json().catch(() => []);
+      return Array.isArray(data)
+        ? data
+        : Array.isArray(data?.value)
+          ? data.value
+          : Array.isArray(data?.data)
+            ? data.data
+            : [];
+    } catch (err) {
+      console.warn("Client portal-state load failed:", err.message);
+      return [];
+    }
+  };
+
+  const saveDeletedClientsToPortalState = async (deletedClients = []) => {
+    try {
+      await fetch(`${apiBaseUrl()}/auth/portal-state/${DELETED_CLIENT_PORTAL_STATE_KEY}`, {
+        method: "PUT",
+        headers: getAuthHeaders(true),
+        body: JSON.stringify({ value: mergeClientLists(deletedClients) }),
+      });
+    } catch (err) {
+      console.warn("Deleted client portal-state save failed:", err.message);
+    }
+  };
+
+  const loadDeletedClientsFromPortalState = async () => {
+    try {
+      const res = await fetch(`${apiBaseUrl()}/auth/portal-state/${DELETED_CLIENT_PORTAL_STATE_KEY}`, {
+        headers: getAuthHeaders(),
+      });
+      const data = await res.json().catch(() => []);
+      return Array.isArray(data)
+        ? data
+        : Array.isArray(data?.value)
+          ? data.value
+          : Array.isArray(data?.data)
+            ? data.data
+            : [];
+    } catch (err) {
+      console.warn("Deleted client portal-state load failed:", err.message);
+      return [];
+    }
+  };
+
+  const saveVendorsToPortalState = async (updatedVendors = []) => {
+    try {
+      await fetch(`${apiBaseUrl()}/auth/portal-state/${VENDOR_PORTAL_STATE_KEY}`, {
+        method: "PUT",
+        headers: getAuthHeaders(true),
+        body: JSON.stringify({ value: mergeVendorLists(updatedVendors) }),
+      });
+    } catch (err) {
+      console.warn("Vendor portal-state save failed:", err.message);
+    }
+  };
+
+  /* ── Load pricing from DB on mount ── */
+  useEffect(() => {
+    if (isTeam) return; // team members don't need to load pricing here
+    setPricingLoading(true);
+    pricingAPI.getAll()
+      .then(data => {
+        if (data && typeof data === "object") {
+          // Merge DB data into pricingRules (DB is source of truth)
+          setPricingRules(prev => ({ ...prev, ...data }));
+        }
+      })
+      .catch(err => console.warn("Could not load pricing from DB:", err.message))
+      .finally(() => setPricingLoading(false));
+  }, [tenantId]); // re-fetch if tenantId changes
+
+
+  /* ── Keep vendor list synced from portal-state + pricing DB across all laptops ── */
+  useEffect(() => {
+    let alive = true;
+
+    async function loadVendorsFromPortalState() {
+      const localDeletedVendors = safeGet(DELETED_VENDORS_KEY, []);
+
+      try {
+        const res = await fetch(`${apiBaseUrl()}/auth/portal-state/${VENDOR_PORTAL_STATE_KEY}`, {
+          headers: getAuthHeaders(),
+        });
+        const data = await res.json().catch(() => []);
+
+        const portalVendors = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.value)
+            ? data.value
+            : Array.isArray(data?.data)
+              ? data.data
+              : [];
+
+        /*
+          IMPORTANT FIX:
+          Do NOT let this laptop's old local deleted-vendors list hide DB vendors.
+          If a vendor exists in portal-state, DB is source of truth and it must show on every laptop.
+        */
+        const cleanedDeletedVendors = removeNamesFromDeleted(portalVendors, localDeletedVendors);
+        safeSet(DELETED_VENDORS_KEY, cleanedDeletedVendors);
+
+        const localVendors = safeGet(VENDORS_KEY, []).filter(
+          v => !isNameDeleted(v, cleanedDeletedVendors)
+        );
+
+        const currentVendorPricingRules = Object.fromEntries(
+          Object.entries(pricingRules || {}).filter(([k]) =>
+            String(k || "").startsWith(VENDOR_SCOPE_PREFIX)
+          )
+        );
+
+        const pricingVendors = extractVendorNamesFromPricingRules(currentVendorPricingRules).filter(
+          v => !isNameDeleted(v, cleanedDeletedVendors)
+        );
+
+        if (!alive) return;
+
+const merged = mergeVendorLists(portalVendors, pricingVendors);
+
+        setVendors(merged);
+        safeSet(VENDORS_KEY, merged);
+
+        // Backfill portal-state when old pricing rules/localStorage contain vendor names but portal-state is incomplete.
+        if (merged.length && portalVendors.length !== merged.length) {
+          saveVendorsToPortalState(merged);
+        }
+      } catch (err) {
+        console.warn("Could not load vendors from portal-state:", err.message);
+        if (!alive) return;
+
+        const cleanedDeletedVendors = safeGet(DELETED_VENDORS_KEY, []);
+        const localVendors = safeGet(VENDORS_KEY, []).filter(
+          v => !isNameDeleted(v, cleanedDeletedVendors)
+        );
+        const currentVendorPricingRules = Object.fromEntries(
+          Object.entries(pricingRules || {}).filter(([k]) =>
+            String(k || "").startsWith(VENDOR_SCOPE_PREFIX)
+          )
+        );
+
+        const pricingVendors = extractVendorNamesFromPricingRules(currentVendorPricingRules).filter(
+          v => !isNameDeleted(v, cleanedDeletedVendors)
+        );
+
+     const merged = mergeVendorLists(pricingVendors);
+        setVendors(merged);
+        safeSet(VENDORS_KEY, merged);
+      }
+    }
+
+    loadVendorsFromPortalState();
+
+    return () => { alive = false; };
+  }, [pricingRules, VENDORS_KEY, DELETED_VENDORS_KEY]);
+
+  /* ── Persist a single scope key to DB (debounced 400ms) ── */
+  const persistScope = useCallback((scopeKey, rules) => {
+    if (isTeam) return;
+    setPricingSaveState("saving");
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      pricingAPI.saveScope(scopeKey, rules)
+        .then(() => setPricingSaveState("saved"))
+        .catch(err => {
+          console.error("Pricing save failed:", err.message);
+          setPricingSaveState("error");
+        });
+    }, 400);
+  }, [isTeam]);
+
+  useEffect(() => {
+    let alive = true;
+
+    const deletedVendors = safeGet(DELETED_VENDORS_KEY, []);
+
+    // Cross-laptop client fix:
+    // Do NOT preload clients from localStorage. Another laptop may still have old
+    // secondary-admin clients cached under the Super Admin login. Clients below are
+    // loaded only from workspace-scoped portal-state/DB and then cached again.
+    const localClients = [];
+    const localVendors = safeGet(VENDORS_KEY, []).filter(v => !isNameDeleted(v, deletedVendors));
+    setClients([]);
+setVendors([]);
+    safeSet(CLIENTS_KEY, []);
+    safeSet(VENDORS_KEY, localVendors);
+    setFileHistory([]); // keep upload page fresh; do not show old laptop-only history
+
+    async function loadClientsFromServer() {
+      try {
+        const portalClients = await loadClientsFromPortalState();
+        let dbClients = [];
+
+        try {
+          const data = await clientAPI.getAll();
+          const scopedClientRecords = filterClientRecordsByWorkspace(data, CLIENT_WORKSPACE_ID, EFFECTIVE_IS_SUPER_ADMIN);
+          dbClients = extractClientNamesFromApi(scopedClientRecords);
+        } catch (dbErr) {
+          console.warn("Could not load clients from DB:", dbErr.message);
+        }
+
+        if (!alive) return;
+
+        // Portal-state is used as the reliable workspace-scoped source for Company/Secondary Admins.
+        // DB clients are still merged when available, but Super Admin clients cannot leak into Secondary Admin.
+        const sourceClients = mergeClientLists(portalClients, dbClients);
+
+        // Persistent delete protection across all laptops:
+        // Deleted clients are stored in workspace-scoped portal-state so another
+        // browser/laptop cannot bring them back from old cache or stale DB records.
+        const cleanedDeleted = mergeClientLists(
+          safeGet(DELETED_CLIENTS_KEY, []),
+          await loadDeletedClientsFromPortalState()
+        );
+        safeSet(DELETED_CLIENTS_KEY, cleanedDeleted);
+        await saveDeletedClientsToPortalState(cleanedDeleted);
+
+        const visibleSourceClients = sourceClients.filter(c => !isNameDeleted(c, cleanedDeleted));
+        const merged = mergeClientLists(visibleSourceClients);
+
+        setClients(merged);
+        safeSet(CLIENTS_KEY, merged);
+      } catch (err) {
+        console.warn("Could not load clients:", err.message);
+        if (alive) setClients([]);
+      }
+    }
+
+    loadClientsFromServer();
+
+    return () => { alive = false; };
+  }, [tenantId, CLIENT_WORKSPACE_ID, isSuperAdmin]);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (clientDropdownRef.current && !clientDropdownRef.current.contains(event.target)) {
+        setClientDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  /* ── Client helpers ── */
+  const handleClientSelect = (c) => {
+    if (c !== selectedClient) setFile(null);
+    setSelectedClient(c);
+  };
+  const addClient = async () => {
+    const t = normalizeClientName(newClient);
+    if (!t) return;
+
+    const exists = clients.some(c => c.toLowerCase() === t.toLowerCase());
+    if (exists) { alert("Client already exists"); return; }
+
+    setSyncStatus("syncing");
+    setSyncMsg(`Saving client "${t}"…`);
+
+    const deletedClients = removeNameFromDeleted(t, safeGet(DELETED_CLIENTS_KEY, []));
+    safeSet(DELETED_CLIENTS_KEY, deletedClients);
+    await saveDeletedClientsToPortalState(deletedClients);
+
+    const updated = mergeClientLists(clients, [t]);
+    setClients(updated);
+    setNewClient("");
+    safeSet(CLIENTS_KEY, updated);
+
+    // Save in account-scoped portal-state first. This prevents Super Admin clients
+    // from leaking into Secondary Admin and avoids backend /clients 504 blocking the UI.
+    await saveClientsToPortalState(updated);
+
+    // Best-effort MongoDB /clients sync. If this route times out for Secondary Admin,
+    // do not block client creation because portal-state already synced the workspace.
+    try {
+      await syncClientsToBackend([t], CLIENT_WORKSPACE_ID);
+    } catch (err) {
+      console.warn("Manual client DB sync skipped/failed:", err.message);
+    }
+
+    setSyncStatus("ok");
+    setSyncMsg(`✅ Client "${t}" saved for this workspace`);
+  };
+  const removeClient = async (c) => {
+    if (!c) return;
+    if (!window.confirm(`Permanently remove client "${c}" from this workspace and database?`)) return;
+
+    const deletedClients = mergeClientLists(safeGet(DELETED_CLIENTS_KEY, []), [c]);
+    safeSet(DELETED_CLIENTS_KEY, deletedClients);
+    await saveDeletedClientsToPortalState(deletedClients);
+
+    const updated = clients.filter(x => nameKey(x) !== nameKey(c));
+    setClients(updated);
+    if (selectedClient === c) handleClientSelect("");
+    safeSet(CLIENTS_KEY, updated);
+    await saveClientsToPortalState(updated);
+
+    setPricingRules(prev => {
+      const next = { ...prev };
+      delete next[c];
+      return next;
+    });
+
+    setSyncStatus("syncing");
+    setSyncMsg(`Removing client "${c}" from database…`);
+
+    await Promise.allSettled([
+      deleteClientFromDBByName(c, CLIENT_WORKSPACE_ID, clientAPI),
+      deletePricingScopeFromDB(c, pricingAPI),
+    ]);
+
+    setSyncStatus("ok");
+    setSyncMsg(`✅ Client "${c}" removed permanently`);
+  };
+  const clearAllClients = async () => {
+    if (!window.confirm("Permanently remove ALL saved clients for this workspace?")) return;
+    const toDelete = [...clients];
+    const deletedClients = mergeClientLists(safeGet(DELETED_CLIENTS_KEY, []), toDelete);
+    safeSet(DELETED_CLIENTS_KEY, deletedClients);
+    await saveDeletedClientsToPortalState(deletedClients);
+
+    setClients([]);
+    handleClientSelect("");
+    localStorage.removeItem(CLIENTS_KEY);
+    await saveClientsToPortalState([]);
+
+    setPricingRules(prev => {
+      const next = { ...prev };
+      toDelete.forEach(c => delete next[c]);
+      return next;
+    });
+
+    setSyncStatus("syncing");
+    setSyncMsg("Removing clients from this workspace…");
+    await Promise.allSettled(toDelete.flatMap(c => [
+      deleteClientFromDBByName(c, CLIENT_WORKSPACE_ID, clientAPI),
+      deletePricingScopeFromDB(c, pricingAPI),
+    ]));
+    setSyncStatus("ok");
+    setSyncMsg("✅ All saved clients removed permanently");
+  };
+
+  /* ── Vendor helpers ── */
+  const addVendor = async () => {
+    const t = normalizeVendorName(newVendor);
+    if (!t) return;
+    if (vendors.some(v => nameKey(v) === nameKey(t))) { alert("Vendor already exists"); return; }
+
+    const deletedVendors = removeNameFromDeleted(t, safeGet(DELETED_VENDORS_KEY, []));
+    safeSet(DELETED_VENDORS_KEY, deletedVendors);
+
+    const updated = mergeVendorLists(vendors, [t]);
+    setVendors(updated);
+    setNewVendor("");
+    safeSet(VENDORS_KEY, updated);
+    await saveVendorsToPortalState(updated);
+
+    // Save vendor name marker in DB so vendor list appears on every laptop.
+    // This marker has no rate, so it does NOT affect pricing calculations.
+    setPricingRules(prev => {
+      const existingRules = Array.isArray(prev[VENDOR_GLOBAL_PRICING_KEY]) ? prev[VENDOR_GLOBAL_PRICING_KEY] : [];
+      const alreadyExists = existingRules.some(r => nameKey(r?.vendorName) === nameKey(t));
+      if (alreadyExists) return prev;
+
+      const nextRules = [
+        ...existingRules,
+        {
+          vendorName: t,
+          state: "",
+          district: "",
+          _vendorOnly: true,
+        },
+      ];
+
+      persistScope(VENDOR_GLOBAL_PRICING_KEY, nextRules);
+      return { ...prev, [VENDOR_GLOBAL_PRICING_KEY]: nextRules };
+    });
+  };
+  const removeVendor = async (v) => {
+    if (!v) return;
+    if (!window.confirm(`Permanently remove vendor "${v}" and all its pricing rules?`)) return;
+
+    const deletedVendors = mergeVendorLists(safeGet(DELETED_VENDORS_KEY, []), [v]);
+    safeSet(DELETED_VENDORS_KEY, deletedVendors);
+
+    const updated = vendors.filter(x => nameKey(x) !== nameKey(v));
+    setVendors(updated);
+    if (nameKey(vendorName) === nameKey(v)) setVendorName("");
+    safeSet(VENDORS_KEY, updated);
+    await saveVendorsToPortalState(updated);
+
+    setSyncStatus("syncing");
+    setSyncMsg(`Removing vendor "${v}" from pricing database…`);
+
+    setPricingRules(prev => {
+      const next = { ...prev };
+      Object.keys(next).forEach(scopeKey => {
+        // ✅ Remove only this account's vendor rules. Do not touch Super Admin/other admin scopes.
+        if (!String(scopeKey || "").startsWith(VENDOR_SCOPE_PREFIX)) return;
+
+        const rules = Array.isArray(next[scopeKey]) ? next[scopeKey] : [];
+        const filtered = rules.filter(r => nameKey(r?.vendorName) !== nameKey(v));
+        if (filtered.length !== rules.length) {
+          next[scopeKey] = filtered;
+          persistScope(scopeKey, filtered);
+        }
+      });
+      return next;
+    });
+
+    setSyncStatus("ok");
+    setSyncMsg(`✅ Vendor "${v}" removed permanently`);
+  };
+
+  /* ── Helper: update pricingRules state + persist to DB ── */
+  const updatePricingRules = useCallback((scopeKey, newRules) => {
+    setPricingRules(prev => {
+      const updated = { ...prev, [scopeKey]: newRules };
+      persistScope(scopeKey, newRules);
+      return updated;
+    });
+  }, [setPricingRules, persistScope]);
+
+  /* ── Client location pricing (STATE-WISE ONLY) ── */
+  const handleAddClientLocationPrice = () => {
+    const targetClient = selectedClient && selectedClient !== MASTER_KEY ? selectedClient : null;
+    if (!targetClient) return alert("Please select a specific client first");
+
+    const st = clientStateName.trim();
+    const pv = Number(newLocationPrice);
+
+    if (!st || !pv) return alert("Please enter state and price");
+
+    const stateKey = st.toLowerCase();
+    const cr = pricingRules[targetClient] || [];
+    const existing = cr.find(r =>
+      String(r.state || "").trim().toLowerCase() === stateKey &&
+      r.clientPrice !== undefined
+    ) || {};
+
+    // Validate and clean email/CC
+    const emailVal = clientStateEmail.trim().toLowerCase();
+    const isValidE = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+    const cleanEmail = emailVal && isValidE(emailVal) ? emailVal : "";
+    // also flush any pending raw CC input
+    const pendingCc = clientStateCcInput.trim()
+      ? clientStateCcInput.split(/[,;]+/).map(s => s.trim().toLowerCase()).filter(isValidE)
+      : [];
+    const cleanCc = [...clientStateCc, ...pendingCc];
+
+    const upd = [
+      ...cr.filter(r => !(
+        String(r.state || "").trim().toLowerCase() === stateKey &&
+        r.clientPrice !== undefined
+      )),
+      {
+        ...existing,
+        state: st,
+        district: "",
+        clientPrice: pv,
+        email:  cleanEmail,
+        ccList: cleanCc,
+      },
+    ];
+
+    updatePricingRules(targetClient, upd);
+    setClientStateName("");
+    setNewLocationPrice("");
+    setClientStateEmail("");
+    setClientStateCc([]);
+    setClientStateCcInput("");
+  };
+
+  const removeClientLocationPrice = (ck, stateToRemove) => {
+    const upd = (pricingRules[ck] || [])
+      .map(r => {
+        const sameState =
+          String(r.state || "").trim().toLowerCase() ===
+          String(stateToRemove || "").trim().toLowerCase();
+        if (!(sameState && r.clientPrice !== undefined)) return r;
+        const { clientPrice, ...rest } = r;
+        return rest;
+      })
+      .filter(r => r.rate !== undefined || r.clientPrice !== undefined);
+    updatePricingRules(ck, upd);
+  };
+
+  /* ── Client check-wise pricing (Super Admin + internal team only) ── */
+  const handleAddClientCheckPrice = () => {
+    const targetClient = selectedClient && selectedClient !== MASTER_KEY ? selectedClient : null;
+    if (!targetClient) return alert("Please select a specific client first");
+
+    const ck = checkPriceName.trim();
+    const pv = Number(newCheckPrice);
+
+    if (!ck || !pv) return alert("Please enter check name and price");
+
+    const checkKey = ck.toLowerCase();
+    const cr = pricingRules[targetClient] || [];
+    const existing = cr.find(r =>
+      String(r.checkName || "").trim().toLowerCase() === checkKey &&
+      r.clientPrice !== undefined
+    ) || {};
+
+    const upd = [
+      ...cr.filter(r => !(
+        String(r.checkName || "").trim().toLowerCase() === checkKey &&
+        r.clientPrice !== undefined
+      )),
+      {
+        ...existing,
+        checkName: ck,
+        state: "",
+        district: "",
+        clientPrice: pv,
+      },
+    ];
+
+    updatePricingRules(targetClient, upd);
+    setCheckPriceName("");
+    setNewCheckPrice("");
+  };
+
+  const removeClientCheckPrice = (ck, checkToRemove) => {
+    const upd = (pricingRules[ck] || [])
+      .map(r => {
+        const sameCheck =
+          String(r.checkName || "").trim().toLowerCase() ===
+          String(checkToRemove || "").trim().toLowerCase();
+        if (!(sameCheck && r.clientPrice !== undefined)) return r;
+        const { clientPrice, ...rest } = r;
+        return rest;
+      })
+      .filter(r => r.rate !== undefined || r.clientPrice !== undefined);
+    updatePricingRules(ck, upd);
+  };
+
+  /* ── Vendor pricing helpers (STATE-WISE ONLY + VENDOR-WISE) ── */
+  const vendorKey = (v = "") => String(v || "").trim().toLowerCase();
+
+  const isSameVendorRule = (ruleVendor, selectedVendor) => {
+    const rv = vendorKey(ruleVendor);
+    const sv = vendorKey(selectedVendor);
+    return sv ? rv === sv : !rv;
+  };
+
+  const handleVendorStateChange = (e) => {
+    const val = e.target.value;
+    setStateName(val);
+
+    const stateKey = val.trim().toLowerCase();
+    const selectedVendorKey = vendorKey(vendorName);
+    const existing = (pricingRules[activePricingKey] || []).find(
+      r =>
+        r.rate !== undefined &&
+        String(r.state || "").trim().toLowerCase() === stateKey &&
+        isSameVendorRule(r.vendorName, selectedVendorKey)
+    );
+
+    if (existing) {
+      if (existing.rate) setPrice(existing.rate);
+      if (existing.vendorName) setVendorName(existing.vendorName);
+    }
+  };
+
+  const applyPricing = () => {
+    if (!vendorName.trim()) return alert("Please select vendor name first");
+    if (!stateName || !price) return alert("Enter state & price");
+
+    const st = stateName.trim();
+    const rp = Number(price);
+    const vn = vendorName.trim();
+    const stateKey = st.toLowerCase();
+    const selectedVendorKey = vendorKey(vn);
+    const cr = pricingRules[activePricingKey] || [];
+
+    const ex = cr.find(r =>
+      r.rate !== undefined &&
+      String(r.state || "").trim().toLowerCase() === stateKey &&
+      vendorKey(r.vendorName) === selectedVendorKey
+    ) || {};
+
+    const upd = [
+      ...cr.filter(r => !(
+        r.rate !== undefined &&
+        String(r.state || "").trim().toLowerCase() === stateKey &&
+        vendorKey(r.vendorName) === selectedVendorKey
+      )),
+      {
+        ...ex,
+        state: st,
+        district: "",
+        rate: rp,
+        vendorName: vn,
+      },
+    ];
+
+    updatePricingRules(activePricingKey, upd);
+    setStateName("");
+    setDistrict("");
+    setPrice("");
+  };
+
+  const deleteRule = (key, stateToRemove, vendorToRemove = "") => {
+    const stateKey = String(stateToRemove || "").trim().toLowerCase();
+    const selectedVendorKey = vendorKey(vendorToRemove);
+
+    const upd = (pricingRules[key] || [])
+      .map(r => {
+        const sameState =
+          r.rate !== undefined &&
+          String(r.state || "").trim().toLowerCase() === stateKey;
+        const sameVendor = selectedVendorKey
+          ? vendorKey(r.vendorName) === selectedVendorKey
+          : true;
+
+        if (!(sameState && sameVendor)) return r;
+
+        const { rate, state, district: _district, vendorName: vn, ...rest } = r;
+        return rest;
+      })
+      .filter(r => r.rate !== undefined || r.clientPrice !== undefined);
+
+    updatePricingRules(key, upd);
+  };
+  /* ── Excel select: manual client/vendor only (NO client/vendor auto-detect) ── */
+  const handleExcelFileSelect = (selectedFile) => {
+    setFile(selectedFile || null);
+    if (selectedFile) {
+      setSyncStatus("ok");
+      setSyncMsg("✅ Excel selected — Client Name column must match saved clients");
+    } else {
+      setSyncStatus(null);
+      setSyncMsg("");
+    }
+  };
+
+  /* ── Upload handler ── */
+  const handleUpload = async () => {
+    if (!file) { alert("Please select an Excel file to upload"); return; }
+    setIsUploading(true); setSyncStatus("syncing"); setSyncMsg("Parsing Excel…");
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const buffer   = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(buffer, { type: "array" });
+        const sheetName = workbook.SheetNames[0];
+        if (!sheetName) { alert("❌ No sheet found"); setIsUploading(false); setSyncStatus(null); return; }
+        const sheet   = workbook.Sheets[sheetName];
+        const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, dateNF: "dd/mm/yyyy", cellDates: true });
+        if (!rawData || rawData.length === 0) { alert("❌ Excel is empty"); setIsUploading(false); setSyncStatus(null); return; }
+
+        const headers = rawData[0];
+
+        // ✅ Client validation for huge uploads:
+        // No need to manually select one client.
+        // Excel must have Client Name column and every Client Name must already exist in saved clients.
+        const clientColIndex = headers.findIndex((h) => {
+          const key = String(h || "").trim().toLowerCase();
+          return (
+            key === "client name" ||
+            key === "client" ||
+            key === "company name"
+          );
+        });
+
+        if (clientColIndex === -1) {
+          alert("❌ Excel rejected. Excel must have a Client Name column.");
+          setIsUploading(false);
+          setSyncStatus(null);
+          return;
+        }
+
+        const deletedClients = mergeClientLists(
+          safeGet(DELETED_CLIENTS_KEY, []),
+          await loadDeletedClientsFromPortalState()
+        );
+        safeSet(DELETED_CLIENTS_KEY, deletedClients);
+
+        // CLIENT MATCH FIX + cross-laptop isolation:
+        // Use the freshest workspace clients from React state + portal-state + DB only.
+        // Do NOT read saved_upload_clients localStorage here because another laptop can
+        // still have old secondary-admin clients cached under Super Admin login.
+        let latestPortalClients = [];
+        let latestDbClients = [];
+
+        try {
+          latestPortalClients = await loadClientsFromPortalState();
+        } catch (portalErr) {
+          console.warn("Client portal-state refresh before upload failed:", portalErr.message);
+        }
+
+        try {
+          const dbClientData = await clientAPI.getAll();
+          const scopedClientRecords = filterClientRecordsByWorkspace(dbClientData, CLIENT_WORKSPACE_ID, EFFECTIVE_IS_SUPER_ADMIN);
+          latestDbClients = extractClientNamesFromApi(scopedClientRecords);
+        } catch (dbErr) {
+          console.warn("Client DB refresh before upload failed:", dbErr.message);
+        }
+
+        const activeClients = mergeClientLists(
+          clients,
+          latestPortalClients,
+          latestDbClients
+        ).filter(c => !isNameDeleted(c, deletedClients));
+
+        if (activeClients.length) {
+          setClients(activeClients);
+          safeSet(CLIENTS_KEY, activeClients);
+        }
+
+        const clientMap = new Map(activeClients.map(c => [strictClientKey(c), c]));
+
+        if (clientMap.size === 0) {
+          alert("❌ No saved clients found. Please add clients first, then upload Excel.");
+          setIsUploading(false);
+          setSyncStatus(null);
+          return;
+        }
+
+        const invalidClientRows = [];
+        const usedClientMap = new Map();
+
+        rawData.slice(1).forEach((row, idx) => {
+          if (!row || row.length === 0) return;
+
+          const excelClient = row[clientColIndex] === undefined || row[clientColIndex] === null
+            ? ""
+            : normalizeClientName(row[clientColIndex]);
+
+          const existingClient = clientMap.get(strictClientKey(excelClient));
+
+          if (!excelClient || !existingClient) {
+            invalidClientRows.push({ rowNo: idx + 2, excelClient: excelClient || "Blank" });
+            return;
+          }
+
+          usedClientMap.set(strictClientKey(excelClient), existingClient);
+        });
+
+        if (invalidClientRows.length > 0) {
+          const sample = invalidClientRows
+            .slice(0, 8)
+            .map((r) => `Row ${r.rowNo}: ${r.excelClient}`)
+            .join("\n");
+
+          alert(
+            `❌ Excel rejected.\n\nEvery Client Name in Excel must already exist in your saved client list.\n\nInvalid/blank client rows: ${invalidClientRows.length}${sample ? `\n\n${sample}` : ""}`
+          );
+          setIsUploading(false);
+          setSyncStatus(null);
+          return;
+        }
+
+        let tierAssigned = 0;
+
+        const finalData = rawData
+          .slice(1)
+          .filter(r => r && r.length > 0)
+          .map(row => {
+            const obj = {};
+            headers.forEach((key, idx) => {
+              if (!key) return;
+              if (String(key).toLowerCase().includes("assign date")) return;
+              obj[key] = cleanCell(row[idx]);
+            });
+
+            // ✅ Keep same normalized client mapping while creating final data
+            const excelClient = row[clientColIndex] === undefined || row[clientColIndex] === null
+              ? ""
+              : normalizeClientName(row[clientColIndex]);
+            const resolvedClient = clientMap.get(strictClientKey(excelClient)) || excelClient;
+
+            const rawStatus =
+              obj["Status"] || obj["status"] || obj["STATUS"] ||
+              obj["Case Status"] || obj["case status"] || obj["BGV Status"] ||
+              obj["bgv status"] || obj["Verification Status"] || obj["verification status"] ||
+              obj["Current Status"] || obj["current status"] || "";
+            obj["Status"] = normaliseStatus(rawStatus);
+            obj["status"] = obj["Status"];
+
+            const existingTier =
+              obj["Tier"] || obj["tier"] || obj["TIER"] ||
+              obj["Tier Type"] || obj["tier type"] || obj["TierType"] || "";
+            if (!existingTier) {
+              const autoTier = getTierForRow(obj);
+              if (autoTier) { obj["Tier"] = autoTier; tierAssigned++; }
+            } else {
+              const t = String(existingTier).trim();
+              const match = t.match(/(\d)/);
+              if (match) obj["Tier"] = `Tier${match[1]}`;
+            }
+
+            return {
+              rate: 0,
+              agent: "",
+              assignDate: "",
+              ...obj,
+              // Client is taken from Excel only if it already exists in saved clients.
+              "Client Name": resolvedClient,
+              Client: resolvedClient,
+              clientName: resolvedClient,
+              // Vendor is still manual only. Excel vendor columns are ignored/overwritten.
+              "Vendor Name": vendorName || "",
+              Vendor: vendorName || "",
+              vendorName: vendorName || "",
+            };
+          });
+
+        if (finalData.length === 0) { alert("❌ No valid data found"); setIsUploading(false); setSyncStatus(null); return; }
+
+        const groupedData = {};
+        finalData.forEach(row => {
+          const c = normalizeClientName(row.clientName || row["Client Name"] || row.Client || "General");
+          if (!groupedData[c]) groupedData[c] = [];
+          groupedData[c].push(row);
+        });
+        groupedData[MASTER_KEY] = finalData;
+
+        const usedClients = Array.from(usedClientMap.values());
+        setClientData(prev => ({ ...prev, ...groupedData }));
+        setSelectedClient(MASTER_KEY);
+
+        // Keep this upload page fresh for client handover: no old laptop-only upload history.
+        setFileHistory([]);
+        localStorage.removeItem(HISTORY_KEY);
+        localStorage.removeItem(scopedKey("lastUploadedFileName", tenantId));
+        localStorage.removeItem(scopedKey("lastUploadedFileRows", tenantId));
+
+        setSyncMsg("Saving records to database…");
+        try {
+          // Do not auto-create clients here. Upload is allowed only for clients that already exist.
+          const dbClientParam = selectedClient && selectedClient !== MASTER_KEY ? selectedClient : "";
+          const result = await uploadAPI.uploadExcel(file, dbClientParam, tenantId);
+          setSyncStatus("ok");
+          setSyncMsg(`✅ ${result.count || finalData.length} records saved to MongoDB`);
+        } catch (syncErr) {
+          setSyncStatus("error");
+          setSyncMsg(`⚠️ Local save OK — DB sync failed: ${syncErr.message}`);
+        }
+
+        alert(
+          `✅ Upload successful!\n\nTotal rows: ${finalData.length}\nTier auto-assigned: ${tierAssigned} rows\n` +
+          `Clients found: ${usedClients.join(", ")}\n` +
+          `Workspace: ${tenantId || "default"}`
+        );
+      } catch (err) {
+        alert(err.message || "❌ Error processing Excel file");
+        setSyncStatus("error"); setSyncMsg(err.message);
+      } finally {
+        setIsUploading(false);
+      }
+    };
+    reader.onerror = () => { alert("❌ File reading failed"); setIsUploading(false); setSyncStatus(null); };
+    reader.readAsArrayBuffer(file);
+  };
+
+  /* ── Derived ── */
+  const isReady            = !!file && !isUploading;
+  const activeRules        = pricingRules[activePricingKey] || [];
+  const selectedVendorKeyForRules = String(vendorName || "").trim().toLowerCase();
+  const activeVendorRules  = selectedVendorKeyForRules
+    ? activeRules.filter(r =>
+        r.rate !== undefined &&
+        String(r.vendorName || "").trim().toLowerCase() === selectedVendorKeyForRules
+      )
+    : [];
+  const clientForLocation  = selectedClient && selectedClient !== MASTER_KEY ? selectedClient : null;
+  const clientLocationRules = clientForLocation
+    ? (pricingRules[clientForLocation] || []).filter(r => r.clientPrice !== undefined && !r.checkName)
+    : [];
+  const clientCheckRules = clientForLocation
+    ? (pricingRules[clientForLocation] || []).filter(r => r.clientPrice !== undefined && r.checkName)
+    : [];
+  const totalVendorRules = Object.entries(pricingRules || {})
+    .filter(([k]) => String(k || "").startsWith(VENDOR_SCOPE_PREFIX))
+    .reduce((sum, [, arr]) => sum + (Array.isArray(arr) ? arr.filter(r => r.rate !== undefined).length : 0), 0);
+
+  /* ═══════════════════════ RENDER ═══════════════════════ */
+  return (
+    <div className="upl-root">
+      <div className="upl-wrap">
+
+        {/* Top bar */}
+        <div className="upl-topbar">
+          <div>
+            <div className="upl-title">Data Upload</div>
+            <div className="upl-subtitle">
+              {isTeam ? "Select client and upload your Excel file" : "Upload Excel — Client Name must exist; Tier auto-detected"}
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            {tenantId && (
+              <span className="workspace-badge">
+                🗂️ {String(tenantId).slice(0, 16)}{tenantId.length > 16 ? "…" : ""}
+              </span>
+            )}
+
+            {showSAPincodeBtn && (
+              <button className="upl-btn upl-btn-purple upl-btn-sm"
+                onClick={() => { setShowSASheet(v => !v); setShowCompanySheet(false); }}
+                style={{ gap: 7 }}>
+                👑 {showSASheet ? "Hide" : "View"} Master Pincode Sheet
+              </button>
+            )}
+            {showCompanyPincodeBtn && (
+              <button
+                onClick={() => { setShowCompanySheet(v => !v); setShowSASheet(false); }}
+                style={{
+                  fontFamily: "var(--head)", fontSize: 13, fontWeight: 600,
+                  padding: "8px 16px", borderRadius: "var(--r8)", cursor: "pointer",
+                  transition: "all 0.18s var(--ease)", whiteSpace: "nowrap",
+                  background: showCompanySheet ? "linear-gradient(135deg,#7c3aed,#a78bfa)" : "rgba(124,58,237,0.08)",
+                  border: "1.5px solid rgba(124,58,237,0.35)",
+                  color: showCompanySheet ? "#fff" : "#7c3aed",
+                  boxShadow: showCompanySheet ? "0 4px 12px rgba(124,58,237,0.28)" : "none",
+                  display: "inline-flex", alignItems: "center", gap: 7,
+                }}>
+                🏢 {showCompanySheet ? "Hide" : "View"} Company Pincode Sheet
+                {isTeam && (
+                  <span style={{ fontSize: 9, background: "rgba(255,255,255,0.22)", padding: "1px 6px", borderRadius: 99 }}>
+                    Read-Only
+                  </span>
+                )}
+              </button>
+            )}
+
+            {syncStatus && (
+              <span className={`sync-badge ${syncStatus === "ok" ? "sync-ok" : syncStatus === "error" ? "sync-err" : "sync-ing"}`}>
+                {syncStatus === "syncing" && <span className="sync-spin" />}
+                {syncMsg}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Pincode panels */}
+        {showSASheet && showSAPincodeBtn && (
+          <SuperAdminPincodePanel onClose={() => setShowSASheet(false)} />
+        )}
+        {showCompanySheet && showCompanyPincodeBtn && (
+          <CompanyPincodePanel
+            tenantId={tenantId}
+            isTeamMember={isTeam}
+            onClose={() => setShowCompanySheet(false)}
+          />
+        )}
+
+        {/* Tier Info Banner */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 18px", borderRadius: "var(--r12)", background: "linear-gradient(135deg,rgba(37,99,235,0.06),rgba(124,58,237,0.04))", border: "1.5px solid rgba(37,99,235,0.16)", marginBottom: 14, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 15 }}>🎯</span>
+          <span style={{ fontFamily: "var(--head)", fontSize: 12, color: "var(--text2)", fontWeight: 600 }}>
+            Tier Auto-Detection Active
+          </span>
+          <span style={{ fontSize: 12, color: "var(--text3)" }}>
+            — Cases are automatically tagged Tier1 / Tier2 / Tier3 / Tier4 based on Pincode or District
+          </span>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {["Tier1", "Tier2", "Tier3", "Tier4"].map(t => {
+              const s = TIER_COLORS[t];
+              return (
+                <span key={t} style={{ fontFamily: "var(--head)", fontSize: 11, fontWeight: 700, padding: "2px 9px", borderRadius: 99, background: s.bg, border: `1px solid ${s.border}`, color: s.color }}>
+                  {t}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Upload glass card */}
+        <div className="upl-glass">
+          <div className="upl-grid">
+
+            {/* CLIENT SECTION */}
+            <div className="upl-section">
+              <div className="upl-label">
+                <span className="upl-label-icon licon-blue">🏢</span>
+                Client
+                <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--text3)", fontWeight: 400 }}>manual only</span>
+              </div>
+              {clients.length > 0 ? (
+                <>
+                  <div ref={clientDropdownRef} style={{ position: "relative", width: "100%" }}>
+                    <button type="button" className="upl-select"
+                      onClick={() => setClientDropdownOpen(v => !v)}
+                      style={{ textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff" }}>
+                      <span>{selectedClient && selectedClient !== MASTER_KEY ? selectedClient : "Select client manually"}</span>
+                    </button>
+                    {clientDropdownOpen && (
+                      <div style={{ position: "absolute", top: "calc(100% + 8px)", left: 0, right: 0, zIndex: 1000, background: "#fff", border: "1.5px solid var(--border2)", borderRadius: "12px", boxShadow: "0 12px 28px rgba(15,28,63,0.14)", maxHeight: "260px", overflowY: "auto", padding: "6px" }}>
+                        <div onClick={() => { handleClientSelect(""); setClientDropdownOpen(false); }}
+                          style={{ padding: "10px 12px", borderRadius: "10px", cursor: "pointer", fontFamily: "var(--head)", fontSize: "13px", fontWeight: 600, color: !selectedClient || selectedClient === MASTER_KEY ? "var(--accent)" : "var(--text)", background: !selectedClient || selectedClient === MASTER_KEY ? "rgba(37,99,235,0.08)" : "transparent", marginBottom: "4px" }}>
+                          Select client manually
+                        </div>
+                        {clients.map((c, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", padding: "10px 12px", borderRadius: "10px", background: selectedClient === c ? "rgba(37,99,235,0.08)" : "transparent", marginBottom: "4px" }}>
+                            <span onClick={() => { handleClientSelect(c); setClientDropdownOpen(false); }}
+                              style={{ flex: 1, cursor: "pointer", fontSize: "13px", color: selectedClient === c ? "var(--accent)" : "var(--text)", fontWeight: selectedClient === c ? 700 : 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c}>{c}</span>
+                            {!isTeam && (
+                              <button type="button" onClick={ex => { ex.stopPropagation(); removeClient(c); }}
+                                style={{ border: "none", background: "rgba(239,68,68,0.10)", color: "#ef4444", width: "24px", height: "24px", borderRadius: "50%", cursor: "pointer", fontSize: "12px", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {!isTeam && (
+                    <button className="upl-btn upl-btn-red upl-btn-sm" style={{ width: "fit-content", fontSize: 11 }} onClick={clearAllClients}>
+                      🗑 Clear All
+                    </button>
+                  )}
+                </>
+              ) : (
+                <div style={{ padding: "14px", background: "rgba(37,99,235,0.04)", border: "1.5px dashed rgba(37,99,235,0.20)", borderRadius: "var(--r8)", fontSize: 12, color: "var(--text3)", lineHeight: 1.6, textAlign: "center" }}>
+                  📂 No clients yet.<br />Add client manually using the input below.
+                </div>
+              )}
+              {!isTeam && (
+                <div className="upl-inline" style={{ marginTop: 4 }}>
+                  <input className="upl-input" placeholder="Add client manually…" value={newClient}
+                    onChange={e => setNewClient(e.target.value)} onKeyDown={e => e.key === "Enter" && addClient()} />
+                  <button className="upl-btn upl-btn-green upl-btn-sm" onClick={addClient}>+ Add</button>
+                </div>
+              )}
+            </div>
+
+            {/* CLIENT LOCATION PRICING */}
+            {!isTeam && (
+              <div className="upl-section">
+                <div className="upl-label">
+                  <span className="upl-label-icon licon-cyan">📍</span>
+                  Client Price / State
+                  {!clientForLocation && <span style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)", marginLeft: "auto" }}>select client first</span>}
+                </div>
+                {/* Row 1: State + Price */}
+                <div className="upl-inline" style={{ alignItems: "stretch", flexWrap: "wrap" }}>
+                  <input className="upl-input" placeholder="State" value={clientStateName} style={{ flex: 1.1, minWidth: "130px" }}
+                    onChange={e => setClientStateName(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleAddClientLocationPrice()}
+                    disabled={!clientForLocation} />
+                  <input className="upl-input" type="number" placeholder="Price ₹" value={newLocationPrice}
+                    style={{ flex: 0.9, minWidth: "100px" }} onChange={e => setNewLocationPrice(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleAddClientLocationPrice()}
+                    disabled={!clientForLocation} />
+                </div>
+                {/* Row 2: Email TO */}
+                <input className="upl-input" placeholder="Client email for this state (TO)" value={clientStateEmail}
+                  style={{ fontSize: 12.5 }}
+                  onChange={e => setClientStateEmail(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleAddClientLocationPrice()}
+                  disabled={!clientForLocation} />
+                {/* Row 3: CC chips */}
+                <div style={{
+                  display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center",
+                  background: clientForLocation ? "#f8faff" : "rgba(248,250,255,0.5)",
+                  border: "1.5px solid rgba(59,130,246,0.22)", borderRadius: "var(--r8)",
+                  padding: "6px 10px", minHeight: 36, cursor: clientForLocation ? "text" : "default",
+                  opacity: clientForLocation ? 1 : 0.5,
+                }} onClick={() => clientForLocation && document.getElementById("csc-cc-input")?.focus()}>
+                  {clientStateCc.map((chip, i) => (
+                    <span key={i} style={{
+                      display: "inline-flex", alignItems: "center", gap: 4,
+                      background: "rgba(6,182,212,0.10)", border: "1px solid rgba(6,182,212,0.28)",
+                      borderRadius: 99, padding: "2px 8px", fontSize: 11.5, color: "var(--accent2)", fontFamily: "var(--head)",
+                    }}>
+                      {chip}
+                      <button type="button" onClick={e => { e.stopPropagation(); setClientStateCc(prev => prev.filter((_, j) => j !== i)); }}
+                        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--accent2)", fontSize: 11, padding: 0, lineHeight: 1 }}>✕</button>
+                    </span>
+                  ))}
+                  <input id="csc-cc-input" placeholder={clientStateCc.length ? "" : "CC emails (comma/Enter)"}
+                    value={clientStateCcInput} disabled={!clientForLocation}
+                    onChange={e => setClientStateCcInput(e.target.value)}
+                    onKeyDown={e => {
+                      const isValidE = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+                      if (e.key === "Enter" || e.key === "," || e.key === ";") {
+                        e.preventDefault();
+                        const chips = clientStateCcInput.split(/[,;]+/).map(s => s.trim().toLowerCase()).filter(isValidE);
+                        if (chips.length) setClientStateCc(prev => [...prev, ...chips]);
+                        setClientStateCcInput("");
+                      } else if (e.key === "Backspace" && !clientStateCcInput && clientStateCc.length) {
+                        setClientStateCc(prev => prev.slice(0, -1));
+                      }
+                    }}
+                    onBlur={() => {
+                      const isValidE = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+                      const chips = clientStateCcInput.split(/[,;]+/).map(s => s.trim().toLowerCase()).filter(isValidE);
+                      if (chips.length) setClientStateCc(prev => [...prev, ...chips]);
+                      setClientStateCcInput("");
+                    }}
+                    style={{ border: "none", outline: "none", background: "transparent", fontSize: 12.5, fontFamily: "var(--body)", minWidth: 100, flex: 1, color: "var(--text)" }} />
+                </div>
+                <button className="upl-btn upl-btn-cyan upl-btn-sm" style={{ width: "100%" }}
+                  onClick={handleAddClientLocationPrice} disabled={!clientForLocation}>+ Add / Update</button>
+                {!clientForLocation && (
+                  <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5, padding: "8px 10px", background: "rgba(37,99,235,0.04)", border: "1px dashed rgba(37,99,235,0.18)", borderRadius: "var(--r8)" }}>
+                    Select a specific client above to set per-client state, price, and email rules.
+                  </div>
+                )}
+                {clientForLocation && clientLocationRules.length > 0 && (
+                  <div style={{ marginTop: 6, position: "relative" }}>
+                    <button
+                      type="button"
+                      onClick={() => setClientPriceDropdownOpen(v => !v)}
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        fontFamily: "var(--head)",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        padding: "9px 12px",
+                        borderRadius: "var(--r8)",
+                        border: "1.5px solid rgba(6,182,212,0.28)",
+                        background: "rgba(6,182,212,0.06)",
+                        color: "var(--accent2)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span>📍 View State Prices</span>
+                      <span style={{ opacity: 0.8 }}>
+                        {clientLocationRules.length} rules {clientPriceDropdownOpen ? "▲" : "▼"}
+                      </span>
+                    </button>
+
+                    {clientPriceDropdownOpen && (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          maxHeight: 220,
+                          overflowY: "auto",
+                          border: "1.5px solid rgba(6,182,212,0.24)",
+                          borderRadius: "var(--r12)",
+                          background: "#fff",
+                          boxShadow: "0 8px 24px rgba(6,182,212,0.12)",
+                          padding: 6,
+                        }}
+                      >
+                        {clientLocationRules.map((cp, idx) => (
+                          <div
+                            key={idx}
+                            onClick={() => {
+                              setClientStateName(cp.state || "");
+                              setNewLocationPrice(cp.clientPrice || "");
+                              setClientStateEmail(cp.email || "");
+                              setClientStateCc(Array.isArray(cp.ccList) ? cp.ccList : []);
+                              setClientStateCcInput("");
+                            }}
+                            style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 3,
+                              padding: "8px 10px",
+                              borderRadius: "var(--r8)",
+                              cursor: "pointer",
+                              fontFamily: "var(--head)",
+                              fontSize: 12.5,
+                              color: "var(--text2)",
+                              borderBottom: idx === clientLocationRules.length - 1 ? "none" : "1px solid rgba(6,182,212,0.10)",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                              <span style={{ fontWeight: 700, color: "var(--accent2)" }}>
+                                {cp.state || "State"}
+                              </span>
+                              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                                <strong style={{ color: "#059669" }}>₹{cp.clientPrice}</strong>
+                                <button
+                                  type="button"
+                                  onClick={(ex) => {
+                                    ex.stopPropagation();
+                                    removeClientLocationPrice(clientForLocation, cp.state);
+                                  }}
+                                  style={{
+                                    width: 20,
+                                    height: 20,
+                                    borderRadius: "50%",
+                                    border: "1px solid rgba(239,68,68,0.25)",
+                                    background: "rgba(239,68,68,0.08)",
+                                    color: "#ef4444",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    lineHeight: "18px",
+                                  }}
+                                  title="Delete state price"
+                                >
+                                  ✕
+                                </button>
+                              </span>
+                            </div>
+                            {cp.email && (
+                              <div style={{ fontSize: 11, color: "var(--text3)", paddingLeft: 2 }}>
+                                📧 {cp.email}{cp.ccList?.length ? ` · CC: ${cp.ccList.join(", ")}` : ""}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* CLIENT CHECK-WISE PRICING — Super Admin + internal team only */}
+            {!isTeam && EFFECTIVE_IS_SUPER_ADMIN && (
+              <div className="upl-section">
+                <div className="upl-label">
+                  <span className="upl-label-icon licon-cyan">🧾</span>
+                  Check Wise Price
+                  {!clientForLocation && <span style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)", marginLeft: "auto" }}>select client first</span>}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 2 }}>
+                  If a case matches both a check-wise price and a state price, check-wise wins.
+                </div>
+                <div className="upl-inline" style={{ alignItems: "stretch", flexWrap: "wrap" }}>
+                  <input className="upl-input" placeholder="Check Name (e.g. CIBIL Check)" value={checkPriceName}
+                    style={{ flex: 1.1, minWidth: "170px" }}
+                    onChange={e => setCheckPriceName(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleAddClientCheckPrice()}
+                    disabled={!clientForLocation} />
+                  <input className="upl-input" type="number" placeholder="Price ₹" value={newCheckPrice}
+                    style={{ flex: 0.9, minWidth: "100px" }} onChange={e => setNewCheckPrice(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleAddClientCheckPrice()}
+                    disabled={!clientForLocation} />
+                </div>
+                <button className="upl-btn upl-btn-cyan upl-btn-sm" style={{ width: "100%" }}
+                  onClick={handleAddClientCheckPrice} disabled={!clientForLocation}>+ Add / Update</button>
+                {!clientForLocation && (
+                  <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5, padding: "8px 10px", background: "rgba(37,99,235,0.04)", border: "1px dashed rgba(37,99,235,0.18)", borderRadius: "var(--r8)" }}>
+                    Select a specific client above to set per-check prices.
+                  </div>
+                )}
+                {clientForLocation && clientCheckRules.length > 0 && (
+                  <div style={{ marginTop: 6, position: "relative" }}>
+                    <button
+                      type="button"
+                      onClick={() => setCheckPriceDropdownOpen(v => !v)}
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        fontFamily: "var(--head)",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        padding: "9px 12px",
+                        borderRadius: "var(--r8)",
+                        border: "1.5px solid rgba(6,182,212,0.28)",
+                        background: "rgba(6,182,212,0.06)",
+                        color: "var(--accent2)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span>🧾 View Check Prices</span>
+                      <span style={{ opacity: 0.8 }}>
+                        {clientCheckRules.length} rules {checkPriceDropdownOpen ? "▲" : "▼"}
+                      </span>
+                    </button>
+
+                    {checkPriceDropdownOpen && (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          maxHeight: 220,
+                          overflowY: "auto",
+                          border: "1.5px solid rgba(6,182,212,0.24)",
+                          borderRadius: "var(--r12)",
+                          background: "#fff",
+                          boxShadow: "0 8px 24px rgba(6,182,212,0.12)",
+                          padding: 6,
+                        }}
+                      >
+                        {clientCheckRules.map((cp, idx) => (
+                          <div
+                            key={idx}
+                            onClick={() => {
+                              setCheckPriceName(cp.checkName || "");
+                              setNewCheckPrice(cp.clientPrice || "");
+                            }}
+                            style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 3,
+                              padding: "8px 10px",
+                              borderRadius: "var(--r8)",
+                              cursor: "pointer",
+                              fontFamily: "var(--head)",
+                              fontSize: 12.5,
+                              color: "var(--text2)",
+                              borderBottom: idx === clientCheckRules.length - 1 ? "none" : "1px solid rgba(6,182,212,0.10)",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                              <span style={{ fontWeight: 700, color: "var(--accent2)" }}>
+                                {cp.checkName || "Check"}
+                              </span>
+                              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                                <strong style={{ color: "#059669" }}>₹{cp.clientPrice}</strong>
+                                <button
+                                  type="button"
+                                  onClick={(ex) => {
+                                    ex.stopPropagation();
+                                    removeClientCheckPrice(clientForLocation, cp.checkName);
+                                  }}
+                                  style={{
+                                    width: 20,
+                                    height: 20,
+                                    borderRadius: "50%",
+                                    border: "1px solid rgba(239,68,68,0.25)",
+                                    background: "rgba(239,68,68,0.08)",
+                                    color: "#ef4444",
+                                    cursor: "pointer",
+                                    fontSize: 11,
+                                    lineHeight: "18px",
+                                  }}
+                                  title="Delete check price"
+                                >
+                                  ✕
+                                </button>
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* FILE SECTION */}
+            <div className="upl-section">
+              <div className="upl-label">
+                <span className="upl-label-icon licon-green">📊</span>
+                Excel File
+              </div>
+              <div className="upl-file-wrap">
+                <label className={`upl-file-label ${file ? "has-file" : ""}`}>
+                  <span style={{ fontSize: 16, flexShrink: 0 }}>{file ? "📄" : "📁"}</span>
+                  <span className="fname">{file ? file.name : "Choose .xlsx / .xls file"}</span>
+                  <input type="file" accept=".xlsx,.xls" className="upl-hidden"
+                    key={file ? file.name : "empty"}
+                    onChange={e => handleExcelFileSelect(e.target.files?.[0] || null)} />
+                </label>
+              </div>
+              {file && (
+                <div style={{ fontSize: 12, color: "var(--text3)", paddingLeft: 2 }}>
+                  {(file.size / 1024).toFixed(1)} KB · {file.name.split(".").pop().toUpperCase()}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: "#8ba3c0", lineHeight: 1.6 }}>
+                📡 Saves to <strong>MongoDB</strong> under your workspace.<br />
+                💡 Excel <b>Client Name</b> must already exist in saved clients.<br />
+                🏪 Vendor is optional/manual only — Excel vendor column is ignored.<br />
+                🎯 <strong>Pincode / District</strong> auto-assigns Tier.
+              </div>
+            </div>
+          </div>
+
+          {/* Action strip */}
+          <div className="upl-action-strip">
+            <div className="upl-status">
+              <span className={`upl-status-dot ${isReady ? "ready" : ""}`} />
+              {isUploading ? "Uploading & syncing to database…"
+                : isReady ? `Ready — ${file.name}`
+                  : "Select an Excel file to continue"}
+            </div>
+            <button className="upl-btn upl-btn-blue" onClick={handleUpload} disabled={!isReady}>
+              {isUploading ? "⏳ Uploading…" : "⬆ Upload Data"}
+            </button>
+          </div>
+        </div>
+
+        {/* VENDOR PRICING */}
+        {isTeam ? (
+          <div className="team-lock">
+            <span className="team-lock-icon">🔒</span>
+            <div>
+              <div className="team-lock-text">Pricing configuration is restricted</div>
+              <div className="team-lock-sub">Vendor and client pricing rules are managed by administrators only.</div>
+            </div>
+          </div>
+        ) : (
+          <div className="pricing-glass">
+            <div className="pricing-header">
+              <div className="pricing-header-left">
+                <div className="pricing-header-icon">📍</div>
+                <div>
+                  <div className="pricing-header-title">Vendor Location Pricing</div>
+                  <div className="pricing-header-sub">
+                    {pricingLoading
+                      ? "⏳ Loading saved rules…"
+                      : `Set vendor prices per state${activePricingKey === VENDOR_GLOBAL_PRICING_KEY ? " — applying to ALL clients in this workspace" : ` — scoped to "${selectedClient}" only`}`}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {totalVendorRules > 0 && (
+                  <span className="pricing-active-pill">{totalVendorRules} rule{totalVendorRules > 1 ? "s" : ""} active</span>
+                )}
+                {/* Save state indicator */}
+                {!pricingLoading && (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "var(--head)", fontSize: 11, color: pricingSaveState === "error" ? "#ef4444" : pricingSaveState === "saving" ? "#f59e0b" : "#10b981" }}>
+                    <span className={`save-dot ${pricingSaveState}`} />
+                    {pricingSaveState === "saving" ? "Saving…" : pricingSaveState === "error" ? "Save failed" : "Saved to DB"}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="pricing-scope-bar">
+              <span className="pricing-scope-label">Apply rules to:</span>
+              <button className={`pricing-scope-pill ${pricingScope === "global" ? "active" : ""}`} onClick={() => setPricingScope("global")}>
+                🌐 All Clients (This Workspace)
+              </button>
+              <button className={`pricing-scope-pill ${pricingScope === "client" ? "active" : ""}`}
+                onClick={() => setPricingScope("client")}
+                disabled={!selectedClient || selectedClient === MASTER_KEY}
+                style={{ opacity: (!selectedClient || selectedClient === MASTER_KEY) ? 0.45 : 1, cursor: (!selectedClient || selectedClient === MASTER_KEY) ? "not-allowed" : "pointer" }}>
+                🏢 {selectedClient && selectedClient !== MASTER_KEY ? selectedClient : "Specific Client (select one above)"}
+              </button>
+              <span className="pricing-scope-info">
+                {vendorName
+                  ? `${activeVendorRules.length} rule${activeVendorRules.length !== 1 ? "s" : ""} for ${vendorName}`
+                  : activePricingKey === VENDOR_GLOBAL_PRICING_KEY
+                    ? `${activeVendorRules.length} workspace rule${activeVendorRules.length !== 1 ? "s" : ""}`
+                    : `${activeVendorRules.length} rule${activeVendorRules.length !== 1 ? "s" : ""} for ${selectedClient}`}
+              </span>
+            </div>
+            <div className="pricing-body">
+              <div className="vendor-name-section">
+                <div className="vendor-name-label">🏪 Vendor Company Name</div>
+                <div className="upl-inline" style={{ maxWidth: 340 }}>
+                  <select className="upl-select" value={vendorName} onChange={e => setVendorName(e.target.value)}>
+                    <option value="">Select vendor…</option>
+                    {vendors.map((v, i) => <option key={i}>{v}</option>)}
+                  </select>
+                </div>
+                <div className="upl-inline" style={{ maxWidth: 340, marginTop: 6 }}>
+                  <input className="upl-input" placeholder="New vendor name…" value={newVendor}
+                    onChange={e => setNewVendor(e.target.value)} onKeyDown={e => e.key === "Enter" && addVendor()} />
+                  <button className="upl-btn upl-btn-cyan upl-btn-sm" onClick={addVendor}>+ Add</button>
+                </div>
+                {vendors.length > 0 && (
+                  <div className="upl-dropdown-box">
+                    <button type="button" className="upl-dropdown-btn" onClick={() => setVendorListDropdownOpen(v => !v)}>
+                      <span>🏪 Saved Vendors ({vendors.length})</span>
+                      <span>{vendorListDropdownOpen ? "▲" : "▼"}</span>
+                    </button>
+                    {vendorListDropdownOpen && (
+                      <div className="upl-dropdown-panel">
+                        {vendors.map((v, i) => (
+                          <div key={i} className={`upl-dropdown-row ${vendorName === v ? "active" : ""}`} onClick={() => { setVendorName(v); setVendorListDropdownOpen(false); }}>
+                            <span>{v}</span>
+                            <button type="button" className="upl-dropdown-del" onClick={ex => { ex.stopPropagation(); removeVendor(v); }}>✕</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="pricing-divider" style={{ marginTop: 4, marginBottom: 4 }} />
+              <div className="pricing-vendor-section">
+                <div className="pricing-vendor-label">🗺️ Add / Update Vendor Location Rule</div>
+                <div className="pricing-vendor-inputs">
+                  <input className="upl-input" placeholder="State" value={stateName} onChange={handleVendorStateChange} style={{ maxWidth: 220 }} />
+                  <input className="upl-input" type="number" placeholder="Price ₹" value={price} onChange={e => setPrice(e.target.value)} style={{ maxWidth: 150 }} />
+                  <button className="upl-btn upl-btn-amber" onClick={applyPricing}>✦ Save Rule</button>
+                </div>
+                <div style={{ fontSize: 11.5, color: "var(--text3)", fontFamily: "var(--head)", marginTop: 4 }}>
+                  {activePricingKey === VENDOR_GLOBAL_PRICING_KEY
+                    ? `💡 These rules apply to ALL clients in this workspace${vendorName ? ` for vendor "${vendorName}"` : ""} — rows will show the vendor price in the table when state matches.`
+                    : `💡 These rules apply only to client "${selectedClient}"${vendorName ? ` and vendor "${vendorName}"` : ""}.`}
+                </div>
+              </div>
+
+              {activeVendorRules.length > 0 && (
+                <div>
+                  <div className="pricing-vendor-label" style={{ marginBottom: 8, marginTop: 4 }}>
+                    ✅ Active Rules {vendorName ? ` — ${vendorName}` : (activePricingKey === VENDOR_GLOBAL_PRICING_KEY ? " (Workspace — all clients)" : ` — ${selectedClient}`)}
+                  </div>
+                  <div className="upl-dropdown-box" style={{ maxWidth: 560 }}>
+                    <button type="button" className="upl-dropdown-btn" onClick={() => setActiveRulesDropdownOpen(v => !v)}>
+                      <span>✅ View Active Rules ({activeVendorRules.length})</span>
+                      <span>{activeRulesDropdownOpen ? "▲" : "▼"}</span>
+                    </button>
+                    {activeRulesDropdownOpen && (
+                      <div className="upl-dropdown-panel">
+                        {activeVendorRules.map((r, i) => (
+                          <div key={i} className="upl-dropdown-row" onClick={() => { if (r.state) setStateName(r.state); setDistrict(""); setPrice(r.rate); if (r.vendorName) setVendorName(r.vendorName); setActiveRulesDropdownOpen(false); }}>
+                            <span>{r.vendorName && `${r.vendorName} · `}{r.state || "State"} → ₹{r.rate}</span>
+                            <button type="button" className="upl-dropdown-del" onClick={ex => { ex.stopPropagation(); deleteRule(activePricingKey, r.state, r.vendorName); }}>✕</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {false && pricingScope === "client" && (pricingRules[GLOBAL_PRICING_KEY] || []).filter(r => r.rate !== undefined).length > 0 && (
+                <div>
+                  <div className="pricing-divider" style={{ margin: "8px 0" }} />
+                  <div className="pricing-vendor-label" style={{ marginBottom: 8 }}>🌐 Global rules (also apply to this client)</div>
+                  <div className="upl-dropdown-box" style={{ maxWidth: 560 }}>
+                    <button type="button" className="upl-dropdown-btn" onClick={() => setGlobalRulesDropdownOpen(v => !v)}>
+                      <span>🌐 View Global Rules ({(pricingRules[GLOBAL_PRICING_KEY] || []).filter(r => r.rate !== undefined).length})</span>
+                      <span>{globalRulesDropdownOpen ? "▲" : "▼"}</span>
+                    </button>
+                    {globalRulesDropdownOpen && (
+                      <div className="upl-dropdown-panel">
+                        {(pricingRules[GLOBAL_PRICING_KEY] || []).filter(r => r.rate !== undefined).map((r, i) => (
+                          <div key={i} className="upl-dropdown-row">
+                            <span>{r.vendorName && `${r.vendorName} · `}{r.state || "State"} → ₹{r.rate}</span>
+                            <button type="button" className="upl-dropdown-del" onClick={ex => { ex.stopPropagation(); deleteRule(GLOBAL_PRICING_KEY, r.state, r.vendorName); }}>✕</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {false && pricingScope === "global" && Object.keys(pricingRules).filter(k => k !== GLOBAL_PRICING_KEY && k !== MASTER_KEY && (pricingRules[k] || []).filter(r => r.rate !== undefined).length > 0).length > 0 && (
+                <div>
+                  <div className="pricing-divider" style={{ margin: "8px 0" }} />
+                  <div className="pricing-vendor-label" style={{ marginBottom: 8 }}>Client-specific rules</div>
+                  <div className="upl-dropdown-box" style={{ maxWidth: 560 }}>
+                    <button type="button" className="upl-dropdown-btn" onClick={() => setClientRulesDropdownOpen(v => !v)}>
+                      <span>🏢 View Client-Specific Rules</span>
+                      <span>{clientRulesDropdownOpen ? "▲" : "▼"}</span>
+                    </button>
+                    {clientRulesDropdownOpen && (
+                      <div className="upl-dropdown-panel">
+                        {Object.entries(pricingRules)
+                          .filter(([k, v]) => k !== GLOBAL_PRICING_KEY && k !== MASTER_KEY && v.filter(r => r.rate !== undefined).length > 0)
+                          .map(([ck, rules]) => rules.filter(r => r.rate !== undefined).map((r, i) => (
+                            <div key={`${ck}-${i}`} className="upl-dropdown-row">
+                              <span>{ck} · {r.state || "State"} → ₹{r.rate}</span>
+                              <button type="button" className="upl-dropdown-del" onClick={ex => { ex.stopPropagation(); deleteRule(ck, r.state); }}>✕</button>
+                            </div>
+                          )))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {totalVendorRules === 0 && !pricingLoading && (
+                <div style={{ textAlign: "center", padding: "20px", background: "rgba(245,158,11,0.04)", border: "1.5px dashed rgba(245,158,11,0.25)", borderRadius: "var(--r12)", fontSize: 13, color: "var(--text3)", lineHeight: 1.7 }}>
+                  <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.4 }}>📍</div>
+                  No vendor pricing rules yet.<br />
+                  Enter a <strong>State</strong>, <strong>District</strong> and <strong>Price</strong> above and click <strong>Save Rule</strong>.
+                </div>
+              )}
+              {pricingLoading && (
+                <div style={{ textAlign: "center", padding: "20px", color: "var(--text3)", fontFamily: "var(--head)", fontSize: 13 }}>
+                  <span className="sync-spin" style={{ display: "inline-block", marginRight: 8 }} />
+                  Loading saved pricing rules…
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+ 

@@ -1,0 +1,23 @@
+// bgv-backend/routes/dailyFollowUpRoutes.js
+// Daily Follow-Up — Super Admin's internal team only. Every route requires
+// auth; role/ownership scoping happens inside the controller (never
+// client-supplied), same pattern as inboxRoutes.js.
+import express from "express";
+import { protect } from "../middleware/authMiddleware.js";
+import {
+  listFollowUps,
+  createFollowUp,
+  updateFollowUp,
+  deleteFollowUp,
+  listFollowUpMembers,
+} from "../controllers/dailyFollowUpController.js";
+
+const router = express.Router();
+
+router.get("/members", protect, listFollowUpMembers);
+router.get("/", protect, listFollowUps);
+router.post("/", protect, createFollowUp);
+router.patch("/:id", protect, updateFollowUp);
+router.delete("/:id", protect, deleteFollowUp);
+
+export default router;

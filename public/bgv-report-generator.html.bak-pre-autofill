@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BGV Report Generator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{
+  --bg:#f2f4f7; --panel:#ffffff; --text:#1b2430; --muted:#5b6675; --border:#dbe1e8;
+  --accent:#00a0d2; --accent-dark:#1f6fb2; --danger:#c0392b; --input-bg:#ffffff;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#10141a; --panel:#1a2029; --text:#e8edf3; --muted:#93a1b3;
+    --border:#2c3542; --input-bg:#131822;
+  }
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+.app{display:flex;align-items:flex-start;gap:22px;padding:22px;max-width:1500px;margin:0 auto;}
+.form-panel{width:400px;flex-shrink:0;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;position:sticky;top:22px;max-height:calc(100vh - 44px);overflow-y:auto;}
+.preview{flex:1;display:flex;flex-direction:column;align-items:center;gap:26px;min-width:0;}
+@media (max-width:980px){
+  .app{flex-direction:column;}
+  .form-panel{position:static;width:100%;max-height:none;}
+  .preview{width:100%;overflow-x:auto;}
+}
+h1{font-size:16px;margin:0 0 14px;}
+h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:20px 0 8px;border-top:1px solid var(--border);padding-top:14px;}
+h2:first-of-type{border-top:none;padding-top:0;margin-top:0;}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px;}
+input[type=text],input[type=date],textarea,select{
+  width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;
+  background:var(--input-bg);color:var(--text);font-size:13px;font-family:inherit;
+}
+textarea{resize:vertical;min-height:56px;}
+.row2{display:flex;gap:10px;}
+.row2>div{flex:1;}
+.toggle{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+.toggle button{flex:1;padding:9px 6px;border:none;background:var(--input-bg);color:var(--text);cursor:pointer;font-size:13px;font-weight:600;}
+.toggle button.active.red{background:#c0392b;color:#fff;}
+.toggle button.active.green{background:#2e7d32;color:#fff;}
+.checkbox-row{display:flex;align-items:flex-start;gap:8px;margin:10px 0;}
+.checkbox-row input{margin-top:3px;}
+.checkbox-row label{margin:0;font-size:12.5px;color:var(--text);}
+button.btn{padding:7px 12px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text);font-size:12.5px;cursor:pointer;}
+button.btn:hover{border-color:var(--accent);}
+button.btn:disabled{opacity:.45;cursor:not-allowed;}
+button.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:11px 14px;width:100%;font-size:14px;margin-top:6px;}
+button.btn-primary:disabled{opacity:.6;cursor:not-allowed;}
+.small-note{font-size:11.5px;color:var(--muted);margin-top:4px;}
+.img-preview{display:flex;align-items:center;gap:10px;margin-top:8px;}
+.img-preview img{max-height:46px;max-width:140px;background:#fff;border:1px solid var(--border);border-radius:4px;padding:3px;}
+.case-card{border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px;position:relative;}
+.case-card .case-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;}
+.case-card .case-head strong{font-size:12.5px;}
+.remove-case{background:none;border:none;color:var(--danger);cursor:pointer;font-size:12px;}
+.add-case{margin-top:12px;width:100%;}
+.err-note{color:var(--danger);font-size:12px;margin-top:8px;white-space:pre-wrap;}
+.pdf-status{font-size:12px;margin-top:8px;color:var(--muted);}
+
+/* ===== Report / page styling (always white, fixed px, independent of theme) ===== */
+.page{
+  width:794px;height:1123px;background:#ffffff;color:#1a1a1a;position:relative;flex-shrink:0;
+  box-shadow:0 6px 24px rgba(0,0,0,.28);
+  font-family:"DejaVu Sans",Verdana,Geneva,sans-serif;font-size:11.2px;line-height:1.45;
+  overflow:hidden;
+}
+.page-content{position:absolute;left:62px;right:54px;top:52px;width:678px;}
+.page-footer{position:absolute;bottom:26px;left:62px;right:34px;display:flex;justify-content:space-between;align-items:center;font-size:9.5px;color:#777;}
+.blk{display:flow-root;}
+.rpt-divider{border:none;border-top:1px solid #1b9ad6;margin:10px 0;}
+.rpt-section-title{color:#1f6fb2;font-size:16.5px;font-weight:700;margin:18px 0 12px;}
+.rpt-table{width:678px;border-collapse:collapse;table-layout:fixed;}
+.rpt-table th{background:#00a0d2;color:#fff;font-size:10.5px;text-align:left;padding:6px 8px;font-weight:700;}
+.rpt-table td{border:1px solid #d7dee3;padding:6px 8px;font-size:10.5px;vertical-align:top;}
+.rpt-label-cell{background:#00a0d2;color:#fff;font-weight:700;width:132px;}
+.header-block{display:flex;justify-content:space-between;align-items:flex-start;}
+.header-left{display:flex;align-items:center;gap:10px;}
+.header-left img.logo-img{height:62px;max-width:360px;object-fit:contain;}
+.header-left .shield-name{display:flex;align-items:center;gap:10px;}
+.header-left .company-name{font-size:17px;font-weight:700;color:#1f6fb2;}
+.header-right{text-align:right;font-size:10.5px;color:#333;max-width:320px;}
+.header-right a, .header-right .link{color:#1155cc;text-decoration:underline;}
+.case-pill{display:inline-block;padding:3px 14px;border-radius:14px;color:#fff;font-size:11px;font-weight:700;vertical-align:middle;background:#f39c12;}
+.case-num{font-weight:700;}
+.status-cell b{display:block;}
+
+/* ===== Profile Details / Results / Risk-O-Meter (exact spec) ===== */
+.r-title{color:#1f6fb2;font-size:16.5px;margin:18px 0 12px;font-weight:400}
+.hr{border-bottom:1px solid #1b9ad6}
+.prof{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:18px}
+.prof table{border-collapse:collapse}
+.prof td{border:1px solid #e3e3e3;padding:8px;vertical-align:top;font-size:11.2px}
+.prof td.l{background:#00a0d2;color:#fff;border-color:#fff;font-weight:400}
+.prof .t1{width:290px}.prof .t1 td.l{width:132px}
+.prof .t2{width:325px}.prof .t2 td.l{width:132px}
+.prof .t2 td.v{white-space:pre-line}
+.results{padding:0 0 12px}
+.pill{display:inline-block;border-radius:9px;color:#fff;font-weight:700;font-size:10.5px;padding:1px 20px;margin-right:2px;vertical-align:middle}
+.pill.orange{background:#f39c12}.pill.green{background:#2e7d32}
+.res-txt{font-size:13px}
+table.meter{width:100%;border-collapse:collapse;margin:14px 0 20px}
+table.meter th{background:#00a0d2;color:#fff;font-weight:400;font-size:11px;padding:6px;border:1px solid #fff;text-align:center}
+table.meter td{border:1px solid #e6e6e6;padding:9px 8px;font-size:10.5px;vertical-align:middle}
+table.meter td.ind{font-weight:700;width:132px;position:relative}
+table.meter tr.sel td.ind,table.meter tr.sel td.gd{border-top:1.5px solid #243a5e;border-bottom:1.5px solid #243a5e}
+table.meter tr.sel td.gd{border-right:1.5px solid #243a5e}
+table.meter tr.sel td.ind{border-left:1.5px solid #243a5e}
+.arrow{position:absolute;left:-14px;top:50%;transform:translateY(-50%);width:0;height:0;border-top:7px solid transparent;border-bottom:7px solid transparent;border-left:10px solid #1b8fce}
+.sig-area{width:190px;margin-left:auto;text-align:center;margin-top:26px;}
+.sig-area img{max-height:92px;max-width:190px;}
+.sig-box{border:1.5px dashed #9aa4af;border-radius:6px;height:70px;display:flex;align-items:center;justify-content:center;color:#8a929c;font-size:10.5px;}
+.disclaimer{text-align:justify;font-size:10px;color:#333;margin-top:14px;}
+.group-row td{background:#dfeef6;font-weight:700;color:#0d4d75;}
+.grey-row td{background:#f2f2f2;}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ================= FORM PANEL ================= -->
+  <div class="form-panel">
+    <h1>BGV Report Generator</h1>
+
+    <label>Result</label>
+    <div class="toggle">
+      <button type="button" id="toggleRed" class="active red">Red · High Risk</button>
+      <button type="button" id="toggleGreen" class="green">Green · No Risk</button>
+    </div>
+
+    <h2>Company</h2>
+    <label>Company name</label>
+    <input type="text" id="companyName" value="Acme Background Verifications Pvt. Ltd.">
+    <label>Company address</label>
+    <textarea id="companyAddress">4th Floor, Prestige Towers, MG Road,
+Bengaluru, Karnataka 560001</textarea>
+
+    <label>Logo</label>
+    <input type="file" accept=".png,.jpg,.jpeg,.webp,.svg" id="logoFile">
+    <div class="img-preview" id="logoPreviewWrap" style="display:none;">
+      <img id="logoPreview">
+      <button type="button" class="btn" id="removeLogo">Remove logo</button>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="signatoryCheck">
+      <label for="signatoryCheck">I am the signatory and have reviewed this report</label>
+    </div>
+    <label>Signature / stamp <span id="sigTargetLabel" style="font-weight:700;"></span></label>
+    <input type="file" accept=".png,.jpg,.jpeg,.webp" id="sigFile" disabled>
+    <div class="img-preview" id="sigPreviewWrap" style="display:none;">
+      <img id="sigPreview">
+      <button type="button" class="btn" id="removeSig">Remove signature</button>
+    </div>
+
+    <h2>Profile</h2>
+    <div class="row2">
+      <div><label>Case RefNo</label><input type="text" id="caseRefNo" value="BGV/2026/00417"></div>
+      <div><label>Verification Date</label><input type="text" id="verificationDate" value="30-Sep-2026"></div>
+    </div>
+    <label>Name</label>
+    <input type="text" id="pName" value="Rahul Sharma">
+    <label>Father's Name</label>
+    <input type="text" id="pFatherName" value="Suresh Sharma">
+    <label>Date of Birth</label>
+    <input type="text" id="pDob" value="14-Mar-1990">
+    <label>Address</label>
+    <textarea id="pAddress">B-402, Sunrise Apartments, Andheri West, Mumbai, Maharashtra 400058</textarea>
+    <label>Alternate Address</label>
+    <input type="text" id="pAltAddress" value="Not Provided">
+
+    <h2 id="caseDetailsHeading" style="display:none;">Case details</h2>
+    <div id="casesList"></div>
+    <button type="button" class="btn add-case" id="addCase" style="display:none;">+ Add case</button>
+
+    <h2>Export</h2>
+    <button type="button" class="btn-primary" id="downloadPdf">Download PDF</button>
+    <div class="pdf-status" id="pdfStatus"></div>
+
+    <h2>Bulk generate from Excel</h2>
+    <div class="small-note">
+      One row per report. Company name/address, logo and the Red/Green signature already set above are reused for every row.<br><br>
+      Expected columns (header names are flexible, case-insensitive): <b>Result</b> (Red/Green), <b>Case RefNo</b>, <b>Verification Date</b>, <b>Name</b>, <b>Father's Name</b>, <b>Date of Birth</b>, <b>Address</b>, <b>Alternate Address</b>, and for Red rows: <b>Case Number</b>, <b>Court</b>, <b>State</b>, <b>District</b>, <b>Act & Section</b>, <b>Case Type</b>, <b>Filing Date</b>, <b>Petitioner</b>, <b>Respondent</b>, <b>Respondent Line 2</b>, <b>Status</b>, <b>Nature of Disposal</b>, <b>Disposed of Date</b>, <b>Match Summary</b>, <b>Risk Summary</b>, <b>Order Summary</b>.
+    </div>
+    <label>Excel file (.xlsx / .xls / .csv)</label>
+    <input type="file" accept=".xlsx,.xls,.csv" id="bulkFile">
+    <button type="button" class="btn-primary" id="bulkGenerate" disabled style="margin-top:10px;">Generate All PDFs</button>
+    <div class="pdf-status" id="bulkStatus"></div>
+  </div>
+
+  <!-- ================= PREVIEW ================= -->
+  <div class="preview" id="preview"></div>
+</div>
+
+<!-- Hidden off-screen measuring container -->
+<div id="measureBox" style="position:absolute;left:-9999px;top:0;width:678px;font-family:'DejaVu Sans',Verdana,sans-serif;font-size:11px;line-height:1.45;"></div>
+
+<script>
+(function(){
+
+/* ---------------------------------------------------------------------- */
+/* State                                                                   */
+/* ---------------------------------------------------------------------- */
+var state = {
+  result: 'red',
+  companyName: '',
+  companyAddress: '',
+  logo: null,
+  sigRed: null,
+  sigGreen: null,
+  signatoryChecked: false,
+  caseRefNo: '', verificationDate: '', pName: '', pFatherName: '', pDob: '',
+  pAddress: '', pAltAddress: '',
+  cases: [ defaultCase() ]
+};
+
+function defaultCase(){
+  return {
+    caseNumber: 'CC/1123/2021', court: 'IX Metropolitan Magistrate Court', state: 'Maharashtra',
+    district: 'Mumbai', actSection: 'Negotiable Instruments Act, 1881 - Sec 138',
+    caseType: 'Criminal', filingDate: '12-Jun-2021',
+    petitioner: 'State Bank of India', respondent: (document.getElementById('pName')||{}).value || '', respondentLine2: '',
+    status: 'Pending', natureOfDisposal: 'N/A', disposedOfDate: 'N/A',
+    matchSummary: 'Name, Father\'s Name and Address match with the subject provided details.',
+    riskSummary: 'Case is registered under Sec 138 of NI Act (cheque bounce) and is currently pending trial.',
+    orderSummary: 'No final order passed. Matter listed for next hearing.'
+  };
+}
+
+var COURT_GROUPS = [
+  { name: 'General Courts', rows: [
+      {name:'High Courts', jurisdiction:'High Courts of India along with respective District &amp; Sessions Courts', since:'Till Date'},
+      {name:'Civil Courts', jurisdiction:'Civil Courts across India', since:'Till Date'},
+      {name:'Criminal Courts', jurisdiction:'Criminal Courts across India', since:'Till Date', key:'criminal'},
+      {name:'Supreme Court', jurisdiction:'Supreme Court of India', since:'Till Date'},
+      {name:'Consumer Courts', jurisdiction:'Consumer Dispute Redressal Forums (District / State / National)', since:'Till Date'}
+  ]},
+  { name: 'Tribunals', rows: [
+      {name:'CEGAT / CESTAT', jurisdiction:'Customs, Excise &amp; Service Tax Appellate Tribunal', since:'Till Date'},
+      {name:'DRT', jurisdiction:'Debts Recovery Tribunal', since:'Till Date'},
+      {name:'DRAT', jurisdiction:'Debts Recovery Appellate Tribunal', since:'Till Date'},
+      {name:'ITAT', jurisdiction:'Income Tax Appellate Tribunal', since:'Till Date'},
+      {name:'NCLT', jurisdiction:'National Company Law Tribunal', since:'Till Date'},
+      {name:'SAT', jurisdiction:'Securities Appellate Tribunal', since:'Till Date'},
+      {name:'NGT', jurisdiction:'National Green Tribunal', since:'Till Date'},
+      {name:'NCLAT', jurisdiction:'National Company Law Appellate Tribunal', since:'Till Date'},
+      {name:'APTE', jurisdiction:'Appellate Tribunal for Electricity', since:'Till Date'}
+  ]},
+  { name: 'Defaulter Lists', rows: [
+      {name:'CIBIL', jurisdictionRed:'RBI List of Willful Defaulters', jurisdictionGreen:'RBI List of Defaulters', since:'Till Date', key:'cibil'},
+      {name:'Crif', jurisdiction:'Crif High Mark Defaulter Database', since:'Till Date'},
+      {name:'EPF', jurisdiction:'Employees\' Provident Fund Organisation Defaulters List', since:'Till Date'},
+      {name:'Equifax', jurisdiction:'Equifax Defaulter Database', since:'Till Date'},
+      {name:'MCA', jurisdiction:'Ministry of Corporate Affairs - Disqualified Directors', since:'Till Date'}
+  ]}
+];
+var OTHERS_GROUP = { name:'Others', rows: [
+    {name:'Others', jurisdiction:'Other regulatory tribunals and forums', since:'Till Date'},
+    {name:'FIR', jurisdiction:'State Police Department online eFIR records', since:'Till Date'}
+]};
+
+/* ---------------------------------------------------------------------- */
+/* localStorage helpers                                                    */
+/* ---------------------------------------------------------------------- */
+function lsGet(key){ try{ return localStorage.getItem(key); }catch(e){ return null; } }
+function lsSet(key,val){ try{ localStorage.setItem(key,val); }catch(e){} }
+function lsRemove(key){ try{ localStorage.removeItem(key); }catch(e){} }
+
+/* ---------------------------------------------------------------------- */
+/* Image trim / scale utility                                              */
+/* ---------------------------------------------------------------------- */
+function loadImageFile(file){
+  return new Promise(function(resolve,reject){
+    var reader = new FileReader();
+    reader.onload = function(){
+      var img = new Image();
+      img.onload = function(){ resolve(img); };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function trimAndScale(img, maxW, maxH){
+  var c = document.createElement('canvas');
+  c.width = img.naturalWidth || img.width;
+  c.height = img.naturalHeight || img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img,0,0);
+  var w = c.width, h = c.height;
+  var data;
+  try{ data = ctx.getImageData(0,0,w,h).data; }catch(e){ data = null; }
+
+  var minX=0,minY=0,maxX=w-1,maxY=h-1;
+  if(data){
+    minX=w; minY=h; maxX=0; maxY=0;
+    var found=false;
+    var threshold = 250; // near-white
+    for(var y=0;y<h;y++){
+      for(var x=0;x<w;x++){
+        var idx=(y*w+x)*4;
+        var r=data[idx],g=data[idx+1],b=data[idx+2],a=data[idx+3];
+        var isBg = (a===0) || (r>threshold && g>threshold && b>threshold);
+        if(!isBg){
+          found=true;
+          if(x<minX) minX=x;
+          if(x>maxX) maxX=x;
+          if(y<minY) minY=y;
+          if(y>maxY) maxY=y;
+        }
+      }
+    }
+    if(!found){ minX=0; minY=0; maxX=w-1; maxY=h-1; }
+  }
+  var cw = Math.max(1, maxX-minX+1);
+  var ch = Math.max(1, maxY-minY+1);
+
+  var trimmed = document.createElement('canvas');
+  trimmed.width = cw; trimmed.height = ch;
+  trimmed.getContext('2d').drawImage(c, minX, minY, cw, ch, 0, 0, cw, ch);
+
+  var scale = Math.min(1, maxW/cw, maxH/ch);
+  var outW = Math.max(1, Math.round(cw*scale));
+  var outH = Math.max(1, Math.round(ch*scale));
+  var out = document.createElement('canvas');
+  out.width = outW; out.height = outH;
+  out.getContext('2d').drawImage(trimmed, 0, 0, outW, outH);
+  return out.toDataURL('image/png');
+}
+
+/* ---------------------------------------------------------------------- */
+/* Form wiring                                                             */
+/* ---------------------------------------------------------------------- */
+var $ = function(id){ return document.getElementById(id); };
+var debounceTimer = null;
+function scheduleRender(){
+  if(debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(renderPreview, 150);
+}
+
+function bindText(id, key){
+  $(id).addEventListener('input', function(){ state[key] = this.value; scheduleRender(); });
+}
+bindText('companyName','companyName');
+bindText('companyAddress','companyAddress');
+bindText('caseRefNo','caseRefNo');
+bindText('verificationDate','verificationDate');
+bindText('pName','pName');
+bindText('pFatherName','pFatherName');
+bindText('pDob','pDob');
+bindText('pAddress','pAddress');
+bindText('pAltAddress','pAltAddress');
+
+state.companyName = $('companyName').value;
+state.companyAddress = $('companyAddress').value;
+state.caseRefNo = $('caseRefNo').value;
+state.verificationDate = $('verificationDate').value;
+state.pName = $('pName').value;
+state.pFatherName = $('pFatherName').value;
+state.pDob = $('pDob').value;
+state.pAddress = $('pAddress').value;
+state.pAltAddress = $('pAltAddress').value;
+
+$('toggleRed').addEventListener('click', function(){ setResult('red'); });
+$('toggleGreen').addEventListener('click', function(){ setResult('green'); });
+function setResult(r){
+  state.result = r;
+  $('toggleRed').classList.toggle('active', r==='red');
+  $('toggleGreen').classList.toggle('active', r==='green');
+  $('caseDetailsHeading').style.display = r==='red' ? '' : 'none';
+  $('casesList').style.display = r==='red' ? '' : 'none';
+  $('addCase').style.display = r==='red' ? '' : 'none';
+  updateSigUI();
+  scheduleRender();
+}
+
+/* --- logo --- */
+$('logoFile').addEventListener('change', function(e){
+  var file = e.target.files[0];
+  if(!file) return;
+  loadImageFile(file).then(function(img){
+    var dataUrl = trimAndScale(img, 900, 400);
+    state.logo = dataUrl;
+    lsSet('bgv_logo', dataUrl);
+    updateLogoUI();
+    scheduleRender();
+  }).catch(function(){ alert('Could not read logo image.'); });
+});
+$('removeLogo').addEventListener('click', function(){
+  state.logo = null;
+  lsRemove('bgv_logo');
+  $('logoFile').value = '';
+  updateLogoUI();
+  scheduleRender();
+});
+function updateLogoUI(){
+  if(state.logo){
+    $('logoPreview').src = state.logo;
+    $('logoPreviewWrap').style.display = 'flex';
+  } else {
+    $('logoPreviewWrap').style.display = 'none';
+  }
+}
+
+/* --- signature (separate slot per result type) --- */
+function sigKey(){ return state.result==='red' ? 'bgv_sig_red' : 'bgv_sig_green'; }
+function sigStateField(){ return state.result==='red' ? 'sigRed' : 'sigGreen'; }
+$('signatoryCheck').addEventListener('change', function(){
+  state.signatoryChecked = this.checked;
+  $('sigFile').disabled = !this.checked;
+  scheduleRender();
+});
+$('sigFile').addEventListener('change', function(e){
+  var file = e.target.files[0];
+  if(!file) return;
+  loadImageFile(file).then(function(img){
+    var dataUrl = trimAndScale(img, 500, 260);
+    state[sigStateField()] = dataUrl;
+    lsSet(sigKey(), dataUrl);
+    updateSigUI();
+    scheduleRender();
+  }).catch(function(){ alert('Could not read signature image.'); });
+});
+$('removeSig').addEventListener('click', function(){
+  state[sigStateField()] = null;
+  lsRemove(sigKey());
+  $('sigFile').value = '';
+  updateSigUI();
+  scheduleRender();
+});
+function updateSigUI(){
+  $('sigTargetLabel').textContent = state.result==='red' ? '(for Red report)' : '(for Green report)';
+  var current = state[sigStateField()];
+  if(current){
+    $('sigPreview').src = current;
+    $('sigPreviewWrap').style.display = 'flex';
+  } else {
+    $('sigPreviewWrap').style.display = 'none';
+  }
+  $('sigFile').value = '';
+}
+
+/* --- load persisted images on open --- */
+(function loadPersisted(){
+  var logo = lsGet('bgv_logo');
+  if(logo){ state.logo = logo; updateLogoUI(); }
+  state.sigRed = lsGet('bgv_sig_red');
+  state.sigGreen = lsGet('bgv_sig_green');
+  updateSigUI();
+})();
+
+/* --- cases --- */
+function renderCaseForm(){
+  var wrap = $('casesList');
+  wrap.innerHTML = '';
+  state.cases.forEach(function(c, idx){
+    var card = document.createElement('div');
+    card.className = 'case-card';
+    card.innerHTML =
+      '<div class="case-head"><strong>Case ' + (idx+1) + '</strong>' +
+      (state.cases.length>1 ? '<button type="button" class="remove-case" data-idx="'+idx+'">Remove</button>' : '') +
+      '</div>' +
+      caseField('Case number','caseNumber',idx,c.caseNumber) +
+      caseField('Court','court',idx,c.court) +
+      caseField('State','state',idx,c.state) +
+      caseField('District','district',idx,c.district) +
+      caseField('Act & Section','actSection',idx,c.actSection) +
+      caseField('Case type','caseType',idx,c.caseType) +
+      caseField('Filing date','filingDate',idx,c.filingDate) +
+      caseField('Petitioner','petitioner',idx,c.petitioner) +
+      caseField('Respondent','respondent',idx,c.respondent) +
+      caseField('Respondent line 2','respondentLine2',idx,c.respondentLine2) +
+      caseField('Status','status',idx,c.status) +
+      caseField('Nature of disposal','natureOfDisposal',idx,c.natureOfDisposal) +
+      caseField('Disposed of date','disposedOfDate',idx,c.disposedOfDate) +
+      caseTextarea('Match summary','matchSummary',idx,c.matchSummary) +
+      caseTextarea('Risk summary','riskSummary',idx,c.riskSummary) +
+      caseTextarea('Order summary','orderSummary',idx,c.orderSummary);
+    wrap.appendChild(card);
+  });
+  wrap.querySelectorAll('input[data-field]').forEach(function(inp){
+    inp.addEventListener('input', function(){
+      state.cases[+this.dataset.idx][this.dataset.field] = this.value;
+      scheduleRender();
+    });
+  });
+  wrap.querySelectorAll('textarea[data-field]').forEach(function(inp){
+    inp.addEventListener('input', function(){
+      state.cases[+this.dataset.idx][this.dataset.field] = this.value;
+      scheduleRender();
+    });
+  });
+  wrap.querySelectorAll('.remove-case').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      state.cases.splice(+this.dataset.idx,1);
+      renderCaseForm();
+      scheduleRender();
+    });
+  });
+}
+function caseField(label,field,idx,val){
+  return '<label>'+label+'</label><input type="text" data-field="'+field+'" data-idx="'+idx+'" value="'+escAttr(val)+'">';
+}
+function caseTextarea(label,field,idx,val){
+  return '<label>'+label+'</label><textarea data-field="'+field+'" data-idx="'+idx+'">'+escHtml(val)+'</textarea>';
+}
+$('addCase').addEventListener('click', function(){
+  state.cases.push(defaultCase());
+  renderCaseForm();
+  scheduleRender();
+});
+renderCaseForm();
+
+/* ---------------------------------------------------------------------- */
+/* Escaping helpers                                                        */
+/* ---------------------------------------------------------------------- */
+function escHtml(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escAttr(s){
+  return escHtml(s).replace(/"/g,'&quot;');
+}
+function nl2br(s){
+  return escHtml(s).replace(/\n/g,'<br>');
+}
+function linkify(s){
+  var esc = escHtml(s);
+  return esc.replace(/\n/g,'<br>').replace(/((?:https?:\/\/|www\.)[^\s<]+)/gi, function(m){
+    var href = m.indexOf('http')===0 ? m : 'http://'+m;
+    return '<a href="'+href+'" class="link" target="_blank" rel="noopener">'+m+'</a>';
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Risk-O-Meter gauge SVG                                                  */
+/* ---------------------------------------------------------------------- */
+function polar(cx,cy,r,angleDeg){
+  var a = angleDeg * Math.PI/180;
+  return { x: cx + r*Math.cos(a), y: cy - r*Math.sin(a) };
+}
+function arcPath(cx,cy,r1,r2,startDeg,endDeg){
+  var p1 = polar(cx,cy,r2,startDeg);
+  var p2 = polar(cx,cy,r2,endDeg);
+  var p3 = polar(cx,cy,r1,endDeg);
+  var p4 = polar(cx,cy,r1,startDeg);
+  var largeArc = Math.abs(startDeg-endDeg) > 180 ? 1 : 0;
+  return 'M '+p1.x+' '+p1.y+
+    ' A '+r2+' '+r2+' 0 '+largeArc+' 0 '+p2.x+' '+p2.y+
+    ' L '+p3.x+' '+p3.y+
+    ' A '+r1+' '+r1+' 0 '+largeArc+' 1 '+p4.x+' '+p4.y+' Z';
+}
+function buildGaugeSvg(level){
+  var cx=150,cy=140,R=108,r=58,cols=['#d7192b','#f18a1f','#fbc92d','#8dc63f','#139b48'];
+  var s='';
+  function pt(a,rad){ return [cx-rad*Math.cos(a), cy-rad*Math.sin(a)]; }
+  for(var i=0;i<5;i++){
+    var a0=(i*36+1)*Math.PI/180, a1=((i+1)*36-1)*Math.PI/180;
+    var p0=pt(a0,R), p1=pt(a1,R), p2=pt(a1,r), p3=pt(a0,r);
+    s+='<path d="M'+p0[0]+' '+p0[1]+' A'+R+' '+R+' 0 0 1 '+p1[0]+' '+p1[1]+' L'+p2[0]+' '+p2[1]+' A'+r+' '+r+' 0 0 0 '+p3[0]+' '+p3[1]+' Z" fill="'+cols[i]+'"/>';
+  }
+  var RO=132, pA=pt(0,RO), pB=pt(Math.PI,RO), pI=pt(Math.PI,R+2), pJ=pt(0,R+2);
+  s='<path d="M'+pA[0]+' '+pA[1]+' A'+RO+' '+RO+' 0 0 1 '+pB[0]+' '+pB[1]+' L'+pI[0]+' '+pI[1]+' A'+(R+2)+' '+(R+2)+' 0 0 0 '+pJ[0]+' '+pJ[1]+' Z" fill="#e8e8e8"/>'+s;
+  var labs=['Very High Risk','High Risk','Average Risk','Low Risk','No Risk'];
+  labs.forEach(function(t,i){
+    var a=(i*36+18);
+    var p=pt(a*Math.PI/180,120);
+    s+='<text x="'+p[0]+'" y="'+p[1]+'" font-family="Times New Roman,serif" font-size="10.5" text-anchor="middle" dominant-baseline="middle" transform="rotate('+(a-90)+' '+p[0]+' '+p[1]+')" fill="#222">'+t+'</text>';
+  });
+  var na=(level*36+18)*Math.PI/180, nTip=pt(na,96);
+  var perp=na+Math.PI/2, w=6;
+  var p1n=[cx+w*Math.cos(perp), cy-w*Math.sin(perp)];
+  var p2n=[cx-w*Math.cos(perp), cy+w*Math.sin(perp)];
+  s+='<path d="M'+p1n[0]+' '+p1n[1]+' L'+nTip[0]+' '+nTip[1]+' L'+p2n[0]+' '+p2n[1]+' Z" fill="#333"/><circle cx="'+cx+'" cy="'+cy+'" r="9" fill="#333"/><circle cx="'+cx+'" cy="'+cy+'" r="4.5" fill="#fff"/>';
+  return '<svg width="232" height="129" viewBox="10 0 280 150">'+s+'</svg>';
+}
+
+/* ---------------------------------------------------------------------- */
+/* Block builders                                                          */
+/* ---------------------------------------------------------------------- */
+function headerBlock(){
+  var left;
+  if(state.logo){
+    left = '<img class="logo-img" src="'+state.logo+'">';
+  } else {
+    left = '<div class="shield-name">' +
+      '<svg width="34" height="34" viewBox="0 0 24 24"><path d="M12 2 L21 6 V11 C21 16.5 17.2 20.7 12 22 C6.8 20.7 3 16.5 3 11 V6 Z" fill="#00a0d2"/><path d="M9.5 12.2 L11.2 14 L15 9.5" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+      '<span class="company-name">'+escHtml(state.companyName)+'</span></div>';
+  }
+  var right = '<div class="header-right">'+linkify(state.companyAddress)+'</div>';
+  return '<div class="blk"><div class="header-block"><div class="header-left">'+left+'</div>'+right+'</div><hr class="rpt-divider"></div>';
+}
+
+function profileBlock(){
+  var ref = escHtml(state.caseRefNo), date = escHtml(state.verificationDate);
+  var name = escHtml(state.pName), father = escHtml(state.pFatherName), dob = escHtml(state.pDob);
+  var address = nl2br(state.pAddress), alt = escHtml(state.pAltAddress);
+  return '<div class="blk">' +
+    '<div class="r-title">Profile Details</div>' +
+    '<div class="prof">' +
+      '<table class="t1">' +
+        '<tr><td class="l">Case RefNo</td><td>'+ref+'</td></tr>' +
+        '<tr><td class="l">Verification Date</td><td>'+date+'</td></tr>' +
+      '</table>' +
+      '<table class="t2">' +
+        '<tr><td class="l">Name</td><td class="v">'+name+'</td></tr>' +
+        '<tr><td class="l">Father\'s Name:</td><td class="v">'+father+'</td></tr>' +
+        '<tr><td class="l">Date of Birth:</td><td class="v">'+dob+'</td></tr>' +
+        '<tr><td class="l" style="height:62px">Address</td><td class="v">'+address+'</td></tr>' +
+        '<tr><td class="l">Alternate Address</td><td class="v">'+alt+'</td></tr>' +
+      '</table>' +
+    '</div>' +
+    '<div class="hr"></div>' +
+  '</div>';
+}
+
+function resultsBlock(){
+  var n = state.cases.length;
+  var isRed = state.result==='red';
+  var body;
+  if(isRed){
+    body = '<span class="pill orange">High Risk</span><span class="res-txt">: '+escHtml(state.pName)+' has '+n+' Criminal Courts registered</span>';
+  } else {
+    body = '<span class="pill green">No Risk</span><span class="res-txt">: As per our court records search, there are <b>no cases</b> found against or instituted by the subject.</span>';
+  }
+  return '<div class="blk"><div class="r-title">Results</div><div class="results">'+body+'</div></div>';
+}
+
+function meterBlock(){
+  var isRed = state.result==='red';
+  var inds=[
+   ['No Risk','#2e7d32','There is no risk involved in hiring the person as per the court records.'],
+   ['Low Risk','#a6c93a','There is low risk involved in hiring the person as per the court records.'],
+   ['Average Risk','#f2c318','There is moderate risk involved in hiring the person. The person can be hired with close monitoring.'],
+   ['High Risk','#e3862a','There is high risk involved in hiring the person. The person can be hired only with adequate checks.'],
+   ['Very High Risk','#e0282e','There is very high risk involved in hiring the person. May refrain from hiring him.']];
+  var selIdx = isRed ? 3 : 0;
+  var lv = isRed ? 1 : 4;
+  var gauge = buildGaugeSvg(lv);
+  var mt='<table class="meter"><tr><th style="width:238px">Risk-O-Meter</th><th style="width:132px">Risk Indicator</th><th>Guide to Interpretation</th></tr>';
+  inds.forEach(function(r,i){
+    mt+='<tr class="'+(i===selIdx?'sel':'')+'">'
+      +(i===0?'<td rowspan="5" style="text-align:center;padding:4px">'+gauge+'</td>':'')
+      +'<td class="ind" style="color:'+r[1]+'">'+(i===selIdx?'<span class="arrow"></span>':'')+r[0]+'</td>'
+      +'<td class="gd">'+r[2]+'</td></tr>';
+  });
+  mt+='</table><div class="hr"></div>';
+  return '<div class="blk">'+mt+'</div>';
+}
+
+function caseDetailsTitleBlock(){
+  return '<div class="blk"><div class="rpt-section-title">Case Details</div>' +
+    '<table class="rpt-table"><colgroup>' +
+    '<col style="width:9%"><col style="width:26%"><col style="width:22%"><col style="width:25%"><col style="width:18%">' +
+    '</colgroup><thead><tr><th>S. No</th><th>Case Details</th><th>Petitioner</th><th>Respondent</th><th>Status</th></tr></thead></table></div>';
+}
+
+function caseDetailsGreenBlock(){
+  return '<div class="blk"><div class="rpt-section-title">Case Details</div>' +
+    '<table class="rpt-table"><colgroup>' +
+    '<col style="width:9%"><col style="width:26%"><col style="width:22%"><col style="width:25%"><col style="width:18%">' +
+    '</colgroup><thead><tr><th>S. No</th><th>Case Details</th><th>Petitioner</th><th>Respondent</th><th>Status</th></tr></thead>' +
+    '<tbody><tr><td>1</td><td>No Cases</td><td>-</td><td>-</td><td>-</td></tr></tbody></table></div>';
+}
+
+function caseRowBlock(c, idx){
+  var caseDetails = '<div class="case-num">'+escHtml(c.caseNumber)+'</div>' +
+    '<div>'+escHtml(c.court)+' / '+escHtml(c.state)+' / '+escHtml(c.district)+'</div>' +
+    '<div>'+escHtml(c.actSection)+'</div>' +
+    '<div>'+escHtml(c.caseType)+'</div>' +
+    '<div>Filing Date: '+escHtml(c.filingDate)+'</div>';
+  var respondent = escHtml(c.respondent) + (c.respondentLine2 ? '<br>'+escHtml(c.respondentLine2) : '');
+  var statusCell = '<div class="status-cell"><b>'+escHtml(c.status)+'</b>' +
+    'Nature of Disposal - '+escHtml(c.natureOfDisposal)+'<br>' +
+    'Disposed of Date : '+escHtml(c.disposedOfDate)+'</div>';
+  var html = '<div class="blk"><table class="rpt-table"><colgroup>' +
+    '<col style="width:9%"><col style="width:26%"><col style="width:22%"><col style="width:25%"><col style="width:18%">' +
+    '</colgroup><tbody>' +
+    '<tr><td>'+(idx+1)+'</td><td>'+caseDetails+'</td><td>'+escHtml(c.petitioner)+'</td><td>'+respondent+'</td><td>'+statusCell+'</td></tr>' +
+    '<tr><td></td><td colspan="4"><span class="case-pill">HIGH RISK</span><br><br>' +
+    '<b>Match Summary:</b> '+escHtml(c.matchSummary)+'<br>' +
+    '<b>Risk Summary:</b> '+escHtml(c.riskSummary)+'<br>' +
+    '<b>Order Summary:</b> '+escHtml(c.orderSummary)+'</td></tr>' +
+    '</tbody></table></div>';
+  return html;
+}
+
+function courtListTitleBlock(){
+  return '<div class="blk"><div class="rpt-section-title">Court Lists</div>' +
+    '<table class="rpt-table"><colgroup><col style="width:22%"><col style="width:48%"><col style="width:13%"><col style="width:17%"></colgroup>' +
+    '<thead><tr><th>Court</th><th>Jurisdiction</th><th>Cases since</th><th>Status</th></tr></thead></table></div>';
+}
+
+function groupHeaderBlock(groupName){
+  return '<div class="blk"><table class="rpt-table"><colgroup><col style="width:22%"><col style="width:48%"><col style="width:13%"><col style="width:17%"></colgroup>' +
+    '<tbody><tr class="group-row"><td colspan="4">'+escHtml(groupName)+'</td></tr></tbody></table></div>';
+}
+
+function courtRowBlock(row, rowIndexGlobal){
+  var jurisdiction = row.key==='cibil' ? (state.result==='red' ? row.jurisdictionRed : row.jurisdictionGreen) : row.jurisdiction;
+  var name = row.key==='cibil' ? (state.result==='red' ? 'CIBIL Willful Defaulter List' : 'CIBIL Defaulter List') : row.name;
+  var status = 'No Case Found';
+  if(row.key==='criminal' && state.result==='red'){
+    status = state.cases.length + ' case(s) found';
+  }
+  var rowClass = rowIndexGlobal % 2 === 1 ? 'grey-row' : '';
+  return '<div class="blk"><table class="rpt-table"><colgroup><col style="width:22%"><col style="width:48%"><col style="width:13%"><col style="width:17%"></colgroup>' +
+    '<tbody><tr class="'+rowClass+'"><td>'+escHtml(name)+'</td><td>'+jurisdiction+'</td><td>'+escHtml(row.since)+'</td><td>'+status+'</td></tr></tbody></table></div>';
+}
+
+function signatureBlock(){
+  var sig = state.result==='red' ? state.sigRed : state.sigGreen;
+  var inner;
+  if(state.signatoryChecked && sig){
+    inner = '<img src="'+sig+'">';
+  } else {
+    inner = '<div class="sig-box">Signature / stamp</div>';
+  }
+  return '<div class="blk"><hr class="rpt-divider"><div class="sig-area">'+inner+'</div></div>';
+}
+
+function disclaimerBlock(){
+  var text;
+  if(state.result==='red'){
+    text = 'This report has been generated based on a search of publicly available court records, tribunal records and defaulter databases, including approximately 2.7 Crore eFIRs from various state Police department online records, using the name, father\'s name, date of birth and address details provided by the subject / client. Court records in India are dependent on manual data entry by respective court registries and may not always be complete, updated or free of errors. This report is a sample generated for demonstration purposes only and should not be relied upon for any employment, credit or legal decision.';
+  } else {
+    text = 'This report has been generated based on a search of publicly available court records, tribunal records and defaulter databases using the name, father\'s name, date of birth and address details provided by the subject / client. Court records in India are dependent on manual data entry by respective court registries and may not always be complete, updated or free of errors. This report is a sample generated for demonstration purposes only and should not be relied upon for any employment, credit or legal decision.';
+  }
+  return '<div class="blk"><hr class="rpt-divider"><div class="disclaimer">'+text+'</div></div>';
+}
+
+/* ---------------------------------------------------------------------- */
+/* Build full block list                                                   */
+/* ---------------------------------------------------------------------- */
+function buildBlocks(){
+  var blocks = [];
+  blocks.push({ html: headerBlock(), breakBefore:false });
+  blocks.push({ html: profileBlock(), breakBefore:false });
+  blocks.push({ html: resultsBlock(), breakBefore:false });
+  blocks.push({ html: meterBlock(), breakBefore:false });
+
+  if(state.result==='red'){
+    blocks.push({ html: caseDetailsTitleBlock(), breakBefore:true });
+    state.cases.forEach(function(c, idx){
+      blocks.push({ html: caseRowBlock(c, idx), breakBefore:false });
+    });
+  } else {
+    blocks.push({ html: caseDetailsGreenBlock(), breakBefore:false });
+  }
+
+  blocks.push({ html: courtListTitleBlock(), breakBefore:false });
+  var globalRowIdx = 0;
+  COURT_GROUPS.forEach(function(g){
+    blocks.push({ html: groupHeaderBlock(g.name), breakBefore:false });
+    g.rows.forEach(function(r){
+      blocks.push({ html: courtRowBlock(r, globalRowIdx), breakBefore:false });
+      globalRowIdx++;
+    });
+  });
+  if(state.result==='red'){
+    blocks.push({ html: groupHeaderBlock(OTHERS_GROUP.name), breakBefore:false });
+    OTHERS_GROUP.rows.forEach(function(r){
+      blocks.push({ html: courtRowBlock(r, globalRowIdx), breakBefore:false });
+      globalRowIdx++;
+    });
+  }
+
+  blocks.push({ html: signatureBlock(), breakBefore:false });
+  blocks.push({ html: disclaimerBlock(), breakBefore:false });
+
+  return blocks;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Measurement + pagination                                                */
+/* ---------------------------------------------------------------------- */
+var MAX_CONTENT_HEIGHT = 1123 - 52 - 100;
+
+function measureBlocks(blocks){
+  var box = $('measureBox');
+  box.innerHTML = '';
+  var wrappers = blocks.map(function(b){
+    var d = document.createElement('div');
+    d.innerHTML = b.html;
+    box.appendChild(d.firstChild || d);
+    return box.lastChild;
+  });
+  var heights = wrappers.map(function(w){ return w.getBoundingClientRect().height; });
+  box.innerHTML = '';
+  return heights;
+}
+
+function paginate(blocks){
+  var heights = measureBlocks(blocks);
+  var pages = [[]];
+  var currentHeight = 0;
+  blocks.forEach(function(b, i){
+    var h = heights[i];
+    var needsBreak = b.breakBefore && currentHeight > 0;
+    if(!needsBreak && currentHeight > 0 && (currentHeight + h) > MAX_CONTENT_HEIGHT){
+      needsBreak = true;
+    }
+    if(needsBreak){
+      pages.push([]);
+      currentHeight = 0;
+    }
+    pages[pages.length-1].push(b.html);
+    currentHeight += h;
+  });
+  return pages;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Render preview                                                          */
+/* ---------------------------------------------------------------------- */
+function renderPreview(){
+  var blocks = buildBlocks();
+  var pages = paginate(blocks);
+  var total = pages.length;
+  var container = $('preview');
+  container.innerHTML = '';
+  pages.forEach(function(pageBlocks, i){
+    var page = document.createElement('div');
+    page.className = 'page';
+    var content = document.createElement('div');
+    content.className = 'page-content';
+    content.innerHTML = pageBlocks.join('');
+    page.appendChild(content);
+    var footer = document.createElement('div');
+    footer.className = 'page-footer';
+    footer.innerHTML =
+      '<span></span>' +
+      '<span>'+(i+1)+'/'+total+'</span>' +
+      '<span></span>';
+    page.appendChild(footer);
+    container.appendChild(page);
+  });
+}
+
+renderPreview();
+
+/* ---------------------------------------------------------------------- */
+/* PDF export                                                              */
+/* ---------------------------------------------------------------------- */
+function exportPagesAsPdf(filename){
+  return new Promise(function(resolve, reject){
+    var pageEls = Array.prototype.slice.call(document.querySelectorAll('#preview .page'));
+    if(pageEls.length===0){ reject(new Error('Nothing to export.')); return; }
+    var jsPDFCtor = (window.jspdf && window.jspdf.jsPDF) ? window.jspdf.jsPDF : window.jsPDF;
+    var pdf = new jsPDFCtor({ unit:'pt', format:'a4', orientation:'portrait' });
+    var pageW = 595.28, pageH = 841.89;
+    function processPage(idx){
+      if(idx >= pageEls.length){
+        pdf.save(filename);
+        resolve();
+        return;
+      }
+      html2canvas(pageEls[idx], { scale:2, useCORS:true, backgroundColor:'#ffffff' }).then(function(canvas){
+        var imgData = canvas.toDataURL('image/jpeg', 0.95);
+        if(idx>0) pdf.addPage();
+        pdf.addImage(imgData, 'JPEG', 0, 0, pageW, pageH);
+        processPage(idx+1);
+      }).catch(reject);
+    }
+    processPage(0);
+  });
+}
+
+function pdfFilenameFor(name, result, suffix){
+  var safeName = (name || 'Report').trim().replace(/[^a-z0-9]+/gi,'_');
+  var riskSuffix = result==='red' ? 'HighRisk_SAMPLE' : 'NoRisk_SAMPLE';
+  return safeName + (suffix ? '_'+suffix : '') + '_' + riskSuffix + '.pdf';
+}
+
+$('downloadPdf').addEventListener('click', function(){
+  var btn = this;
+  var statusEl = $('pdfStatus');
+  statusEl.textContent = '';
+  statusEl.classList.remove('err-note');
+  btn.disabled = true;
+  btn.textContent = 'Generating PDF…';
+  exportPagesAsPdf(pdfFilenameFor(state.pName, state.result, null)).then(function(){
+    btn.disabled = false;
+    btn.textContent = 'Download PDF';
+    statusEl.textContent = 'Done.';
+  }).catch(function(err){
+    statusEl.classList.add('err-note');
+    statusEl.textContent = 'Error generating PDF: ' + (err && err.message ? err.message : err);
+    btn.disabled = false;
+    btn.textContent = 'Download PDF';
+  });
+});
+
+/* ---------------------------------------------------------------------- */
+/* Bulk generation from Excel                                              */
+/* ---------------------------------------------------------------------- */
+var bulkRows = null;
+
+function normalizeHeader(h){
+  return String(h==null?'':h).toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+
+var FIELD_ALIASES = {
+  result: ['result','reporttype','risk','redgreen','reportresult'],
+  refno: ['caserefno','refno','caseref','referenceno','reference'],
+  date: ['verificationdate','date'],
+  name: ['name','candidatename','subjectname'],
+  father: ['fathersname','fathername'],
+  dob: ['dateofbirth','dob'],
+  address: ['address','currentaddress'],
+  altaddress: ['alternateaddress','altaddress'],
+  caseNumber: ['casenumber','caseno'],
+  court: ['court'],
+  stateField: ['state'],
+  district: ['district'],
+  actSection: ['actsection','actandsection','section'],
+  caseType: ['casetype','type'],
+  filingDate: ['filingdate'],
+  petitioner: ['petitioner'],
+  respondent: ['respondent'],
+  respondentLine2: ['respondentline2'],
+  status: ['status'],
+  natureOfDisposal: ['natureofdisposal'],
+  disposedOfDate: ['disposedofdate'],
+  matchSummary: ['matchsummary'],
+  riskSummary: ['risksummary'],
+  orderSummary: ['ordersummary']
+};
+
+function buildHeaderMap(rawHeaders){
+  var map = {};
+  rawHeaders.forEach(function(h){
+    var norm = normalizeHeader(h);
+    Object.keys(FIELD_ALIASES).forEach(function(key){
+      if(FIELD_ALIASES[key].indexOf(norm)!==-1){ map[key]=h; }
+    });
+  });
+  return map;
+}
+
+function rowValue(row, map, key){
+  var h = map[key];
+  if(!h) return '';
+  var v = row[h];
+  return v==null ? '' : String(v).trim();
+}
+
+$('bulkFile').addEventListener('change', function(e){
+  var file = e.target.files[0];
+  var statusEl = $('bulkStatus');
+  statusEl.classList.remove('err-note');
+  if(!file){ bulkRows=null; $('bulkGenerate').disabled=true; return; }
+  var reader = new FileReader();
+  reader.onload = function(ev){
+    try{
+      var data = new Uint8Array(ev.target.result);
+      var wb = XLSX.read(data, {type:'array'});
+      var sheet = wb.Sheets[wb.SheetNames[0]];
+      var rows = XLSX.utils.sheet_to_json(sheet, {defval:''});
+      if(rows.length===0){ throw new Error('No rows found in the first sheet.'); }
+      var headers = Object.keys(rows[0]);
+      var map = buildHeaderMap(headers);
+      if(!map.name){ throw new Error('Could not find a "Name" column in the sheet.'); }
+      bulkRows = { rows: rows, map: map };
+      statusEl.textContent = rows.length + ' row(s) loaded.';
+      $('bulkGenerate').disabled = false;
+    }catch(err){
+      bulkRows = null;
+      $('bulkGenerate').disabled = true;
+      statusEl.classList.add('err-note');
+      statusEl.textContent = 'Could not read file: ' + (err && err.message ? err.message : err);
+    }
+  };
+  reader.onerror = function(){
+    statusEl.classList.add('err-note');
+    statusEl.textContent = 'Could not read file.';
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+function rowToReportState(row, map){
+  var resultRaw = rowValue(row, map, 'result').toLowerCase();
+  var isGreen = /green|no\s*risk|norisk/.test(resultRaw);
+  var result = isGreen ? 'green' : 'red';
+  var name = rowValue(row, map, 'name');
+  var caseObj = null;
+  if(result==='red'){
+    caseObj = {
+      caseNumber: rowValue(row,map,'caseNumber'),
+      court: rowValue(row,map,'court'),
+      state: rowValue(row,map,'stateField'),
+      district: rowValue(row,map,'district'),
+      actSection: rowValue(row,map,'actSection'),
+      caseType: rowValue(row,map,'caseType'),
+      filingDate: rowValue(row,map,'filingDate'),
+      petitioner: rowValue(row,map,'petitioner'),
+      respondent: rowValue(row,map,'respondent') || name,
+      respondentLine2: rowValue(row,map,'respondentLine2'),
+      status: rowValue(row,map,'status'),
+      natureOfDisposal: rowValue(row,map,'natureOfDisposal'),
+      disposedOfDate: rowValue(row,map,'disposedOfDate'),
+      matchSummary: rowValue(row,map,'matchSummary'),
+      riskSummary: rowValue(row,map,'riskSummary'),
+      orderSummary: rowValue(row,map,'orderSummary')
+    };
+  }
+  return {
+    result: result,
+    caseRefNo: rowValue(row,map,'refno'),
+    verificationDate: rowValue(row,map,'date'),
+    pName: name,
+    pFatherName: rowValue(row,map,'father'),
+    pDob: rowValue(row,map,'dob'),
+    pAddress: rowValue(row,map,'address'),
+    pAltAddress: rowValue(row,map,'altaddress') || 'Not Provided',
+    cases: caseObj ? [caseObj] : []
+  };
+}
+
+function waitFrame(){
+  return new Promise(function(resolve){ setTimeout(resolve, 80); });
+}
+
+$('bulkGenerate').addEventListener('click', function(){
+  if(!bulkRows) return;
+  var btn = this;
+  var statusEl = $('bulkStatus');
+  statusEl.classList.remove('err-note');
+  btn.disabled = true;
+
+  var snapshot = {
+    result: state.result, caseRefNo: state.caseRefNo, verificationDate: state.verificationDate,
+    pName: state.pName, pFatherName: state.pFatherName, pDob: state.pDob,
+    pAddress: state.pAddress, pAltAddress: state.pAltAddress, cases: state.cases
+  };
+
+  var rows = bulkRows.rows, map = bulkRows.map;
+  var idx = 0, okCount = 0, failCount = 0;
+
+  function next(){
+    if(idx >= rows.length){
+      Object.assign(state, snapshot);
+      renderPreview();
+      btn.disabled = false;
+      statusEl.textContent = 'Done: ' + okCount + ' generated, ' + failCount + ' failed.';
+      if(failCount>0) statusEl.classList.add('err-note');
+      return;
+    }
+    var row = rows[idx];
+    var rowData = rowToReportState(row, map);
+    Object.assign(state, rowData);
+    statusEl.textContent = 'Generating ' + (idx+1) + ' of ' + rows.length + ': ' + (rowData.pName || '(no name)') + '…';
+    renderPreview();
+    waitFrame().then(function(){
+      return exportPagesAsPdf(pdfFilenameFor(rowData.pName, rowData.result, rowData.caseRefNo));
+    }).then(function(){
+      okCount++;
+    }).catch(function(err){
+      failCount++;
+      console.error('Row '+(idx+1)+' failed:', err);
+    }).then(function(){
+      idx++;
+      setTimeout(next, 400);
+    });
+  }
+  next();
+});
+
+})();
+</script>
+</body>
+</html>

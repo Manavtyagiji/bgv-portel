@@ -1,0 +1,100 @@
+// bgv-backend/controllers/dailyUploadController.js
+// Additive only — does not touch uploadController.js or any existing collection.
+
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import DailyUpload from "../models/DailyUpload.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+const EXCEL_DIR = path.join(__dirname, "..", "uploads-excel");
+
+// Same scoping logic as getScopeFilter in uploadController.js:
+// superadmin → no filter; admin/team → filter by tenantId.
+function getScopeFilter(req) {
+  const role = String(req.user?.role || "").toLowerCase();
+  if (role === "superadmin") return {};
+  return { tenantId: req.user?.tenantId || null };
+}
+
+// POST /api/daily-uploads
+// Receives the raw .xlsx file from the frontend after a successful daily import.
+// Saves file to disk (already done by multer) and creates a DailyUpload document.
+// This is called fire-and-forget from the frontend — a failure here does NOT
+// affect the rows that were already imported.
+export async function saveDailyExcel(req, res) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const { totalRows = 0, importedRows = 0, tenantId = "" } = req.body;
+
+    const doc = await DailyUpload.create({
+      originalFilename: req.file.originalname,
+      filePath:         req.file.filename,
+      uploaderEmail:    req.user?.email || "unknown",
+      uploaderRole:     req.user?.role  || "",
+      tenantId:         tenantId || req.user?.tenantId || "",
+      totalRows:        Number(totalRows)   || 0,
+      importedRows:     Number(importedRows) || 0,
+    });
+
+    return res.json({ ok: true, id: doc._id });
+  } catch (err) {
+    console.error("saveDailyExcel error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// GET /api/daily-uploads
+// Lists uploads newest-first, scoped by role/tenant.
+export async function listDailyUploads(req, res) {
+  try {
+    const filter = getScopeFilter(req);
+    const docs = await DailyUpload.find(filter)
+      .sort({ createdAt: -1 })
+      .select("-__v")
+      .lean();
+    return res.json({ uploads: docs });
+  } catch (err) {
+    console.error("listDailyUploads error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// GET /api/daily-uploads/:id/download
+// Streams the saved .xlsx back with auth + scope check.
+export async function downloadDailyUpload(req, res) {
+  try {
+    const doc = await DailyUpload.findById(req.params.id).lean();
+    if (!doc) return res.status(404).json({ error: "Upload not found" });
+
+    // Scope check — superadmin can download any; others only their own tenant
+    const role = String(req.user?.role || "").toLowerCase();
+    if (role !== "superadmin") {
+      if (String(doc.tenantId || "") !== String(req.user?.tenantId || "")) {
+        return res.status(403).json({ error: "Not allowed" });
+      }
+    }
+
+    const filePath = path.join(EXCEL_DIR, doc.filePath);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "File not found on disk" });
+    }
+
+    const ext = path.extname(doc.originalFilename).toLowerCase();
+    const mime = ext === ".xls"
+      ? "application/vnd.ms-excel"
+      : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(doc.originalFilename)}`);
+    res.setHeader("Content-Type", mime);
+    fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    console.error("downloadDailyUpload error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}

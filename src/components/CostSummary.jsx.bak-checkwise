@@ -1,0 +1,1966 @@
+import { useState, useEffect, useMemo } from "react";
+import * as XLSX from "xlsx";
+import { saveAs } from "file-saver";
+import { pricingAPI, uploadAPI } from "../api/api";
+import { idbGet, idbSet } from "../utils/idbCache";
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+.cs-root * { box-sizing: border-box; margin: 0; padding: 0; }
+.cs-root {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  color: #0f1c3f;
+  padding: 24px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.cs-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.cs-tab-group {
+  display: flex;
+  background: rgba(37,99,235,0.06);
+  border: 1.5px solid rgba(37,99,235,0.18);
+  border-radius: 10px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.cs-tab {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px; font-weight: 600;
+  padding: 9px 20px; cursor: pointer;
+  border: none; background: transparent;
+  color: #8ba3c0;
+  transition: all 0.18s cubic-bezier(.4,0,.2,1);
+  display: flex; align-items: center; gap: 7px;
+  white-space: nowrap;
+}
+.cs-tab:hover { color: #2563eb; background: rgba(37,99,235,0.07); }
+.cs-tab.active { background: linear-gradient(135deg,#2563eb,#06b6d4); color: #fff; }
+.cs-select {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 13.5px; background: #f8faff;
+  border: 1.5px solid rgba(59,130,246,0.22);
+  border-radius: 8px; padding: 9px 32px 9px 13px;
+  color: #0f1c3f; outline: none; cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center;
+  transition: all 0.18s;
+}
+.cs-select:focus { background-color: #fff; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.09); }
+.cs-select option { background: #fff; }
+.cs-view-toggle {
+  display: inline-flex;
+  background: rgba(37,99,235,0.06);
+  border: 1.5px solid rgba(37,99,235,0.18);
+  border-radius: 10px; overflow: hidden;
+}
+.cs-view-btn {
+  border: none; background: transparent;
+  padding: 9px 16px; cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px; font-weight: 600;
+  color: #8ba3c0;
+  transition: all 0.18s cubic-bezier(.4,0,.2,1);
+}
+.cs-view-btn:hover { color: #2563eb; background: rgba(37,99,235,0.07); }
+.cs-view-btn.active { background: linear-gradient(135deg,#2563eb,#06b6d4); color: #fff; }
+.cs-export-btn {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px; font-weight: 600;
+  border: none; border-radius: 8px;
+  padding: 9px 17px; cursor: pointer;
+  background: linear-gradient(135deg,#10b981,#34d399);
+  color: #001a0d;
+  box-shadow: 0 4px 12px rgba(16,185,129,0.22);
+  display: inline-flex; align-items: center; gap: 6px;
+  transition: all 0.18s; margin-left: auto;
+}
+.cs-export-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.cs-export-btn:active { transform: scale(0.97); }
+.cs-grand-strip { display: flex; gap: 14px; flex-wrap: wrap; }
+.cs-grand-card {
+  flex: 1; min-width: 180px; border-radius: 14px;
+  padding: 18px 22px; display: flex; align-items: center; gap: 14px;
+  position: relative; overflow: hidden;
+}
+.cs-grand-card-vendor {
+  background: linear-gradient(135deg,rgba(37,99,235,0.08),rgba(6,182,212,0.06));
+  border: 1.5px solid rgba(37,99,235,0.20);
+  box-shadow: 0 4px 20px rgba(37,99,235,0.08);
+}
+.cs-grand-card-client {
+  background: linear-gradient(135deg,rgba(16,185,129,0.08),rgba(52,211,153,0.05));
+  border: 1.5px solid rgba(16,185,129,0.22);
+  box-shadow: 0 4px 20px rgba(16,185,129,0.08);
+}
+.cs-grand-icon {
+  width: 44px; height: 44px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; flex-shrink: 0;
+}
+.cs-grand-icon-vendor { background: rgba(37,99,235,0.12); border: 1px solid rgba(37,99,235,0.22); }
+.cs-grand-icon-client { background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.22); }
+.cs-grand-label {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.09em; color: #8ba3c0;
+}
+.cs-grand-value {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 30px; font-weight: 700;
+  line-height: 1.15; margin-top: 2px; letter-spacing: -0.5px;
+}
+.cs-grand-value-vendor {
+  background: linear-gradient(135deg,#2563eb,#06b6d4);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.cs-grand-value-client {
+  background: linear-gradient(135deg,#10b981,#34d399);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.cs-grand-count { font-size: 12px; color: #8ba3c0; font-family: 'Space Grotesk', sans-serif; margin-top: 3px; }
+.cs-closed-notice {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(20,184,166,0.09); border: 1px solid rgba(20,184,166,0.28);
+  color: #0d9488; font-family: 'Space Grotesk', sans-serif;
+  font-size: 11.5px; font-weight: 700; padding: 5px 14px; border-radius: 99px;
+}
+.cs-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 16px;
+}
+.cs-company-card {
+  background: #ffffff;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  border-radius: 14px; overflow: hidden;
+  box-shadow: 0 2px 12px rgba(37,99,235,0.07);
+  transition: all 0.2s cubic-bezier(.4,0,.2,1);
+}
+.cs-company-card:hover { box-shadow: 0 8px 32px rgba(37,99,235,0.13); transform: translateY(-2px); }
+.cs-company-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid rgba(59,130,246,0.12);
+}
+.cs-company-avatar {
+  width: 36px; height: 36px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px; font-weight: 700; color: #fff; flex-shrink: 0;
+}
+.cs-avatar-vendor { background: linear-gradient(135deg,#2563eb,#06b6d4); }
+.cs-avatar-client { background: linear-gradient(135deg,#10b981,#34d399); }
+.cs-company-name {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px; font-weight: 700; color: #0f1c3f;
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cs-company-name.clickable { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.cs-company-total { font-family: 'Space Grotesk', sans-serif; font-size: 16px; font-weight: 700; white-space: nowrap; }
+.cs-company-total-vendor { color: #2563eb; }
+.cs-company-total-client { color: #059669; }
+.cs-month-rows { padding: 10px 0 6px; }
+.cs-month-row { display: flex; align-items: center; padding: 7px 18px; transition: background 0.12s; }
+.cs-month-row.clickable { cursor: pointer; }
+.cs-month-row:hover { background: #f0f6ff; }
+.cs-month-label { font-family: 'Space Grotesk', sans-serif; font-size: 12px; font-weight: 600; color: #4a6080; min-width: 80px; }
+.cs-month-bar-wrap { flex: 1; height: 6px; background: rgba(59,130,246,0.10); border-radius: 99px; overflow: hidden; margin: 0 12px; }
+.cs-month-bar { height: 100%; border-radius: 99px; }
+.cs-bar-vendor { background: linear-gradient(135deg,#2563eb,#06b6d4); }
+.cs-bar-client { background: linear-gradient(135deg,#10b981,#34d399); }
+.cs-month-amount { font-family: 'Space Grotesk', sans-serif; font-size: 12px; font-weight: 700; min-width: 60px; text-align: right; }
+.cs-amount-vendor { color: #2563eb; }
+.cs-amount-client { color: #059669; }
+.cs-month-count { font-size: 12px; color: #8ba3c0; min-width: 64px; text-align: right; }
+.cs-table-wrap {
+  background: #ffffff;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  border-radius: 14px; overflow: hidden;
+  box-shadow: 0 2px 12px rgba(37,99,235,0.07);
+}
+.cs-table-scroll { overflow: auto; }
+.cs-table { width: 100%; border-collapse: collapse; min-width: 720px; }
+.cs-thead tr { background: linear-gradient(135deg,#1d4ed8 0%,#0891b2 100%); }
+.cs-th {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.09em;
+  color: rgba(255,255,255,0.82);
+  padding: 14px 18px; text-align: left; white-space: nowrap;
+}
+.cs-tr { border-bottom: 1px solid rgba(59,130,246,0.10); transition: background 0.15s; }
+.cs-tr:hover { background: #eef4ff; }
+.cs-td { padding: 14px 18px; font-size: 13px; color: #0f1c3f; white-space: nowrap; }
+.cs-td-name { font-family: 'Space Grotesk', sans-serif; font-weight: 700; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.cs-td-amount-vendor { color: #2563eb; font-weight: 700; }
+.cs-td-amount-client { color: #059669; font-weight: 700; }
+.cs-empty {
+  border: 1.5px dashed rgba(59,130,246,0.22);
+  background: linear-gradient(135deg,rgba(37,99,235,0.04),rgba(6,182,212,0.03));
+  border-radius: 16px; padding: 36px 20px; text-align: center;
+}
+.cs-empty-icon { font-size: 28px; margin-bottom: 8px; }
+.cs-empty-text { font-family: 'Space Grotesk', sans-serif; font-size: 18px; font-weight: 700; color: #0f1c3f; }
+.cs-empty-sub { font-size: 13px; color: #8ba3c0; margin-top: 6px; }
+.cs-detail-overlay {
+  position: fixed; inset: 0;
+  background: rgba(15,28,63,0.45); backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; z-index: 9999;
+}
+.cs-detail-box {
+  width: 100%; max-width: 1250px; max-height: 88vh; overflow: hidden;
+  background: #fff; border-radius: 18px;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  box-shadow: 0 24px 80px rgba(37,99,235,0.18);
+  display: flex; flex-direction: column;
+}
+.cs-detail-head {
+  padding: 18px 22px; border-bottom: 1px solid rgba(59,130,246,0.14);
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap;
+}
+.cs-detail-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 18px; color: #0f1c3f; }
+.cs-detail-sub { font-size: 13px; color: #6b7a99; margin-top: 4px; }
+.cs-detail-actions { display: flex; gap: 10px; align-items: center; }
+.cs-close-btn {
+  border: 1px solid rgba(59,130,246,0.18); border-radius: 8px;
+  padding: 10px 14px; cursor: pointer; background: #fff;
+  color: #0f1c3f; font-weight: 700; font-family: 'Space Grotesk', sans-serif;
+}
+.cs-detail-scroll { overflow: auto; }
+.cs-detail-table { width: 100%; border-collapse: collapse; min-width: 1550px; }
+.cs-detail-thead tr { background: linear-gradient(135deg,#1d4ed8,#0891b2); }
+.cs-detail-th {
+  padding: 12px 14px; text-align: left;
+  color: rgba(255,255,255,0.88);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  white-space: nowrap; font-family: 'Space Grotesk', sans-serif;
+}
+.cs-detail-tr { border-bottom: 1px solid rgba(59,130,246,0.08); }
+.cs-detail-tr:nth-child(even) { background: #f8fbff; }
+.cs-detail-td { padding: 12px 14px; font-size: 13px; white-space: nowrap; color: #0f1c3f; }
+
+/* ── Month Picker Modal ── */
+.cs-month-picker-box {
+  background: #fff; border-radius: 18px;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  box-shadow: 0 24px 80px rgba(37,99,235,0.18);
+  padding: 28px 32px; min-width: 320px; max-width: 440px; width: 100%;
+}
+.cs-month-picker-title {
+  font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+  font-size: 17px; color: #0f1c3f; margin-bottom: 4px;
+}
+.cs-month-picker-sub { font-size: 13px; color: #6b7a99; margin-bottom: 18px; }
+.cs-month-picker-list { display: flex; flex-direction: column; gap: 8px; }
+.cs-month-picker-btn {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 11px 16px; border-radius: 10px;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  background: #f8faff; cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif; font-weight: 600;
+  font-size: 14px; color: #0f1c3f;
+  transition: background 0.15s, border-color 0.15s;
+  width: 100%;
+}
+.cs-month-picker-btn:hover { background: #e0eaff; border-color: rgba(37,99,235,0.35); }
+.cs-month-picker-btn-amount { color: #2563eb; font-size: 13px; }
+.cs-month-picker-btn-amount.client { color: #059669; }
+.cs-month-picker-cancel {
+  margin-top: 16px; width: 100%; padding: 10px;
+  border-radius: 8px; border: 1px solid rgba(59,130,246,0.18);
+  background: #fff; cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+  font-size: 13px; color: #0f1c3f; transition: background 0.15s;
+}
+.cs-month-picker-cancel:hover { background: #f0f6ff; }
+
+/* ── Hostinger Mail Modal ── */
+.cs-hostinger-box {
+  background: #fff; border-radius: 18px;
+  border: 1.5px solid rgba(59,130,246,0.18);
+  box-shadow: 0 24px 80px rgba(37,99,235,0.18);
+  padding: 0; min-width: 360px; max-width: 480px; width: 100%;
+  overflow: hidden;
+}
+.cs-hostinger-header {
+  background: linear-gradient(135deg,#f97316,#fb923c);
+  padding: 20px 24px 16px;
+}
+.cs-hostinger-title {
+  font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+  font-size: 17px; color: #fff; display: flex; align-items: center; gap: 8px;
+}
+.cs-hostinger-sub { font-size: 12.5px; color: rgba(255,255,255,0.80); margin-top: 4px; }
+.cs-hostinger-body { padding: 22px 24px; display: flex; flex-direction: column; gap: 12px; }
+.cs-hostinger-info {
+  background: rgba(249,115,22,0.06);
+  border: 1.5px solid rgba(249,115,22,0.20);
+  border-radius: 10px; padding: 14px 16px;
+  font-size: 13px; color: #7c2d12; line-height: 1.6;
+}
+.cs-hostinger-info strong { color: #c2410c; font-weight: 700; }
+.cs-hostinger-steps { display: flex; flex-direction: column; gap: 8px; }
+.cs-hostinger-step {
+  display: flex; align-items: flex-start; gap: 10px;
+  font-size: 13px; color: #374151; line-height: 1.5;
+}
+.cs-hostinger-step-num {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: linear-gradient(135deg,#f97316,#fb923c);
+  color: #fff; font-family: 'Space Grotesk', sans-serif;
+  font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; margin-top: 1px;
+}
+.cs-hostinger-open-btn {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; padding: 13px 20px; border: none; border-radius: 10px;
+  background: linear-gradient(135deg,#f97316,#fb923c);
+  color: #fff; font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  box-shadow: 0 4px 14px rgba(249,115,22,0.30);
+  transition: all 0.18s;
+}
+.cs-hostinger-open-btn:hover { filter: brightness(1.07); transform: translateY(-1px); }
+.cs-hostinger-copy-btn {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  width: 100%; padding: 10px 20px; border-radius: 8px;
+  border: 1.5px solid rgba(249,115,22,0.28); background: transparent;
+  color: #c2410c; font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px; font-weight: 700; cursor: pointer;
+  transition: all 0.15s;
+}
+.cs-hostinger-copy-btn:hover { background: rgba(249,115,22,0.06); }
+.cs-hostinger-cancel {
+  width: 100%; padding: 10px; border-radius: 8px;
+  border: 1px solid rgba(59,130,246,0.18); background: #fff;
+  cursor: pointer; font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700; font-size: 13px; color: #0f1c3f; transition: background 0.15s;
+}
+.cs-hostinger-cancel:hover { background: #f0f6ff; }
+
+@media (max-width: 780px) {
+  .cs-root { padding: 18px 16px 24px; }
+  .cs-grid { grid-template-columns: 1fr; }
+  .cs-export-btn { margin-left: 0; }
+}
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("cost-summary-style")) {
+  const s = document.createElement("style");
+  s.id = "cost-summary-style";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+/* ─────────────────────────── CONSTANTS ──────────────────────────────────── */
+const GLOBAL_PRICING_KEY = "__GLOBAL__";
+export const fmt = (n) => "₹ " + Number(n || 0).toLocaleString("en-IN");
+const initial = (str) => String(str || "?").charAt(0).toUpperCase();
+const MASTER  = "__MASTER_TABLE__";
+
+/* ─────────────────────────── WORKSPACE / SCOPED PRICING HELPERS ────────── */
+function getCurrentUserSafe() {
+  try {
+    return JSON.parse(localStorage.getItem("currentUser") || "{}");
+  } catch {
+    return {};
+  }
+}
+
+export function getWorkspaceId() {
+  const cu = getCurrentUserSafe();
+
+  if (String(cu.role || "").toLowerCase() === "superadmin") {
+    return "__SUPERADMIN__";
+  }
+
+  return String(
+    cu.tenantId ||
+    cu.companyTenantId ||
+    cu.companyId ||
+    cu.tenantCode ||
+    cu.companyCode ||
+    cu.companyName ||
+    cu.company ||
+    cu.ownerAdminEmail ||
+    cu.adminEmail ||
+    cu.email ||
+    "__LOCAL_COMPANY__"
+  ).trim();
+}
+
+function safeScope(v = "") {
+  return String(v || "__LOCAL_COMPANY__").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function nameKey(v = "") {
+  return String(v || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/* ─────────────────────────── HELPERS ────────────────────────────────────── */
+
+export function isClosedRow(row) {
+  const status = (
+    row["Status"] || row["status"] || row["STATUS"] ||
+    row["Case Status"] || row["BGV Status"] ||
+    row["Verification Status"] || row["Current Status"] ||
+    (row.rawData && typeof row.rawData === "object" && (
+      row.rawData["Status"] || row.rawData["status"] || row.rawData["STATUS"] ||
+      row.rawData["Case Status"] || row.rawData["BGV Status"] ||
+      row.rawData["Verification Status"] || row.rawData["Current Status"]
+    )) || ""
+  );
+  return String(status).trim().toLowerCase() === "closed";
+}
+
+export function getCol(row, key) {
+  if (!row || !key) return undefined;
+  const lower = String(key).trim().toLowerCase();
+  const findIn = (obj) => {
+    if (!obj || typeof obj !== "object") return undefined;
+    if (obj[key] !== undefined && obj[key] !== null && obj[key] !== "") return obj[key];
+    const found = Object.keys(obj).find(k => String(k).trim().toLowerCase() === lower);
+    if (found !== undefined && obj[found] !== null && obj[found] !== "") return obj[found];
+    return undefined;
+  };
+  const top = findIn(row);
+  if (top !== undefined) return top;
+  if (row.rawData) { const rd = findIn(row.rawData); if (rd !== undefined) return rd; }
+  for (const k of Object.keys(row)) {
+    if (k === "rawData") continue;
+    if (row[k] && typeof row[k] === "object" && !Array.isArray(row[k])) {
+      const nested = findIn(row[k]);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+}
+
+export function flattenRow(row) {
+  if (!row) return {};
+  if (!row.rawData || typeof row.rawData !== "object") return { ...row };
+  return { ...row.rawData, ...row };
+}
+
+function parsePrice(val) {
+  if (!val && val !== 0) return null;
+  const n = Number(String(val).replace(/[^0-9.]/g, ""));
+  return !isNaN(n) && n > 0 ? n : null;
+}
+
+/* ─────────────────────────── MONTH ORDER HELPER ─────────────────────────── */
+/* Converts a "MMM YYYY" month label (e.g. "May 2026") into a sortable number
+   so months order by real calendar date (May, June, July...) instead of by
+   alphabet. "Unknown"/unparseable labels are pushed to the end. */
+const _MONTH_INDEX = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+export function monthSortKey(monthStr) {
+  const s = String(monthStr || "").trim();
+  if (!s || s.toLowerCase() === "unknown") return Infinity;
+  const m = s.match(/^([A-Za-z]{3,})\s+(\d{4})$/);
+  if (m) {
+    const mon = _MONTH_INDEX[m[1].slice(0, 3).toLowerCase()];
+    const yr = Number(m[2]);
+    if (mon !== undefined && Number.isFinite(yr)) return yr * 12 + mon;
+  }
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return d.getFullYear() * 12 + d.getMonth();
+  return Infinity;
+}
+
+
+/* ─────────────────────────── PENALTY HELPERS ────────────────────────────── */
+function parseDateFlexible(value) {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const serial = Number(raw);
+  if (Number.isFinite(serial) && serial > 20000 && serial < 80000) {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    const d = new Date(excelEpoch.getTime() + serial * 86400000);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    const d = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+
+  const slash = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
+  if (slash) {
+    let a = Number(slash[1]);
+    let b = Number(slash[2]);
+    let y = Number(slash[3]);
+    if (y < 100) y += 2000;
+
+    let day;
+    let month;
+
+    if (a > 12) {
+      day = a;
+      month = b;
+    } else if (b > 12) {
+      day = b;
+      month = a;
+    } else {
+      // Matches your portal/Excel short date style: 5/6/26 = 06 May 2026
+      month = a;
+      day = b;
+    }
+
+    const d = new Date(y, month - 1, day);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatDateDisplay(value) {
+  const d = parseDateFlexible(value);
+  if (!d) return value ? String(value) : "-";
+
+  return d.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function dayOnlyUTC(d) {
+  if (!d) return null;
+  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function calcDaysBetween(startDate, endDate) {
+  if (!startDate || !endDate) return null;
+  const s = dayOnlyUTC(startDate);
+  const e = dayOnlyUTC(endDate);
+  if (s === null || e === null) return null;
+  return Math.max(0, Math.floor((e - s) / 86400000));
+}
+
+function getPenaltyDays(row) {
+  const directKeys = [
+    "Penalty Days", "Penalty Day", "Penalty %", "Penalty", "TAT Days", "TAT Day",
+    "Vendor TAT", "Vendor TAT Days", "TAT", "tatDays", "penaltyDays",
+  ];
+
+  for (const key of directKeys) {
+    const v = getCol(row, key);
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      const m = String(v).match(/\d+/);
+      if (m) return Number(m[0]);
+    }
+  }
+
+  const startRaw =
+    getCol(row, "Assigned Date") ||
+    getCol(row, "Assign Date") ||
+    getCol(row, "assignDate") ||
+    getCol(row, "Sent Date") ||
+    getCol(row, "Vendor Sent Date") ||
+    getCol(row, "Vendor Assigned Date") ||
+    getCol(row, "Vendor Assign Date");
+
+  const endRaw =
+    getCol(row, "Completed Date") ||
+    getCol(row, "Complete Date") ||
+    getCol(row, "Closed Date") ||
+    getCol(row, "Vendor Close Date") ||
+    getCol(row, "Vendor Completed Date") ||
+    getCol(row, "Vendor Closed Date") ||
+    getCol(row, "completedDate");
+
+  const start = parseDateFlexible(startRaw);
+  const end = parseDateFlexible(endRaw);
+  return calcDaysBetween(start, end);
+}
+
+function getPenaltyPercent(days) {
+  if (days === null || days === undefined || Number.isNaN(Number(days))) return 0;
+  const d = Number(days);
+  if (d <= 5) return 0;
+  if (d <= 8) return 10;
+  if (d <= 10) return 20;
+  return 50;
+}
+
+export function getPenaltyInfo(row, caseAmount, type = "vendor") {
+  // Penalty is applied only on vendor payable amount.
+  if (type !== "vendor") {
+    return { days: null, percent: 0, penaltyAmount: 0, finalAmount: Number(caseAmount || 0) };
+  }
+
+  const amount = Number(caseAmount || 0);
+  const days = getPenaltyDays(row);
+  const percent = getPenaltyPercent(days);
+  const penaltyAmount = Math.round((amount * percent) / 100);
+  const finalAmount = Math.max(0, amount - penaltyAmount);
+
+  return { days, percent, penaltyAmount, finalAmount };
+}
+
+/* ─────────────────────────── PRICING RULE HELPERS ───────────────────────── */
+
+// getRulesForKey is called ~10x per row (buildRuleSets tries a priority
+// chain of key variants) across every closed case being summarized — its
+// case-insensitive fallback used to re-scan Object.keys(obj) on every single
+// call. pricingRules/clientPricing are the same object reference for the
+// whole computation, so cache each object's lowercased-key index once (by
+// object identity, via WeakMap — naturally invalidated if the object is ever
+// rebuilt) instead of rescanning it thousands of times. Same lookup result,
+// just computed once instead of on every call.
+const rulesKeyIndexCache = new WeakMap();
+function getLowercaseKeyIndex(obj) {
+  let idx = rulesKeyIndexCache.get(obj);
+  if (idx) return idx;
+  idx = new Map();
+  for (const k of Object.keys(obj)) {
+    const lk = String(k).trim().toLowerCase();
+    if (!idx.has(lk)) idx.set(lk, k);
+  }
+  rulesKeyIndexCache.set(obj, idx);
+  return idx;
+}
+function getRulesForKey(obj, key) {
+  if (!obj || !key) return [];
+  if (Array.isArray(obj[key])) return obj[key];
+  const lowerKey = String(key).trim().toLowerCase();
+  if (Array.isArray(obj[lowerKey])) return obj[lowerKey];
+  const foundKey = getLowercaseKeyIndex(obj).get(lowerKey);
+  return foundKey && Array.isArray(obj[foundKey]) ? obj[foundKey] : [];
+}
+
+function getRowStateDistrict(row) {
+  const state = String(
+    row?.["State"] || row?.["state"] || row?.["STATE"] ||
+    row?.rawData?.["State"] || row?.rawData?.["state"] || row?.rawData?.["STATE"] || ""
+  ).trim().toLowerCase();
+  const district = String(
+    row?.["District"] || row?.["district"] || row?.["DISTRICT"] ||
+    row?.rawData?.["District"] || row?.rawData?.["district"] || row?.rawData?.["DISTRICT"] || ""
+  ).trim().toLowerCase();
+  return { state, district };
+}
+
+function findMatchingRule(rules, row) {
+  if (!rules || !rules.length) return null;
+
+  const { state: directState, district: directDistrict } = getRowStateDistrict(row);
+  const addressStr = [
+    row["Address"], row["Full Address"], row["City"], row["State"], row["District"],
+    row["Pincode"], row["Location"], row["Village"], row["Area"],
+    row.rawData?.["Address"], row.rawData?.["Full Address"], row.rawData?.["City"],
+    row.rawData?.["State"], row.rawData?.["District"], row.rawData?.["Location"],
+    row.rawData?.["Village"], row.rawData?.["Area"],
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  const words = addressStr.split(/[\s,;/\\|]+/).filter(Boolean);
+  const textMatches = (needle) => {
+    if (!needle) return false;
+    return addressStr.includes(needle) || words.includes(needle);
+  };
+
+  for (const rule of rules) {
+    const rs = String(rule.state || "").trim().toLowerCase();
+    const rd = String(rule.district || "").trim().toLowerCase();
+
+    // Supports BOTH:
+    // 1) Vendor district rules: { state, district, rate }
+    // 2) Client state-only rules from Upload.jsx: { state, district: "", clientPrice }
+    const stateMatches = !rs ||
+      (directState && directState === rs) ||
+      textMatches(rs);
+
+    const districtMatches = !rd ||
+      (directDistrict && directDistrict === rd) ||
+      textMatches(rd);
+
+    if (stateMatches && districtMatches) return rule;
+  }
+  return null;
+}
+/* ─────────────────────────── BUILD RULE SETS ────────────────────────────── */
+/* Shared helper — builds the 6-entry priority list used by both vendor & client */
+function buildRuleSets(row, pricingRules, clientPricing) {
+  const workspaceId = getWorkspaceId();
+  const scopeSafe = safeScope(workspaceId);
+
+  // Must match Upload.jsx:
+  // VENDOR_SCOPE_PREFIX = `__VENDOR_PRICING__${VENDOR_SCOPE_SAFE}__`
+  // GLOBAL key          = `${VENDOR_SCOPE_PREFIX}GLOBAL`
+  // CLIENT key          = `${VENDOR_SCOPE_PREFIX}CLIENT__${nameKey(clientName)}`
+  const vendorScopePrefix = `__VENDOR_PRICING__${scopeSafe}__`;
+  const vendorGlobalKey = `${vendorScopePrefix}GLOBAL`;
+
+  const clientNameRaw =
+    getCol(row, "Client Name") ||
+    getCol(row, "Company Name") ||
+    row._client ||
+    "";
+
+  const clientNameKey = String(clientNameRaw).trim().toLowerCase();
+  const vendorClientKey = `${vendorScopePrefix}CLIENT__${nameKey(clientNameRaw)}`;
+
+  return [
+    // ✅ NEW scoped vendor pricing from Upload.jsx
+    getRulesForKey(pricingRules, vendorClientKey),
+    getRulesForKey(pricingRules, vendorGlobalKey),
+    getRulesForKey(clientPricing, vendorClientKey),
+    getRulesForKey(clientPricing, vendorGlobalKey),
+
+    // ✅ old / client fallback keys
+    getRulesForKey(pricingRules,  clientNameKey),
+    getRulesForKey(pricingRules,  row._client),
+    getRulesForKey(clientPricing, clientNameKey),
+    getRulesForKey(clientPricing, row._client),
+    getRulesForKey(pricingRules,  GLOBAL_PRICING_KEY),
+    getRulesForKey(clientPricing, GLOBAL_PRICING_KEY),
+  ];
+}
+
+/* ─────────────────────────── VENDOR NAME LOOKUP ─────────────────────────── */
+/* Resolves the vendor name from rules (full priority chain) then Excel columns */
+function resolveVendorName(row) {
+  const candidates = [
+    "Vendor Name",
+    "vendor name",
+    "VendorName",
+    "Vendor Company",
+    "vendor company",
+    "Vendor",
+    "vendor",
+  ];
+
+  for (const c of candidates) {
+    const v = getCol(row, c);
+    if (v && String(v).trim()) return String(v).trim();
+  }
+
+  return "";
+}
+
+/* ─────────────────────────── EXTRA PRICE ────────────────────────────────── */
+function getExtraPrice(row) {
+  const approvedRaw =
+    getCol(row, "extraApproved") ??
+    getCol(row, "Extra Approved") ??
+    getCol(row, "Extra Approval") ??
+    false;
+  const amount =
+    parsePrice(getCol(row, "extraAmount")) ??
+    parsePrice(getCol(row, "Extra Amount")) ??
+    parsePrice(getCol(row, "Vendor Extra Approval")) ??
+    parsePrice(getCol(row, "Extra Approval Amount")) ??
+    0;
+  const isApproved =
+    approvedRaw === true ||
+    approvedRaw === 1 ||
+    String(approvedRaw).trim().toLowerCase() === "true" ||
+    String(approvedRaw).trim().toLowerCase() === "yes";
+  return isApproved ? Number(amount || 0) : 0;
+}
+
+/* ─────────────────────────── CORE PRICE RESOLVER ────────────────────────── */
+/**
+ * getCasePrice — BOTH vendor and client use the same 6-rule priority chain.
+ *
+ * VENDOR  → filters rules by r.rate       → adds getExtraPrice()
+ * CLIENT  → filters rules by r.clientPrice
+ *
+ * Priority (same for both):
+ *   1. pricingRules[clientName]   — client-specific rule
+ *   2. pricingRules[row._client]  — client-specific rule (raw key)
+ *   3. clientPricing[clientName]  — client-specific rule
+ *   4. clientPricing[row._client] — client-specific rule (raw key)
+ *   5. pricingRules[GLOBAL]       — global rule
+ *   6. clientPricing[GLOBAL]      — global rule
+ *   7. Excel column fallback
+ */
+export function getCasePrice(row, type, pricingRules = {}, clientPricing = {}) {
+  const ruleSets = buildRuleSets(row, pricingRules, clientPricing);
+
+  if (type === "vendor") {
+    const manualVendorName = resolveVendorName(row);
+
+    if (!manualVendorName) {
+      return getExtraPrice(row);
+    }
+
+    for (const arr of ruleSets) {
+      if (!Array.isArray(arr) || !arr.length) continue;
+
+      const vpRules = arr.filter((r) => {
+        const ruleVendor = String(r.vendorName || "").trim().toLowerCase();
+
+        return (
+          r.rate !== undefined &&
+          r.rate !== null &&
+          r.rate !== "" &&
+          ruleVendor &&
+          ruleVendor === manualVendorName.toLowerCase()
+        );
+      });
+
+      if (!vpRules.length) continue;
+
+      const match = findMatchingRule(vpRules, row);
+
+      if (match) {
+        return (Number(match.rate) || 0) + getExtraPrice(row);
+      }
+    }
+
+    const vendorCols = [
+      "Vendor Price",
+      "vendor price",
+      "VendorPrice",
+      "Vendor Rate",
+      "vendor rate",
+      "VendorRate",
+      "V Price",
+      "v price",
+    ];
+
+    for (const c of vendorCols) {
+      const p = parsePrice(getCol(row, c));
+      if (p !== null) return p + getExtraPrice(row);
+    }
+
+    return getExtraPrice(row);
+  }
+
+  /* CLIENT */
+  for (const arr of ruleSets) {
+    if (!Array.isArray(arr) || !arr.length) continue;
+    const cpRules = arr.filter(
+      r => r.clientPrice !== undefined && r.clientPrice !== null && r.clientPrice !== ""
+    );
+    if (!cpRules.length) continue;
+    const match = findMatchingRule(cpRules, row);
+    if (match) return Number(match.clientPrice) || 0;
+  }
+  /* Excel fallback */
+  const clientCols = ["Client Price","client price","ClientPrice","Client Rate","client rate","ClientRate","Price","price","C Price","c price"];
+  for (const c of clientCols) {
+    const p = parsePrice(getCol(row, c));
+    if (p !== null) return p;
+  }
+  return 0;
+}
+
+/* ─────────────────────────── TEXT / EXCEL HELPERS ───────────────────────── */
+
+export function parseMonth(raw, row = {}) {
+  const makeMonth = (d) => {
+    if (!d || Number.isNaN(d.getTime())) return "";
+    return d.toLocaleString("en-IN", { month: "short", year: "numeric" });
+  };
+
+  const parseValue = (value) => {
+    if (value === undefined || value === null || value === "") return "";
+
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return makeMonth(value);
+    }
+
+    let s = String(value).trim();
+    if (!s) return "";
+
+    // Handles values saved/displayed like "✓ 29/05/2026" or "Closed - 29 May 2026".
+    s = s.replace(/[✓✔✅]/g, " ").replace(/\s+/g, " ").trim();
+
+    const embeddedDate =
+      s.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-](?:\d{2}|\d{4}))/) ||
+      s.match(/(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})/) ||
+      s.match(/([A-Za-z]{3,}\s+\d{1,2},?\s+\d{4})/);
+    if (embeddedDate) s = embeddedDate[1].replace(/,/g, "").trim();
+
+    if (/^[A-Za-z]{3,}\s+\d{4}$/.test(s)) return s;
+
+    const m1 = s.match(/^(\d{4})[\/\-](\d{1,2})$/);
+    if (m1) return makeMonth(new Date(Number(m1[1]), Number(m1[2]) - 1));
+
+    const m2 = s.match(/^(\d{1,2})[\/\-](\d{4})$/);
+    if (m2) return makeMonth(new Date(Number(m2[2]), Number(m2[1]) - 1));
+
+    const m3 = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
+    if (m3) {
+      let a = Number(m3[1]);
+      let b = Number(m3[2]);
+      let y = Number(m3[3]);
+      if (y < 100) y += 2000;
+
+      let day;
+      let month;
+
+      if (a > 12) {
+        day = a;
+        month = b;
+      } else if (b > 12) {
+        day = b;
+        month = a;
+      } else {
+        // Portal/Excel style: 5/6/26 = 06 May 2026
+        month = a;
+        day = b;
+      }
+
+      return makeMonth(new Date(y, month - 1, day));
+    }
+
+    const serial = Number(s);
+    if (Number.isFinite(serial) && serial > 20000 && serial < 80000) {
+      const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+      return makeMonth(new Date(excelEpoch.getTime() + serial * 86400000));
+    }
+
+    // Catches ISO yyyy-mm-dd strings the earlier branches don't match
+    // (e.g. "0022-07-21" — a truncated year saved into a 4-digit slot).
+    // The 2-digit-year correction other branches above already apply
+    // (`y < 100 ? y += 2000`) doesn't reach this fallback, so a bad year
+    // here would otherwise silently produce a garbage month bucket like
+    // "Jul 22" instead of grouping with the correct year (or being
+    // rejected as unparseable).
+    const isoMatch = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (isoMatch) {
+      let y = Number(isoMatch[1]);
+      if (y < 100) y += 2000;
+      if (y < 2000 || y > 2100) return "";
+      return makeMonth(new Date(y, Number(isoMatch[2]) - 1, Number(isoMatch[3])));
+    }
+
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) return makeMonth(d);
+
+    return "";
+  };
+
+  const completedDateValues = [
+    getCol(row, "Completed Date"),
+    getCol(row, "Complete Date"),
+    getCol(row, "Completion Date"),
+    getCol(row, "completedDate"),
+    getCol(row, "closedDate"),
+    getCol(row, "Closed Date"),
+    getCol(row, "Close Date"),
+    getCol(row, "Case Closed Date"),
+    getCol(row, "Vendor Close Date"),
+    getCol(row, "Vendor Completed Date"),
+    getCol(row, "Vendor Closed Date"),
+    row?.["Completed Date"],
+    row?.["Complete Date"],
+    row?.["Completion Date"],
+    row?.completedDate,
+    row?.closedDate,
+    row?.["Closed Date"],
+    row?.["Close Date"],
+    row?.["Case Closed Date"],
+    row?.["Vendor Close Date"],
+    row?.["Vendor Completed Date"],
+    row?.["Vendor Closed Date"],
+    row?.rawData?.["Completed Date"],
+    row?.rawData?.["Complete Date"],
+    row?.rawData?.["Completion Date"],
+    row?.rawData?.completedDate,
+    row?.rawData?.closedDate,
+    row?.rawData?.["Closed Date"],
+    row?.rawData?.["Close Date"],
+    row?.rawData?.["Case Closed Date"],
+    row?.rawData?.["Vendor Close Date"],
+    row?.rawData?.["Vendor Completed Date"],
+    row?.rawData?.["Vendor Closed Date"],
+  ];
+
+  for (const value of completedDateValues) {
+    const month = parseValue(value);
+    if (month) return month;
+  }
+
+  // Cost Summary counts CLOSED cases only. If a closed case has no completed date,
+  // do not fall back to Assigned Date / Month, otherwise cost is shown in the wrong month.
+  if (isClosedRow(row)) return "Unknown";
+
+  const directMonth = parseValue(raw);
+  if (directMonth) return directMonth;
+
+  const fallbackValues = [
+    getCol(row, "Assigned Date"),
+    getCol(row, "Assign Date"),
+    getCol(row, "assignDate"),
+    getCol(row, "Assigned On"),
+    getCol(row, "Created Date"),
+    getCol(row, "Upload Date"),
+    getCol(row, "uploadedAt"),
+    getCol(row, "createdAt"),
+    row?.assignDate,
+    row?.assignedDate,
+    row?.uploadedAt,
+    row?.createdAt,
+    row?.rawData?.assignDate,
+    row?.rawData?.assignedDate,
+    row?.rawData?.uploadedAt,
+    row?.rawData?.createdAt,
+    row?.rawData?.["Assigned Date"],
+    row?.rawData?.["Assign Date"],
+    row?.rawData?.["Created Date"],
+    row?.rawData?.["Upload Date"],
+  ];
+
+  for (const value of fallbackValues) {
+    const month = parseValue(value);
+    if (month) return month;
+  }
+
+  return "Unknown";
+}
+
+function cleanText(value) { return String(value ?? "-").replace(/\s+/g, " ").trim(); }
+function limitText(value, max = 18) { const str = cleanText(value); return str.length > max ? str.slice(0, max - 2) + ".." : str; }
+function padText(value, width, align = "left") {
+  const str = String(value ?? "-");
+  if (str.length >= width) return str.slice(0, width);
+  const spaces = " ".repeat(width - str.length);
+  return align === "right" ? spaces + str : str + spaces;
+}
+
+function buildFrontendTableText(type, company, month, cases, pricingRules, clientPricing = {}) {
+  const vendorMode = type === "vendor";
+  const headers = vendorMode
+    ? [["No",4,"right"],["Candidate",18,"left"],["Check",14,"left"],["Price",11,"right"],["Pen",8,"right"],["Final",11,"right"]]
+    : [["No",4,"right"],["Candidate",16,"left"],["Client",14,"left"],["Check",14,"left"],["Price",12,"right"]];
+  const makeLine = (cols) => cols.map(([text,width,align]) => padText(text, width, align)).join(" | ");
+  const headerLine = makeLine(headers);
+  const separator  = headers.map(([,width]) => "-".repeat(width)).join("-+-");
+  let total = 0;
+  const rows = cases.map((row, index) => {
+    const casePrice = getCasePrice(row, type, pricingRules, clientPricing);
+    const penalty = getPenaltyInfo(row, casePrice, type);
+    const finalAmount = vendorMode ? penalty.finalAmount : casePrice;
+    total += finalAmount;
+
+    if (vendorMode) {
+      return makeLine([
+        [String(getCol(row,"S.NO") || index + 1), 4, "right"],
+        [limitText(getCol(row,"Candidate Name") || "-", 18), 18, "left"],
+        [limitText(getCol(row,"Check Name") || "-", 14), 14, "left"],
+        [fmt(casePrice), 11, "right"],
+        [`${penalty.percent}%`, 8, "right"],
+        [fmt(finalAmount), 11, "right"],
+      ]);
+    }
+
+    return makeLine([
+      [String(getCol(row,"S.NO") || index + 1), 4, "right"],
+      [limitText(getCol(row,"Candidate Name")  || "-", 16), 16, "left"],
+      [limitText(getCol(row,"Client Name") || row._client || "-", 14), 14, "left"],
+      [limitText(getCol(row,"Check Name")     || "-", 14), 14, "left"],
+      [fmt(casePrice), 12, "right"],
+    ]);
+  });
+  const totalColspanWidth = vendorMode ? 4+3+18+3+14+3+11+3+8 : 4+3+16+3+14+3+14;
+  const totalLine = padText(vendorMode ? "TOTAL PAYABLE" : "TOTAL", totalColspanWidth, "right") + " | " + padText(fmt(total), vendorMode ? 11 : 12, "right");
+  let text = "";
+  text += `📊 ${vendorMode ? "VENDOR" : "CLIENT"} MONTHLY REPORT
+`;
+  text += `Name  : ${cleanText(company)}
+`;
+  text += `Month : ${cleanText(month)}
+`;
+  text += `Cases : ${cases.length}
+
+`;
+if (vendorMode) text += "Penalty: 6-8 days = 10%, 9-10 days = 20%, after 10 days = 50%\\n\\n";
+  text += "📎 Please attach the Excel file before sending.";
+  text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+  text += headerLine + " ";
+  text += separator  + " ";
+  text += rows.join("") + " ";
+  text += separator  + " ";
+  text += totalLine  + " ";
+  text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+  return text;
+}
+
+function downloadDetailExcel(detailModal, pricingRules, clientPricing = {}) {
+  const { type, company, month, cases } = detailModal;
+  if (!cases || !cases.length) { alert("No case details found."); return null; }
+
+  const rows = cases.map((row, index) => {
+    const casePrice = getCasePrice(row, type, pricingRules, clientPricing);
+    const penalty = getPenaltyInfo(row, casePrice, type);
+    const finalAmount = type === "vendor" ? penalty.finalAmount : casePrice;
+
+    return {
+      "S.NO":           getCol(row,"S.NO") || index + 1,
+      "Candidate Name": getCol(row,"Candidate Name") || "",
+      ...(type === "client"
+        ? { "Client Name": getCol(row,"Client Name") || row._client || "" }
+        : { "Vendor Name": resolveVendorName(row, pricingRules, clientPricing) }),
+      "Check Id":       getCol(row,"Check Id")       || "",
+      "Check Name":     getCol(row,"Check Name")     || "",
+      "Sub Check Type": getCol(row,"Sub Check Type") || "",
+      "Assigned Date":  formatDateDisplay(getCol(row,"Assigned Date") || getCol(row,"assignDate") || ""),
+      "Completed Date": formatDateDisplay(getCol(row,"Completed Date") || getCol(row,"completedDate") || ""),
+      "Address":        getCol(row,"Address")        || "",
+      "City":           getCol(row,"City")           || "",
+      "State":          getCol(row,"State")          || "",
+      "Pincode":        getCol(row,"Pincode")        || "",
+      "Case Price":     casePrice,
+      ...(type === "vendor" ? {
+        "Penalty Days": penalty.days === null ? "" : penalty.days,
+        "Penalty %": `${penalty.percent}%`,
+        "Penalty Amount": penalty.penaltyAmount,
+        "Final Payable Amount": finalAmount,
+      } : {}),
+    };
+  });
+
+  const totalCase = rows.reduce((sum, r) => sum + (Number(r["Case Price"]) || 0), 0);
+  const totalPenalty = rows.reduce((sum, r) => sum + (Number(r["Penalty Amount"]) || 0), 0);
+  const totalFinal = rows.reduce((sum, r) => sum + (Number(r["Final Payable Amount"] ?? r["Case Price"]) || 0), 0);
+
+  rows.push({});
+  rows.push(type === "vendor"
+    ? {
+        "Candidate Name": "TOTAL",
+        "Case Price": totalCase,
+        "Penalty Amount": totalPenalty,
+        "Final Payable Amount": totalFinal,
+      }
+    : { "Candidate Name": "TOTAL PRICING", "Case Price": totalCase }
+  );
+
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  const safeCompany = String(company || "details").replace(/[\/:*?"<>|]+/g,"").trim();
+  const safeMonth   = String(month   || "month"  ).replace(/[\/:*?"<>|]+/g,"").trim();
+  const filename    = `${type}_${safeCompany}_${safeMonth}.xlsx`;
+  XLSX.utils.book_append_sheet(wb, ws, type === "vendor" ? "Vendor Details" : "Client Details");
+  saveAs(
+    new Blob([XLSX.write(wb, { bookType:"xlsx", type:"array" })], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    filename
+  );
+  return filename;
+}
+
+/* ─────────────────────────── MAIN COMPONENT ─────────────────────────────── */
+export default function CostSummary({
+  pricingRules   = {},
+  clientPricing  = {},
+  selectedClient = "",
+}) {
+  const [activeTab,   setActiveTab]   = useState("vendor");
+
+  // Fetches only Closed records directly from the server — Cost Summary
+  // only ever considers closed cases (see isClosedRow filter below), so it
+  // never needed Pending/Sent/Insuff/Hold/Stop rows at all. Avoids depending
+  // on the full eager-loaded dataset, which doesn't scale as record volume
+  // grows. Grouped into the same {[clientName]: rows[], [MASTER]: rows[]}
+  // shape this file already expects, so none of the pricing/penalty/month
+  // calculation logic below changes.
+  const [clientsData, setClientsData] = useState({});
+  const [costLoading, setCostLoading] = useState(true);
+  const [costLoadingMore, setCostLoadingMore] = useState(true);
+  const [costLoadedCount, setCostLoadedCount] = useState(0);
+
+  // Cache-first (stale-while-revalidate): the full closed-records fetch below
+  // is unavoidable for correct totals (every row must go through the same
+  // pricing/penalty/month math — nothing here shortcuts or changes that), but
+  // it's the one thing making Cost Summary feel slow to open every time. This
+  // paints the LAST successfully fetched result instantly on mount, then
+  // fetches fresh data in the background and silently replaces it (and the
+  // cache) once it lands — same numbers, just visible sooner. First-ever
+  // open (empty cache) still waits for the real fetch, same as before.
+  //
+  // Uses IndexedDB (idbCache), not localStorage — localStorage caps at ~5MB
+  // and silently fails on payloads this size (thousands of closed records,
+  // each with full rawData), which is exactly why this codebase already has
+  // idbCache for the equivalent Records-page cache. A localStorage version
+  // of this would look like it's caching but never actually persist.
+  const costSummaryCacheKey = `bgv_cost_summary_cache_${getWorkspaceId()}`;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    idbGet(costSummaryCacheKey).then(cached => {
+      if (cancelled) return;
+      // Only paint from cache if it actually has rows — an empty/zero cached
+      // snapshot (e.g. saved from a fetch that failed or briefly returned
+      // nothing) must never be shown as if it were a confirmed "zero cost"
+      // result. Better to fall through to the normal loading state and wait
+      // for a real answer than to display a confidently-wrong ₹0.
+      if (cached && typeof cached === "object" && Array.isArray(cached[MASTER]) && cached[MASTER].length > 0) {
+        setClientsData(cached);
+        setCostLoading(false);
+      }
+    });
+
+    // Progressive batch fetch, not one single limit:100000 request — a
+    // closed-cases dataset with full rawData per row can be several MB in
+    // one shot, so the page sat blank the whole time waiting for all of it.
+    // Fetching in pages and re-grouping/repainting after each one means the
+    // FIRST batch's real numbers appear almost immediately, then keep
+    // growing as later batches land — same total data, same math, nothing
+    // recalculated differently, just visible sooner. Only caches once every
+    // batch has arrived, so the cache never holds a partial/undercounted
+    // snapshot.
+    (async () => {
+      const BATCH_SIZE = 1000;
+      let pageNo = 1;
+      let allRows = [];
+      let firstPaintDone = false;
+
+      try {
+        while (true) {
+          if (cancelled) return;
+          const batch = await uploadAPI.getRecords({ status: "closed", page: pageNo, limit: BATCH_SIZE });
+          if (cancelled) return;
+          if (!Array.isArray(batch) || batch.length === 0) break;
+
+          allRows = allRows.concat(batch);
+
+          const grouped = {};
+          allRows.forEach(row => {
+            const clientName = String(row["Company Name"] || row["Client Name"] || "Unknown").trim() || "Unknown";
+            if (!grouped[clientName]) grouped[clientName] = [];
+            grouped[clientName].push(row);
+          });
+          grouped[MASTER] = allRows;
+
+          setClientsData(grouped);
+          setCostLoadedCount(allRows.length);
+          if (!firstPaintDone) { setCostLoading(false); firstPaintDone = true; }
+
+          if (batch.length < BATCH_SIZE) break; // last page reached
+          pageNo += 1;
+        }
+
+        // Don't cache a genuinely-empty result — a transient blip (slow
+        // connection, momentary server hiccup) must never get "locked in"
+        // as the instant-paint snapshot for every future visit.
+        if (allRows.length > 0) {
+          const finalGrouped = {};
+          allRows.forEach(row => {
+            const clientName = String(row["Company Name"] || row["Client Name"] || "Unknown").trim() || "Unknown";
+            if (!finalGrouped[clientName]) finalGrouped[clientName] = [];
+            finalGrouped[clientName].push(row);
+          });
+          finalGrouped[MASTER] = allRows;
+          idbSet(costSummaryCacheKey, finalGrouped);
+        }
+      } catch (err) {
+        console.warn("Cost Summary fetch failed:", err.message);
+      } finally {
+        if (!cancelled) { setCostLoading(false); setCostLoadingMore(false); }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, []);
+  const [monthFilter, setMonthFilter] = useState("All");
+  const [viewMode,    setViewMode]    = useState("cards");
+  const [detailModal, setDetailModal] = useState({
+    open:false, type:"vendor", company:"", month:"", cases:[],
+  });
+  const [monthPickerModal, setMonthPickerModal] = useState({
+    open: false, type: "", company: "", months: [],
+  });
+  const [hostingerModal, setHostingerModal] = useState({
+    open: false, subject: "", body: "", copied: false,
+  });
+
+  // Load pricing directly from DB also, so Cost Summary works even after refresh
+  // or when user opens Cost Summary without visiting Upload page first.
+  const [dbPricingRules, setDbPricingRules] = useState({});
+
+  useEffect(() => {
+    let alive = true;
+    pricingAPI.getAll()
+      .then((data) => {
+        if (alive && data && typeof data === "object" && !Array.isArray(data)) {
+          setDbPricingRules(data);
+        }
+      })
+      .catch((err) => console.warn("CostSummary pricing load failed:", err?.message || err));
+    return () => { alive = false; };
+  }, []);
+
+  const effectivePricingRules = useMemo(() => ({
+    ...(dbPricingRules || {}),
+    ...(pricingRules || {}),
+  }), [dbPricingRules, pricingRules]);
+
+  const effectiveClientPricing = useMemo(() => ({
+    ...(clientPricing || {}),
+  }), [clientPricing]);
+
+  /* ── Flatten all closed rows ── */
+  const allRows = useMemo(() => {
+    const rows = [];
+    if (clientsData[MASTER] && clientsData[MASTER].length > 0) {
+      clientsData[MASTER].forEach(row => {
+        const flat = flattenRow(row);
+        if (!isClosedRow(flat)) return;
+        const client = getCol(flat,"Client Name") || getCol(flat,"Company Name") || flat.clientName || "";
+        rows.push({ ...flat, _client: client });
+      });
+    } else {
+      const clients = selectedClient
+        ? [selectedClient]
+        : Object.keys(clientsData || {}).filter(k => k !== MASTER);
+      clients.forEach(client => {
+        (clientsData?.[client] || []).forEach(row => {
+          const flat = flattenRow(row);
+          if (!isClosedRow(flat)) return;
+          rows.push({ ...flat, _client: client });
+        });
+      });
+    }
+    return rows;
+  }, [clientsData, selectedClient]);
+
+  // A special case's CLIENT month is its specialBillingDate, not its
+  // completion month — the dropdown must offer that month too, or a case
+  // billed into a month nothing else completed in (e.g. July, when every
+  // completion date is in June) would have no way to be selected at all.
+  const allMonths = useMemo(() => {
+    const set = new Set();
+    allRows.forEach(r => {
+      const m = parseMonth(getCol(r,"Month") || getCol(r,"month") || "", r);
+      if (m && m !== "Unknown") set.add(m);
+      if (r.isSpecialCase && r.specialBillingDate) {
+        const sm = parseMonth(r.specialBillingDate, r);
+        if (sm && sm !== "Unknown") set.add(sm);
+      }
+    });
+    return ["All", ...Array.from(set).sort((a, b) => monthSortKey(a) - monthSortKey(b))];
+  }, [allRows]);
+
+  // Client and vendor summaries bucket special cases differently (client:
+  // specialBillingDate override; vendor: always vendorCompleteDate — see
+  // vendorSummary/clientSummary below), so the month FILTER that decides
+  // which rows are even considered must match each tab's own bucketing
+  // rule. A single shared filter based only on completion month was why a
+  // special case never showed up in Cost Summary when filtering by its
+  // override month — it got excluded before the per-tab bucketing logic
+  // (which was already correct) ever saw it.
+  const clientFilteredRows = useMemo(() => {
+    if (monthFilter === "All") return allRows;
+    return allRows.filter(r => {
+      const m = (r.isSpecialCase && r.specialBillingDate)
+        ? parseMonth(r.specialBillingDate, r)
+        : parseMonth(getCol(r,"Month") || getCol(r,"month") || "", r);
+      return m === monthFilter;
+    });
+  }, [allRows, monthFilter]);
+
+  const vendorFilteredRows = useMemo(() => {
+    if (monthFilter === "All") return allRows;
+    return allRows.filter(r => {
+      const vendorCDRaw =
+        getCol(r, "Vendor Complete Date") ||
+        r?.vendorCompleteDate ||
+        r?.rawData?.["Vendor Complete Date"] ||
+        r?.rawData?.vendorCompleteDate ||
+        "";
+      const m = vendorCDRaw
+        ? parseMonth(vendorCDRaw, r)
+        : parseMonth(getCol(r,"Month") || getCol(r,"month") || "", r);
+      return m === monthFilter;
+    });
+  }, [allRows, monthFilter]);
+
+  /* ── Vendor summary ── */
+  const vendorSummary = useMemo(() => {
+    const map = {};
+    vendorFilteredRows.forEach(row => {
+      const vendorName = resolveVendorName(row, effectivePricingRules, effectiveClientPricing) || "Unknown";
+      const casePrice  = getCasePrice(row, "vendor", effectivePricingRules, effectiveClientPricing);
+      const penalty    = getPenaltyInfo(row, casePrice, "vendor");
+      const price      = penalty.finalAmount;
+      const vendorCDRaw =
+        getCol(row, "Vendor Complete Date") ||
+        row?.vendorCompleteDate ||
+        row?.rawData?.["Vendor Complete Date"] ||
+        row?.rawData?.vendorCompleteDate ||
+        "";
+      const month = vendorCDRaw
+        ? parseMonth(vendorCDRaw, row)
+        : parseMonth(getCol(row,"Month") || getCol(row,"month") || "", row);
+      if (!map[vendorName]) map[vendorName] = { total:0, gross:0, penalty:0, count:0, months:{} };
+      map[vendorName].total += price;
+      map[vendorName].gross += casePrice;
+      map[vendorName].penalty += penalty.penaltyAmount;
+      map[vendorName].count += 1;
+      if (!map[vendorName].months[month]) map[vendorName].months[month] = { total:0, gross:0, penalty:0, count:0 };
+      map[vendorName].months[month].total += price;
+      map[vendorName].months[month].gross += casePrice;
+      map[vendorName].months[month].penalty += penalty.penaltyAmount;
+      map[vendorName].months[month].count += 1;
+    });
+    return Object.entries(map)
+      .sort((a, b) => b[1].total - a[1].total)
+      .map(([name, data]) => ({
+        name, total: data.total, count: data.count,
+        months: Object.entries(data.months).sort((a, b) => monthSortKey(a[0]) - monthSortKey(b[0])).map(([month, d]) => ({ month, ...d })),
+      }));
+  }, [vendorFilteredRows, effectivePricingRules, effectiveClientPricing]);
+
+  /* ── Client summary ── */
+  const clientSummary = useMemo(() => {
+    const map = {};
+    clientFilteredRows.forEach(row => {
+      const clientName = getCol(row,"Client Name") || getCol(row,"client name") || row._client || "Unknown";
+      const cp    = getCasePrice(row, "client", effectivePricingRules, effectiveClientPricing);
+      const month = (row.isSpecialCase && row.specialBillingDate)
+        ? parseMonth(row.specialBillingDate, row)
+        : parseMonth(getCol(row,"Month") || getCol(row,"month") || "", row);
+      if (!map[clientName]) map[clientName] = { total:0, count:0, months:{} };
+      map[clientName].total += cp;
+      map[clientName].count += 1;
+      if (!map[clientName].months[month]) map[clientName].months[month] = { total:0, count:0 };
+      map[clientName].months[month].total += cp;
+      map[clientName].months[month].count += 1;
+    });
+    return Object.entries(map)
+      .sort((a, b) => b[1].total - a[1].total)
+      .map(([name, data]) => ({
+        name, total: data.total, count: data.count,
+        months: Object.entries(data.months).sort((a, b) => monthSortKey(a[0]) - monthSortKey(b[0])).map(([month, d]) => ({ month, ...d })),
+      }));
+  }, [clientFilteredRows, effectivePricingRules, effectiveClientPricing]);
+
+  const summary  = activeTab === "vendor" ? vendorSummary : clientSummary;
+  const isVendor = activeTab === "vendor";
+
+  /* ── Export summary Excel ── */
+  const exportExcel = () => {
+    const rows = [];
+    summary.forEach(company => {
+      company.months.forEach(m => {
+        rows.push(isVendor ? {
+          "Vendor Company": company.name,
+          Month: m.month,
+          Cases: m.count,
+          "Gross Amount": m.gross || 0,
+          "Penalty Deduction": m.penalty || 0,
+          "Final Payable Amount": m.total,
+        } : {
+          "Client Name": company.name,
+          Month: m.month,
+          Cases: m.count,
+          Amount: m.total,
+        });
+      });
+      rows.push(isVendor ? {
+        "Vendor Company": `TOTAL — ${company.name}`,
+        Month: "",
+        Cases: company.count,
+        "Gross Amount": company.gross || 0,
+        "Penalty Deduction": company.penalty || 0,
+        "Final Payable Amount": company.total,
+      } : {
+        "Client Name": `TOTAL — ${company.name}`,
+        Month: "",
+        Cases: company.count,
+        Amount: company.total,
+      });
+      rows.push({});
+    });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, isVendor ? "Vendor Summary" : "Client Summary");
+    saveAs(
+      new Blob([XLSX.write(wb, { bookType:"xlsx", type:"array" })]),
+      `${activeTab}_cost_summary_closed.xlsx`
+    );
+  };
+
+  /* ── Table view rows ── */
+  const tableRows = useMemo(() => {
+    const rows = [];
+    summary.forEach(company => {
+      company.months.forEach(m => {
+        rows.push({ company:company.name, month:m.month, count:m.count, amount:m.total, gross:m.gross || 0, penalty:m.penalty || 0 });
+      });
+    });
+    return rows;
+  }, [summary]);
+
+  /* ── Detail modal helpers ── */
+  const openMonthlyDetails = (type, companyName, month) => {
+    const cases = allRows.filter(row => {
+      const rowMonth = parseMonth(getCol(row,"Month") || getCol(row,"month") || "", row);
+      if (rowMonth !== month) return false;
+      if (type === "vendor") {
+        return resolveVendorName(row, effectivePricingRules, effectiveClientPricing) === companyName;
+      }
+      const clientName = getCol(row,"Client Name") || getCol(row,"client name") || row._client || "Unknown";
+      return clientName === companyName;
+    });
+    setDetailModal({ open:true, type, company:companyName, month, cases });
+  };
+
+  const handleCompanyNameClick = (company) => {
+    const type = isVendor ? "vendor" : "client";
+    if (company.months.length === 1) {
+      openMonthlyDetails(type, company.name, company.months[0].month);
+    } else {
+      setMonthPickerModal({ open: true, type, company: company.name, months: company.months });
+    }
+  };
+
+  const closeMonthPicker = () =>
+    setMonthPickerModal({ open: false, type: "", company: "", months: [] });
+
+  const closeDetails = () =>
+    setDetailModal({ open:false, type:"vendor", company:"", month:"", cases:[] });
+
+  const handleDownloadDetailExcel = () =>
+    downloadDetailExcel(detailModal, effectivePricingRules, effectiveClientPricing);
+
+  const totalDetailPrice = detailModal.cases.reduce((sum, row) => {
+    const casePrice = getCasePrice(row, detailModal.type, effectivePricingRules, effectiveClientPricing);
+    const penalty = getPenaltyInfo(row, casePrice, detailModal.type);
+    return sum + (detailModal.type === "vendor" ? penalty.finalAmount : casePrice);
+  }, 0);
+
+  const totalDetailPenalty = detailModal.cases.reduce((sum, row) => {
+    const casePrice = getCasePrice(row, detailModal.type, effectivePricingRules, effectiveClientPricing);
+    const penalty = getPenaltyInfo(row, casePrice, detailModal.type);
+    return sum + penalty.penaltyAmount;
+  }, 0);
+
+  /* ── Send via Hostinger ── */
+  const handleSendHostingerMail = () => {
+    const { type, company, month, cases } = detailModal;
+    if (!cases.length) { alert("No case details found."); return; }
+    const fileName = downloadDetailExcel(detailModal, effectivePricingRules, effectiveClientPricing);
+    const subject = `${type === "vendor" ? "Vendor" : "Client"} Monthly Validation - ${company} - ${month}`;
+    let body = buildFrontendTableText(type, company, month, cases, effectivePricingRules, effectiveClientPricing);
+    if (fileName) body = `Excel File: ${fileName}\nPlease attach this file before sending.\n\n${body}`;
+    window.open("https://mail.hostinger.com", "_blank", "noopener,noreferrer");
+    setHostingerModal({ open: true, subject, body, copied: false });
+  };
+
+  const copyBodyToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        `Subject: ${hostingerModal.subject}\n\n${hostingerModal.body}`
+      );
+      setHostingerModal(prev => ({ ...prev, copied: true }));
+      setTimeout(() => setHostingerModal(prev => ({ ...prev, copied: false })), 2500);
+    } catch (_) {
+      const el = document.createElement("textarea");
+      el.value = `Subject: ${hostingerModal.subject}\n\n${hostingerModal.body}`;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand("copy");
+      document.body.removeChild(el);
+      setHostingerModal(prev => ({ ...prev, copied: true }));
+      setTimeout(() => setHostingerModal(prev => ({ ...prev, copied: false })), 2500);
+    }
+  };
+
+  /* ── Send via WhatsApp ── */
+  const sendMonthlyValidationWhatsApp = () => {
+    const { type, company, month, cases } = detailModal;
+    if (!cases.length) { alert("No case details found."); return; }
+    const fileName = downloadDetailExcel(detailModal, effectivePricingRules, effectiveClientPricing);
+    let message = buildFrontendTableText(type, company, month, cases, effectivePricingRules, effectiveClientPricing);
+    if (fileName) message = `Excel File Created: ${fileName}\nPlease attach before sending.\n\n${message}`;
+    const phone      = getCol(cases[0],"Phone") || getCol(cases[0],"phone") || getCol(cases[0],"Phone Number") || getCol(cases[0],"Mobile Number") || "";
+    const cleanPhone = String(phone).replace(/\D/g,"");
+    window.open(
+      cleanPhone
+        ? `https://wa.me/${cleanPhone}?text=${encodeURIComponent(message)}`
+        : `https://wa.me/?text=${encodeURIComponent(message)}`,
+      "_blank"
+    );
+  };
+
+  /* ════════════════════════════ RENDER ════════════════════════════ */
+  return (
+    <div className="cs-root">
+
+      {/* Grand totals */}
+      <div className="cs-grand-strip">
+        <div className="cs-grand-card cs-grand-card-vendor">
+          <div className="cs-grand-icon cs-grand-icon-vendor">🏪</div>
+          <div>
+            <div className="cs-grand-label">Total Vendor Cost · Closed</div>
+            <div className="cs-grand-value cs-grand-value-vendor">
+              {fmt(vendorSummary.reduce((s,c) => s + c.total, 0))}
+            </div>
+            <div className="cs-grand-count">
+              {vendorSummary.length} vendor{vendorSummary.length!==1?"s":""} · {vendorSummary.reduce((s,c) => s + c.count, 0)} closed cases
+            </div>
+          </div>
+        </div>
+        <div className="cs-grand-card cs-grand-card-client">
+          <div className="cs-grand-icon cs-grand-icon-client">🏢</div>
+          <div>
+            <div className="cs-grand-label">Total Client Cost · Closed</div>
+            <div className="cs-grand-value cs-grand-value-client">
+              {fmt(clientSummary.reduce((s,c) => s + c.total, 0))}
+            </div>
+            <div className="cs-grand-count">
+              {clientSummary.length} client{clientSummary.length!==1?"s":""} · {clientSummary.reduce((s,c) => s + c.count, 0)} closed cases
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Controls */}
+      <div className="cs-controls">
+        <div className="cs-tab-group">
+          <button className={`cs-tab ${activeTab==="vendor"?"active":""}`} onClick={() => setActiveTab("vendor")}>
+            🏪 Vendor Summary
+          </button>
+          <button className={`cs-tab ${activeTab==="client"?"active":""}`} onClick={() => setActiveTab("client")}>
+            🏢 Client Summary
+          </button>
+        </div>
+        <select className="cs-select" value={monthFilter} onChange={e => setMonthFilter(e.target.value)}>
+          {allMonths.map((m,i) => <option key={i}>{m}</option>)}
+        </select>
+        <div className="cs-view-toggle">
+          <button className={`cs-view-btn ${viewMode==="cards"?"active":""}`} onClick={() => setViewMode("cards")}>⊞ Cards</button>
+          <button className={`cs-view-btn ${viewMode==="table"?"active":""}`} onClick={() => setViewMode("table")}>≡ Table</button>
+        </div>
+        <span className="cs-closed-notice">🔒 Closed cases only</span>
+        {!costLoading && costLoadingMore && (
+          <span className="cs-closed-notice" title="More closed cases are still loading in the background — totals will keep growing until this finishes">
+            🔄 Loading more… ({costLoadedCount.toLocaleString()} so far)
+          </span>
+        )}
+        <button className="cs-export-btn" onClick={exportExcel}>↓ Export Excel</button>
+      </div>
+
+      {/* Loading / empty state */}
+      {costLoading ? (
+        <div className="cs-empty">
+          <div className="cs-empty-text">Loading…</div>
+        </div>
+      ) : summary.length === 0 ? (
+        <div className="cs-empty">
+          <div className="cs-empty-icon">{isVendor ? "🏪" : "🏢"}</div>
+          <div className="cs-empty-text">No {isVendor ? "vendor" : "client"} cost data found</div>
+          <div className="cs-empty-sub">
+            {isVendor
+              ? "No closed cases with vendor pricing found. Mark cases as Closed and ensure vendor prices are set."
+              : "No closed cases with client pricing found. Mark cases as Closed and ensure client prices are set."}
+          </div>
+        </div>
+
+      /* Cards view */
+      ) : viewMode === "cards" ? (
+        <div className="cs-grid">
+          {summary.map((company, i) => {
+            const maxMonth = Math.max(...company.months.map(m => m.total), 1);
+            return (
+              <div key={i} className="cs-company-card">
+                <div className="cs-company-header">
+                  <div className={`cs-company-avatar ${isVendor?"cs-avatar-vendor":"cs-avatar-client"}`}>
+                    {initial(company.name)}
+                  </div>
+                  <div
+                    className="cs-company-name clickable"
+                    title={company.months.length === 1
+                      ? `Click to view ${company.name} — ${company.months[0].month}`
+                      : `Click to select a month for ${company.name}`}
+                    onClick={() => handleCompanyNameClick(company)}
+                  >
+                    {company.name}
+                  </div>
+                  <div className={`cs-company-total ${isVendor?"cs-company-total-vendor":"cs-company-total-client"}`}>
+                    {fmt(company.total)}
+                  </div>
+                </div>
+                <div className="cs-month-rows">
+                  {company.months.map((m, j) => (
+                    <div key={j} className="cs-month-row clickable"
+                      onClick={() => openMonthlyDetails(isVendor?"vendor":"client", company.name, m.month)}>
+                      <span className="cs-month-label">{m.month}</span>
+                      <div className="cs-month-bar-wrap">
+                        <div className={`cs-month-bar ${isVendor?"cs-bar-vendor":"cs-bar-client"}`}
+                          style={{width:`${Math.round((m.total/maxMonth)*100)}%`}}/>
+                      </div>
+                      <span className={`cs-month-amount ${isVendor?"cs-amount-vendor":"cs-amount-client"}`}>
+                        {fmt(m.total)}
+                      </span>
+                      <span className="cs-month-count">{m.count} case{m.count!==1?"s":""}</span>
+                    </div>
+                  ))}
+                  {company.months.length > 1 && (
+                    <div className="cs-month-row"
+                      style={{borderTop:"1px dashed rgba(59,130,246,0.14)",marginTop:2,paddingTop:8}}>
+                      <span className="cs-month-label" style={{fontWeight:700,color:"#0f1c3f"}}>Total</span>
+                      <div className="cs-month-bar-wrap">
+                        <div className={`cs-month-bar ${isVendor?"cs-bar-vendor":"cs-bar-client"}`} style={{width:"100%"}}/>
+                      </div>
+                      <span className={`cs-month-amount ${isVendor?"cs-amount-vendor":"cs-amount-client"}`}>
+                        {fmt(company.total)}
+                      </span>
+                      <span className="cs-month-count">{company.count} case{company.count!==1?"s":""}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+      /* Table view */
+      ) : (
+        <div className="cs-table-wrap">
+          <div className="cs-table-scroll">
+            <table className="cs-table">
+              <thead className="cs-thead">
+                <tr>
+                  <th className="cs-th">{isVendor?"Vendor":"Client"}</th>
+                  <th className="cs-th">Month</th>
+                  <th className="cs-th">Closed Cases</th>
+                  <th className="cs-th">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tableRows.map((r,i) => (
+                  <tr key={i} className="cs-tr"
+                    onClick={() => openMonthlyDetails(isVendor?"vendor":"client", r.company, r.month)}
+                    style={{cursor:"pointer"}}>
+                    <td className="cs-td cs-td-name">{r.company}</td>
+                    <td className="cs-td">{r.month}</td>
+                    <td className="cs-td">{r.count}</td>
+                    <td className={`cs-td ${isVendor?"cs-td-amount-vendor":"cs-td-amount-client"}`}>
+                      {fmt(r.amount)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Month Picker Modal */}
+      {monthPickerModal.open && (
+        <div className="cs-detail-overlay"
+          onClick={e => { if (e.target.classList.contains("cs-detail-overlay")) closeMonthPicker(); }}>
+          <div className="cs-month-picker-box">
+            <div className="cs-month-picker-title">Select a Month</div>
+            <div className="cs-month-picker-sub">
+              {monthPickerModal.company} · {monthPickerModal.months.length} month{monthPickerModal.months.length !== 1 ? "s" : ""}
+            </div>
+            <div className="cs-month-picker-list">
+              {monthPickerModal.months.map((m, i) => (
+                <button key={i} className="cs-month-picker-btn"
+                  onClick={() => {
+                    closeMonthPicker();
+                    openMonthlyDetails(monthPickerModal.type, monthPickerModal.company, m.month);
+                  }}>
+                  <span>{m.month}</span>
+                  <span className={`cs-month-picker-btn-amount${monthPickerModal.type === "client" ? " client" : ""}`}>
+                    {fmt(m.total)} · {m.count} case{m.count !== 1 ? "s" : ""}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <button className="cs-month-picker-cancel" onClick={closeMonthPicker}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Detail Modal */}
+      {detailModal.open && (
+        <div className="cs-detail-overlay"
+          onClick={e => { if(e.target.classList.contains("cs-detail-overlay")) closeDetails(); }}>
+          <div className="cs-detail-box">
+            <div className="cs-detail-head">
+              <div>
+                <div className="cs-detail-title">
+                  {detailModal.type==="vendor" ? "Vendor" : "Client"} Monthly Validation
+                </div>
+                <div className="cs-detail-sub">
+                  {detailModal.company} · {detailModal.month} · {detailModal.cases.length} closed case{detailModal.cases.length!==1?"s":""}
+                </div>
+              </div>
+              <div className="cs-detail-actions">
+                <button onClick={handleDownloadDetailExcel}
+                  style={{border:"none",borderRadius:"8px",padding:"10px 16px",cursor:"pointer",background:"linear-gradient(135deg,#3b82f6,#06b6d4)",color:"#fff",fontWeight:700,fontFamily:"'Space Grotesk',sans-serif",display:"inline-flex",alignItems:"center",gap:6}}>
+                  ↓ Excel
+                </button>
+                <button onClick={handleSendHostingerMail}
+                  style={{border:"none",borderRadius:"8px",padding:"10px 16px",cursor:"pointer",background:"linear-gradient(135deg,#f97316,#fb923c)",color:"#fff",fontWeight:700,fontFamily:"'Space Grotesk',sans-serif",display:"inline-flex",alignItems:"center",gap:6,boxShadow:"0 4px 12px rgba(249,115,22,0.28)"}}>
+                  ✉️ Send Mail
+                </button>
+                <button onClick={sendMonthlyValidationWhatsApp}
+                  style={{border:"none",borderRadius:"8px",padding:"10px 16px",cursor:"pointer",background:"linear-gradient(135deg,#22c55e,#16a34a)",color:"#fff",fontWeight:700,fontFamily:"'Space Grotesk',sans-serif",display:"inline-flex",alignItems:"center",gap:6}}>
+                  📲 WhatsApp
+                </button>
+                <button className="cs-close-btn" onClick={closeDetails}>✕</button>
+              </div>
+            </div>
+            <div className="cs-detail-scroll">
+              <table className="cs-detail-table">
+                <thead className="cs-detail-thead">
+                  <tr>
+                    {[
+                      "S.NO","Candidate Name",
+                      detailModal.type==="client" ? "Client Name" : "Vendor Name",
+                      "Check Id","Check Name","Sub Check Type",
+                      "Assigned Date","Completed Date",
+                      "Address","City","State","Pincode","Case Price",
+                      ...(detailModal.type === "vendor" ? ["Penalty Days", "Penalty %", "Penalty Amount", "Final Amount"] : []),
+                    ].map(h => <th key={h} className="cs-detail-th">{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {detailModal.cases.length === 0 ? (
+                    <tr>
+                      <td colSpan={detailModal.type === "vendor" ? 17 : 13} style={{padding:"40px",textAlign:"center",color:"#8ba3c0"}}>No cases found.</td>
+                    </tr>
+                  ) : (
+                    <>
+                      {detailModal.cases.map((row, idx) => {
+                        const casePrice = getCasePrice(row, detailModal.type, effectivePricingRules, effectiveClientPricing);
+                        const penalty = getPenaltyInfo(row, casePrice, detailModal.type);
+                        const finalAmount = detailModal.type === "vendor" ? penalty.finalAmount : casePrice;
+                        const nameCol = detailModal.type === "client"
+                          ? (getCol(row,"Client Name") || row._client || "-")
+                          : resolveVendorName(row, effectivePricingRules, effectiveClientPricing);
+                        return (
+                          <tr key={idx} className="cs-detail-tr">
+                            <td className="cs-detail-td">{getCol(row,"S.NO") || idx+1}</td>
+                            <td className="cs-detail-td">{getCol(row,"Candidate Name") || "-"}</td>
+                            <td className="cs-detail-td">{nameCol}</td>
+                            <td className="cs-detail-td">{getCol(row,"Check Id")       || "-"}</td>
+                            <td className="cs-detail-td">{getCol(row,"Check Name")     || "-"}</td>
+                            <td className="cs-detail-td">{getCol(row,"Sub Check Type") || "-"}</td>
+                            <td className="cs-detail-td">{formatDateDisplay(getCol(row,"Assigned Date") || getCol(row,"assignDate") || "")}</td>
+                            <td className="cs-detail-td">{formatDateDisplay(getCol(row,"Completed Date") || getCol(row,"completedDate") || "")}</td>
+                            <td className="cs-detail-td">{getCol(row,"Address")        || "-"}</td>
+                            <td className="cs-detail-td">{getCol(row,"City")           || "-"}</td>
+                            <td className="cs-detail-td">{getCol(row,"State")          || "-"}</td>
+                            <td className="cs-detail-td">{getCol(row,"Pincode")        || "-"}</td>
+                            <td className="cs-detail-td"
+                              style={{fontWeight:700,color:detailModal.type==="vendor"?"#2563eb":"#059669"}}>
+                              {fmt(casePrice)}
+                            </td>
+                            {detailModal.type === "vendor" && (
+                              <>
+                                <td className="cs-detail-td" style={{fontWeight:700,color:"#7c3aed"}}>
+                                  {penalty.days === null ? "-" : `${penalty.days}d`}
+                                </td>
+                                <td className="cs-detail-td" style={{fontWeight:700,color:penalty.percent ? "#c2410c" : "#059669"}}>
+                                  {penalty.percent}%
+                                </td>
+                                <td className="cs-detail-td" style={{fontWeight:700,color:"#ef4444"}}>
+                                  -{fmt(penalty.penaltyAmount)}
+                                </td>
+                                <td className="cs-detail-td" style={{fontWeight:800,color:"#059669"}}>
+                                  {fmt(finalAmount)}
+                                </td>
+                              </>
+                            )}
+                          </tr>
+                        );
+                      })}
+                      <tr style={{background:"#eef6ff"}}>
+                        <td colSpan={detailModal.type === "vendor" ? 16 : 12} className="cs-detail-td"
+                          style={{textAlign:"right",fontWeight:700,fontFamily:"'Space Grotesk',sans-serif"}}>
+                          {detailModal.type === "vendor" ? `Total Payable (Penalty Deducted: ${fmt(totalDetailPenalty)})` : "Total Pricing"}
+                        </td>
+                        <td className="cs-detail-td"
+                          style={{fontWeight:800,color:detailModal.type==="vendor"?"#2563eb":"#059669",fontFamily:"'Space Grotesk',sans-serif"}}>
+                          {fmt(totalDetailPrice)}
+                        </td>
+                      </tr>
+                    </>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hostinger Mail Helper Modal */}
+      {hostingerModal.open && (
+        <div className="cs-detail-overlay"
+          onClick={e => { if (e.target.classList.contains("cs-detail-overlay")) setHostingerModal(prev => ({...prev, open:false})); }}>
+          <div className="cs-hostinger-box">
+            <div className="cs-hostinger-header">
+              <div className="cs-hostinger-title">✉️ Send via Hostinger Mail</div>
+              <div className="cs-hostinger-sub">Excel downloaded · Copy content below · Compose in Hostinger</div>
+            </div>
+            <div className="cs-hostinger-body">
+              <div className="cs-hostinger-info">
+                ✅ <strong>Excel file downloaded.</strong> Attach it to your email before sending.
+              </div>
+              <div>
+                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",color:"#6b7a99",marginBottom:6}}>
+                  Email Subject
+                </div>
+                <div style={{background:"#f8faff",border:"1.5px solid rgba(59,130,246,0.18)",borderRadius:8,padding:"10px 14px",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:600,color:"#0f1c3f",wordBreak:"break-all"}}>
+                  {hostingerModal.subject}
+                </div>
+              </div>
+              <div>
+                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",color:"#6b7a99",marginBottom:6}}>
+                  Email Body (preview)
+                </div>
+                <div style={{background:"#f8faff",border:"1.5px solid rgba(59,130,246,0.18)",borderRadius:8,padding:"10px 14px",fontFamily:"monospace",fontSize:11,color:"#374151",maxHeight:120,overflowY:"auto",whiteSpace:"pre-wrap",lineHeight:1.5}}>
+                  {hostingerModal.body.slice(0, 400)}{hostingerModal.body.length > 400 ? "\n…(truncated)" : ""}
+                </div>
+              </div>
+              <div className="cs-hostinger-steps">
+                {[
+                  "Click \"Copy Content\" to copy subject + body to clipboard",
+                  "Click \"Open Hostinger Mail\" — it opens in a new tab",
+                  "Login if needed, then click Compose",
+                  "Choose recipient, paste subject & body, attach the Excel file",
+                  "Click Send",
+                ].map((step, i) => (
+                  <div key={i} className="cs-hostinger-step">
+                    <div className="cs-hostinger-step-num">{i + 1}</div>
+                    <span>{step}</span>
+                  </div>
+                ))}
+              </div>
+              <button className="cs-hostinger-copy-btn" onClick={copyBodyToClipboard}>
+                {hostingerModal.copied ? "✅ Copied!" : "📋 Copy Subject + Body"}
+              </button>
+              <button className="cs-hostinger-open-btn"
+                onClick={() => window.open("https://mail.hostinger.com", "_blank", "noopener,noreferrer")}>
+                ✉️ Open Hostinger Mail
+              </button>
+              <button className="cs-hostinger-cancel"
+                onClick={() => setHostingerModal(prev => ({...prev, open:false}))}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

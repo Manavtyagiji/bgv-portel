@@ -1,0 +1,25 @@
+// bgv-backend/routes/pricingRoutes.js
+import express from "express";
+import { protect, adminOnly } from "../middleware/authMiddleware.js";
+import {
+  getPricing,
+  savePricing,
+  saveScopePricing,
+  deleteScopePricing,
+} from "../controllers/pricingController.js";
+
+const router = express.Router();
+
+// ── Fetch all pricing rules for the calling user's tenant ─────────
+router.get(  "/",          protect, getPricing);
+
+// ── Replace ALL pricing rules (bulk save) ─────────────────────────
+router.put(  "/",          protect, adminOnly, savePricing);
+
+// ── Upsert rules for a SINGLE scope key (lightweight update) ──────
+router.patch("/:scopeKey", protect, adminOnly, saveScopePricing);
+
+// ── Delete a scope key's rules ────────────────────────────────────
+router.delete("/:scopeKey",protect, adminOnly, deleteScopePricing);
+
+export default router;

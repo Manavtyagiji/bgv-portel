@@ -1,0 +1,72 @@
+// bgv-backend/routes/auditRoutes.js
+// Protected endpoint for listing statusAudit entries.
+// Scoped identically to getRecords: SA sees all, admin/team see their tenantId only.
+
+import express from "express";
+import { protect } from "../middleware/authMiddleware.js";
+import StatusAudit from "../models/StatusAudit.js";
+
+const router = express.Router();
+
+function getScopeFilter(req) {
+  const role = String(req.user?.role || "").toLowerCase();
+  const isInternalTeam =
+    role === "team" &&
+    (req.user?.isInternal === true ||
+      (req.user?.tenantId == null && !req.user?.ownerAdminEmail));
+
+  if (role === "superadmin" || isInternalTeam) {
+    // SA can optionally narrow to a specific tenant via query param
+    const tid = req.query.tenantId;
+    return tid ? { tenantId: tid } : {};
+  }
+
+  // admin / team: forced to their own tenant
+  return { tenantId: req.user?.tenantId ?? null };
+}
+
+// GET /api/audit
+// Query params (all optional): tenantId, dateFrom, dateTo, changedByEmail, newStatus
+router.get("/", protect, async (req, res) => {
+  try {
+    const filter = getScopeFilter(req);
+
+    const { dateFrom, dateTo, changedByEmail, newStatus } = req.query;
+
+    if (dateFrom || dateTo) {
+      filter.timestamp = {};
+      if (dateFrom) filter.timestamp.$gte = new Date(dateFrom);
+      if (dateTo) {
+        const end = new Date(dateTo);
+        end.setHours(23, 59, 59, 999);
+        filter.timestamp.$lte = end;
+      }
+    }
+
+    if (changedByEmail && String(changedByEmail).trim()) {
+      filter.changedByEmail = {
+        $regex: String(changedByEmail).trim(),
+        $options: "i",
+      };
+    }
+
+    if (newStatus && String(newStatus).trim()) {
+      filter.newStatus = {
+        $regex: `^${String(newStatus).trim()}$`,
+        $options: "i",
+      };
+    }
+
+    const entries = await StatusAudit.find(filter)
+      .sort({ timestamp: -1 })
+      .limit(500)
+      .lean();
+
+    res.json(entries);
+  } catch (err) {
+    console.error("[auditRoutes] list error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+export default router;

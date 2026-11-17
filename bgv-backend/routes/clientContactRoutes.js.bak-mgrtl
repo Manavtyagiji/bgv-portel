@@ -1,0 +1,28 @@
+// bgv-backend/routes/clientContactRoutes.js
+
+import express from "express";
+import multer  from "multer";
+import { protect, adminOnly } from "../middleware/authMiddleware.js";
+import {
+  listClientContacts,
+  createClientContact,
+  updateClientContact,
+  deleteClientContact,
+  bulkImportClientContacts,
+  lookupClientContact,
+} from "../controllers/clientContactController.js";
+
+const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Specific routes BEFORE /:id to avoid conflict
+router.get("/lookup",      protect, adminOnly, lookupClientContact);
+router.post("/bulk-import", protect, adminOnly, upload.single("file"), bulkImportClientContacts);
+
+// CRUD
+router.get("/",       protect, adminOnly, listClientContacts);
+router.post("/",      protect, adminOnly, createClientContact);
+router.put("/:id",    protect, adminOnly, updateClientContact);
+router.delete("/:id", protect, adminOnly, deleteClientContact);
+
+export default router;

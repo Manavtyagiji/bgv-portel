@@ -1,0 +1,104 @@
+// bgv-backend/utils/saveToSentFolder.js
+//
+// NON-BLOCKING helper: after a successful SMTP send, appends a copy of the
+// message to the sender's IMAP Sent folder so it appears like a normal sent mail.
+//
+// RULES:
+//  - Never throws — all errors are logged with console.error and swallowed.
+//  - Must be called fire-and-forget: saveToSentFolder(...).catch(() => {})
+//  - Uses the same mailbox credentials that just sent the SMTP message.
+//  - Derives the IMAP host from the SMTP host (smtp.X → imap.X).
+//  - Detects the Sent folder via \Sent special-use flag, then common names.
+
+import { ImapFlow } from "imapflow";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
+
+/**
+ * @param {Object} account     - { smtpHost, smtpUser, smtpPass }
+ * @param {Object} mailOptions - the exact object passed to transporter.sendMail()
+ */
+export async function saveToSentFolder(account, mailOptions) {
+  try {
+    if (!account?.smtpUser || !account?.smtpPass) {
+      console.error("[saveToSentFolder] Missing IMAP credentials — skipping");
+      return;
+    }
+
+    const rawBuffer = await buildRawMessage(mailOptions);
+    const imapHost  = deriveImapHost(account.smtpHost);
+
+    const client = new ImapFlow({
+      host:   imapHost,
+      port:   993,
+      secure: true,
+      auth:   { user: account.smtpUser, pass: account.smtpPass },
+      logger: false,
+    });
+
+    await client.connect();
+    try {
+      const sentPath = await findSentFolder(client, account.smtpUser);
+      if (!sentPath) {
+        console.error(`[saveToSentFolder] No Sent folder found for ${account.smtpUser} — skipping`);
+        return;
+      }
+      await client.append(sentPath, rawBuffer, ["\\Seen"], new Date());
+      console.log(`[saveToSentFolder] ✅ Appended to "${sentPath}" for ${account.smtpUser}`);
+    } finally {
+      await client.logout().catch(() => {});
+    }
+  } catch (err) {
+    console.error(`[saveToSentFolder] IMAP error for ${account?.smtpUser || "unknown"}: ${err.message}`);
+  }
+}
+
+// ── Internals ────────────────────────────────────────────────────────────────
+
+function deriveImapHost(smtpHost) {
+  if (!smtpHost) return "imap.hostinger.com";
+  if (smtpHost.startsWith("smtp.")) return "imap." + smtpHost.slice(5);
+  if (smtpHost.includes("hostinger")) return "imap.hostinger.com";
+  if (smtpHost.includes("gmail"))     return "imap.gmail.com";
+  if (smtpHost.includes("outlook") || smtpHost.includes("office365")) return "imap.outlook.com";
+  return "imap.hostinger.com";
+}
+
+async function findSentFolder(client, user) {
+  try {
+    // client.list("*") returns a flat array of MailboxObject
+    // each has: path (string), flags (Set), specialUse (string|null)
+    const boxes = await client.list("*");
+
+    // 1. Prefer \Sent special-use flag (most reliable)
+    const byFlag = boxes.find(m => m.specialUse === "\\Sent");
+    if (byFlag) return byFlag.path;
+
+    // 2. Fall back to common Sent folder names (case-insensitive)
+    const candidates = ["Sent", "INBOX.Sent", "Sent Items", "Sent Messages"];
+    for (const name of candidates) {
+      const found = boxes.find(m => m.path.toLowerCase() === name.toLowerCase());
+      if (found) return found.path;
+    }
+
+    console.error(`[saveToSentFolder] Could not locate Sent folder for ${user}`);
+    return null;
+  } catch (err) {
+    console.error(`[saveToSentFolder] list error for ${user}: ${err.message}`);
+    return null;
+  }
+}
+
+function buildRawMessage(mailOptions) {
+  return new Promise((resolve, reject) => {
+    try {
+      const composer = new MailComposer(mailOptions);
+      const stream   = composer.compile().createReadStream();
+      const chunks   = [];
+      stream.on("data",  c   => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      stream.on("end",   ()  => resolve(Buffer.concat(chunks)));
+      stream.on("error", err => reject(err));
+    } catch (err) {
+      reject(err);
+    }
+  });
+}

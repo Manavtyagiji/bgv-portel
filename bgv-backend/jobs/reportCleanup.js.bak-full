@@ -1,0 +1,150 @@
+// bgv-backend/jobs/reportCleanup.js
+//
+// Deletes ONLY the uploaded report file (keeps the record) once a
+// Closed/Completed record's report is older than RETENTION_DAYS.
+// The 60-day countdown is anchored on `reportUploadedAt` (a reliable date).
+//
+// SAFETY: starts in preview mode. While DRY_RUN = true it only LOGS what
+// it would delete and deletes NOTHING. To enable real deletion, change
+// DRY_RUN to false and restart the backend.
+
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+
+import Record from "../models/Record.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Report files live at <backend>/uploads/reports
+const REPORTS_DIR = path.join(__dirname, "..", "uploads", "reports");
+
+/* ───────────────────────── SETTINGS ───────────────────────── */
+
+// true  = PREVIEW ONLY (logs what would be deleted, deletes nothing)
+// false = REAL deletion of report files
+const DRY_RUN = true;
+
+// How many days after the report was uploaded before its file is removed.
+const RETENTION_DAYS = 60;
+
+/* ─────────────────────────────────────────────────────────── */
+
+// Which status values count as "Completed / Closed".
+function isClosedStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  return (
+    s === "closed" ||
+    s === "close" ||
+    s === "completed" ||
+    s === "complete"
+  );
+}
+
+export async function cleanupOldReports() {
+  try {
+    const cutoff = new Date(
+      Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000
+    );
+
+    // Only records that actually have a report file with a reliable upload date.
+    const candidates = await Record.find({
+      reportUploaded: true,
+      reportFile: { $nin: ["", null] },
+      reportUploadedAt: { $ne: null, $lte: cutoff },
+    })
+      .select(
+        "_id status reportFile reportFileName reportUploadedAt clientName candidateName"
+      )
+      .lean();
+
+    // status is free text, so filter for closed/completed in JS.
+    const eligible = candidates.filter((r) => isClosedStatus(r.status));
+
+    console.log(
+      `[reportCleanup] ${new Date().toISOString()} | DRY_RUN=${DRY_RUN} | retention=${RETENTION_DAYS}d | cutoff=${cutoff.toISOString()} | scanned=${candidates.length} | eligible=${eligible.length}`
+    );
+
+    if (eligible.length === 0) {
+      return { scanned: candidates.length, eligible: 0, removed: 0, dryRun: DRY_RUN };
+    }
+
+    let removed = 0;
+
+    for (const r of eligible) {
+      // basename() guarantees we can only ever touch a file INSIDE REPORTS_DIR.
+      const fileName = path.basename(String(r.reportFile || ""));
+      const diskPath = path.join(REPORTS_DIR, fileName);
+      const uploadedAt = r.reportUploadedAt
+        ? new Date(r.reportUploadedAt).toISOString()
+        : "?";
+
+      console.log(
+        `  - ${DRY_RUN ? "WOULD REMOVE" : "REMOVING"} | record=${r._id} | ${r.clientName || "-"} / ${r.candidateName || "-"} | uploaded=${uploadedAt} | file=${fileName}`
+      );
+
+      if (DRY_RUN) continue;
+
+      // 1) delete the file from disk (if it still exists)
+      try {
+        if (fileName && fs.existsSync(diskPath)) {
+          fs.unlinkSync(diskPath);
+        }
+      } catch (e) {
+        console.log(`    ! could not delete file ${fileName}: ${e.message}`);
+        // skip this record so DB still points at a file we failed to remove
+        continue;
+      }
+
+      // 2) clear the report fields on the record (the record itself is kept)
+      await Record.updateOne(
+        { _id: r._id },
+        {
+          $set: {
+            reportFile: "",
+            reportFileName: "",
+            reportUploaded: false,
+            reportUploadedAt: null,
+          },
+        }
+      );
+
+      removed++;
+    }
+
+    console.log(
+      `[reportCleanup] done | ${DRY_RUN ? "previewed" : "removed"}=${DRY_RUN ? eligible.length : removed}`
+    );
+
+    return {
+      scanned: candidates.length,
+      eligible: eligible.length,
+      removed: DRY_RUN ? 0 : removed,
+      dryRun: DRY_RUN,
+    };
+  } catch (err) {
+    console.error("[reportCleanup] error:", err.message);
+    return { error: err.message };
+  }
+}
+
+// Runs once shortly after startup (for easy verification in logs),
+// then once every 24 hours.
+export function startReportCleanupSchedule() {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  // first run 15s after boot so you can see the preview in `pm2 logs`
+  setTimeout(() => {
+    cleanupOldReports();
+  }, 15 * 1000);
+
+  // then every 24h
+  setInterval(() => {
+    cleanupOldReports();
+  }, DAY);
+
+  console.log(
+    `[reportCleanup] scheduled every 24h | DRY_RUN=${DRY_RUN} | retention=${RETENTION_DAYS} days`
+  );
+}

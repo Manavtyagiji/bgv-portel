@@ -1,0 +1,518 @@
+// src/components/Inbox.jsx
+// Stage 1 — READ-ONLY per-admin email inbox (chat-style). No composing/reply
+// yet (Stage 2). Mailbox scoping is entirely server-side (see
+// bgv-backend/controllers/inboxController.js) — this component never
+// chooses or sends a mailbox identity, it just renders whatever the
+// authenticated user's scoped mailbox returns.
+
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { saveAs } from "file-saver";
+import DOMPurify from "dompurify";
+import { inboxAPI } from "../api/api";
+
+function fmtDateTime(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleString("en-IN", {
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function fmtDay(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function senderKey(from) {
+  const addr = String(from?.address || "").trim().toLowerCase();
+  return addr || String(from?.name || "unknown").trim().toLowerCase();
+}
+
+function senderLabel(from) {
+  if (!from) return "Unknown sender";
+  return from.name && from.name.trim() ? from.name.trim() : (from.address || "Unknown sender");
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export default function Inbox() {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [ownerEmail, setOwnerEmail] = useState("");
+  const [selectedSender, setSelectedSender] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [bodies, setBodies] = useState({}); // uid -> full message (fetched on demand)
+  const [openingUid, setOpeningUid] = useState(null);
+  const [downloadingKey, setDownloadingKey] = useState(null);
+
+  // Stage 2 — reply. sentReplies is keyed by conversation (sender key) so
+  // each conversation keeps its own locally-sent history; nothing here is
+  // persisted server-side beyond the actual email send + IMAP Sent-copy.
+  const [replyText, setReplyText] = useState("");
+  const [replyAttachments, setReplyAttachments] = useState([]); // File[]
+  const [sending, setSending] = useState(false);
+  const [sentReplies, setSentReplies] = useState({}); // senderKey -> [{to, subject, text, sentAt, attachmentNames}]
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError("");
+    inboxAPI.listMessages(100)
+      .then(({ ownerEmail: oe, messages: msgs }) => {
+        setOwnerEmail(oe || "");
+        setMessages(Array.isArray(msgs) ? msgs : []);
+      })
+      .catch(err => setError(err.message || "Failed to load inbox"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Group messages by sender — this is what makes the list read like
+  // conversations rather than a flat mail log. No automatic case-matching;
+  // purely a display grouping over the real mailbox contents.
+  const conversations = useMemo(() => {
+    const map = new Map();
+    messages.forEach(m => {
+      const key = senderKey(m.from);
+      if (!map.has(key)) map.set(key, { key, from: m.from, messages: [] });
+      map.get(key).messages.push(m);
+    });
+    const list = Array.from(map.values()).map(c => {
+      const sorted = [...c.messages].sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+      const unreadCount = sorted.filter(m => m.unread).length;
+      return { ...c, messages: sorted, unreadCount, lastDate: sorted[sorted.length - 1]?.date };
+    });
+    list.sort((a, b) => new Date(b.lastDate || 0) - new Date(a.lastDate || 0));
+    return list;
+  }, [messages]);
+
+  // Search filters the visible conversation list only — matches sender
+  // name/address or any subject within that conversation. Purely a display
+  // filter over what's already loaded; doesn't touch the mailbox or refetch.
+  const visibleConversations = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return conversations;
+    return conversations.filter(c => {
+      const name = String(c.from?.name || "").toLowerCase();
+      const addr = String(c.from?.address || "").toLowerCase();
+      if (name.includes(q) || addr.includes(q)) return true;
+      return c.messages.some(m => String(m.subject || "").toLowerCase().includes(q));
+    });
+  }, [conversations, searchQuery]);
+
+  const activeConversation = conversations.find(c => c.key === selectedSender) || null;
+
+  const openMessage = (uid) => {
+    if (bodies[uid]) return; // already fetched
+    setOpeningUid(uid);
+    inboxAPI.getMessage(uid)
+      .then(full => {
+        setBodies(prev => ({ ...prev, [uid]: full }));
+        setMessages(prev => prev.map(m => (m.uid === uid ? { ...m, unread: false } : m)));
+      })
+      .catch(err => setBodies(prev => ({ ...prev, [uid]: { error: err.message || "Failed to load message" } })))
+      .finally(() => setOpeningUid(null));
+  };
+
+  // Auto-open the most recent message in a conversation as soon as it's
+  // selected, so the reading pane isn't empty on click. Also clear any
+  // draft reply left over from a previous conversation.
+  useEffect(() => {
+    setReplyText("");
+    setReplyAttachments([]);
+    if (activeConversation && activeConversation.messages.length > 0) {
+      const latest = activeConversation.messages[activeConversation.messages.length - 1];
+      openMessage(latest.uid);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSender]);
+
+  const downloadAttachment = async (uid, att) => {
+    const key = `${uid}-${att.index}`;
+    setDownloadingKey(key);
+    try {
+      const blob = await inboxAPI.fetchAttachmentBlob(uid, att.index);
+      saveAs(blob, att.filename || "attachment");
+    } catch (e) {
+      alert("Download failed: " + (e.message || "Unknown error"));
+    } finally {
+      setDownloadingKey(null);
+    }
+  };
+
+  const sendReply = async () => {
+    if (!activeConversation || !replyText.trim()) return;
+    const latest = activeConversation.messages[activeConversation.messages.length - 1];
+    const latestBody = bodies[latest.uid];
+    const toAddress = activeConversation.from?.address || "";
+    if (!toAddress) {
+      alert("Can't determine a reply-to address for this conversation.");
+      return;
+    }
+    const rawSubject = latestBody?.subject || latest.subject || "";
+    const subject = /^re:/i.test(rawSubject.trim()) ? rawSubject : `Re: ${rawSubject}`;
+
+    setSending(true);
+    try {
+      const result = await inboxAPI.sendReply(latest.uid, {
+        to: toAddress,
+        subject,
+        text: replyText,
+        inReplyTo: latestBody?.messageId || "",
+        attachments: replyAttachments,
+      });
+      setSentReplies(prev => ({
+        ...prev,
+        [activeConversation.key]: [...(prev[activeConversation.key] || []), result],
+      }));
+      setReplyText("");
+      setReplyAttachments([]);
+    } catch (e) {
+      alert("Failed to send reply: " + (e.message || "Unknown error"));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const totalUnread = messages.filter(m => m.unread).length;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{
+        background: "var(--card)", border: "1.5px solid var(--border2)",
+        borderRadius: "var(--r16)", padding: "20px 24px", boxShadow: "var(--shadow)",
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12,
+      }}>
+        <div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 17, fontWeight: 700, color: "var(--text)", marginBottom: 4 }}>
+            📧 Inbox {ownerEmail ? <span style={{ fontSize: 13, fontWeight: 500, color: "var(--text3)" }}>— {ownerEmail}</span> : null}
+          </div>
+          <div style={{ fontSize: 13, color: "var(--text3)" }}>
+            Read-only view of your mailbox, grouped by sender. {totalUnread > 0 ? `${totalUnread} unread.` : "All caught up."}
+          </div>
+        </div>
+        <button
+          onClick={load}
+          disabled={loading}
+          style={{
+            fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+            padding: "8px 16px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+            background: "transparent", color: "var(--text)", cursor: loading ? "default" : "pointer",
+          }}
+        >
+          {loading ? "Refreshing…" : "⟳ Refresh"}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{
+          background: "rgba(239,68,68,0.08)", border: "1.5px solid rgba(239,68,68,0.25)",
+          borderRadius: "var(--r16)", padding: "16px 20px", color: "#b91c1c", fontSize: 13,
+        }}>
+          {error}
+        </div>
+      )}
+
+      {loading && messages.length === 0 && !error && (
+        <div style={{
+          background: "var(--card)", border: "1.5px dashed var(--border2)",
+          borderRadius: "var(--r16)", padding: "48px 24px", textAlign: "center", boxShadow: "var(--shadow)",
+        }}>
+          <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text3)" }}>Loading…</div>
+        </div>
+      )}
+
+      {!loading && !error && messages.length === 0 && (
+        <div style={{
+          background: "var(--card)", border: "1.5px dashed var(--border2)",
+          borderRadius: "var(--r16)", padding: "48px 24px", textAlign: "center", boxShadow: "var(--shadow)",
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.22 }}>📭</div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text3)" }}>No messages found</div>
+        </div>
+      )}
+
+      {messages.length > 0 && (
+        <div style={{
+          display: "grid", gridTemplateColumns: "320px 1fr", gap: 20, minHeight: 480,
+        }}>
+          {/* Conversation list */}
+          <div style={{
+            background: "var(--card)", border: "1.5px solid var(--border2)",
+            borderRadius: "var(--r16)", boxShadow: "var(--shadow)", overflow: "hidden",
+            display: "flex", flexDirection: "column", maxHeight: 640,
+          }}>
+            <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border2)", flexShrink: 0 }}>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="🔍 Search sender or subject…"
+                style={{
+                  width: "100%", fontFamily: "var(--head)", fontSize: 12.5,
+                  padding: "8px 12px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                  background: "var(--card)", color: "var(--text)", boxSizing: "border-box",
+                }}
+              />
+            </div>
+            <div style={{ overflowY: "auto" }}>
+              {visibleConversations.length === 0 && (
+                <div style={{ padding: "20px 18px", fontSize: 12.5, color: "var(--text3)", textAlign: "center" }}>
+                  No conversations match "{searchQuery}"
+                </div>
+              )}
+              {visibleConversations.map(c => {
+                const last = c.messages[c.messages.length - 1];
+                const active = c.key === selectedSender;
+                return (
+                  <div
+                    key={c.key}
+                    onClick={() => setSelectedSender(c.key)}
+                    style={{
+                      padding: "14px 18px", cursor: "pointer",
+                      borderBottom: "1px solid var(--border2)",
+                      background: active ? "rgba(37,99,235,0.08)" : "transparent",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{
+                        fontFamily: "var(--head)", fontSize: 13.5, fontWeight: 700, color: "var(--text)",
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        {senderLabel(c.from)}
+                      </div>
+                      {c.unreadCount > 0 && (
+                        <span style={{
+                          fontFamily: "var(--head)", fontSize: 10, fontWeight: 700, color: "#fff",
+                          background: "#2563eb", borderRadius: 999, padding: "1px 7px", flexShrink: 0,
+                        }}>
+                          {c.unreadCount}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{
+                      fontSize: 12.5, color: "var(--text3)", marginTop: 3,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }}>
+                      {last?.subject}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 4, opacity: 0.8 }}>
+                      {fmtDay(c.lastDate)} · {c.messages.length} message{c.messages.length !== 1 ? "s" : ""}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Chat-style reading pane */}
+          <div style={{
+            background: "var(--card)", border: "1.5px solid var(--border2)",
+            borderRadius: "var(--r16)", boxShadow: "var(--shadow)", overflow: "hidden",
+            display: "flex", flexDirection: "column", maxHeight: 640,
+          }}>
+            {!activeConversation && (
+              <div style={{
+                flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+                color: "var(--text3)", fontSize: 14, fontFamily: "var(--head)",
+              }}>
+                Select a conversation to read it
+              </div>
+            )}
+
+            {activeConversation && (
+              <div style={{ overflowY: "auto", padding: "20px 24px", display: "flex", flexDirection: "column", gap: 16, flex: 1 }}>
+                {activeConversation.messages.map(m => {
+                  const full = bodies[m.uid];
+                  const isOpening = openingUid === m.uid;
+                  return (
+                    <div key={m.uid} style={{
+                      background: "rgba(37,99,235,0.04)", border: "1px solid var(--border2)",
+                      borderRadius: "var(--r16)", padding: "14px 18px",
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 6 }}>
+                        <div style={{ fontFamily: "var(--head)", fontSize: 14, fontWeight: 700, color: "var(--text)" }}>
+                          {m.subject}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--text3)", whiteSpace: "nowrap" }}>
+                          {fmtDateTime(m.date)}
+                        </div>
+                      </div>
+
+                      {!full && !isOpening && (
+                        <button
+                          onClick={() => openMessage(m.uid)}
+                          style={{
+                            fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+                            padding: "6px 14px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                            background: "transparent", color: "var(--text)", cursor: "pointer",
+                          }}
+                        >
+                          Open message
+                        </button>
+                      )}
+
+                      {isOpening && (
+                        <div style={{ fontSize: 12.5, color: "var(--text3)" }}>Loading…</div>
+                      )}
+
+                      {full && full.error && (
+                        <div style={{ fontSize: 12.5, color: "#b91c1c" }}>{full.error}</div>
+                      )}
+
+                      {full && !full.error && (
+                        <div>
+                          {full.html
+                            ? <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6 }}
+                                // Email HTML is untrusted content — sanitize before
+                                // rendering (strips <script>, event handlers, etc.).
+                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(full.html) }} />
+                            : <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                                {full.text}
+                              </div>
+                          }
+
+                          {full.attachments && full.attachments.length > 0 && (
+                            <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                              {full.attachments.map(att => {
+                                const key = `${m.uid}-${att.index}`;
+                                return (
+                                  <button
+                                    key={key}
+                                    onClick={() => downloadAttachment(m.uid, att)}
+                                    disabled={downloadingKey === key}
+                                    style={{
+                                      fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+                                      padding: "6px 12px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                                      background: "transparent", color: "var(--text)",
+                                      cursor: downloadingKey === key ? "default" : "pointer",
+                                      textAlign: "left", width: "fit-content",
+                                    }}
+                                  >
+                                    {downloadingKey === key ? "Downloading…" : `📎 ${att.filename} (${fmtSize(att.size)})`}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {(sentReplies[activeConversation.key] || []).map((r, i) => (
+                  <div key={`sent-${i}`} style={{
+                    background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.25)",
+                    borderRadius: "var(--r16)", padding: "14px 18px", marginLeft: 32,
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 6 }}>
+                      <div style={{ fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 700, color: "#059669" }}>
+                        You replied
+                      </div>
+                      <div style={{ fontSize: 11.5, color: "var(--text3)", whiteSpace: "nowrap" }}>
+                        {fmtDateTime(r.sentAt)}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                      {r.text}
+                    </div>
+                    {r.attachmentNames && r.attachmentNames.length > 0 && (
+                      <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                        {r.attachmentNames.map((name, ai) => (
+                          <div key={ai} style={{ fontSize: 11.5, color: "#059669" }}>📎 {name}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {activeConversation && (
+              <div style={{
+                borderTop: "1px solid var(--border2)", padding: "14px 18px",
+                display: "flex", flexDirection: "column", gap: 8, flexShrink: 0,
+              }}>
+                <textarea
+                  value={replyText}
+                  onChange={e => setReplyText(e.target.value)}
+                  placeholder={`Reply to ${senderLabel(activeConversation.from)}…`}
+                  rows={3}
+                  style={{
+                    fontFamily: "var(--head)", fontSize: 13, padding: "10px 12px",
+                    borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                    background: "var(--card)", color: "var(--text)", resize: "vertical",
+                  }}
+                />
+
+                {replyAttachments.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {replyAttachments.map((file, i) => (
+                      <span key={i} style={{
+                        display: "inline-flex", alignItems: "center", gap: 6,
+                        fontSize: 11.5, color: "var(--text)", background: "rgba(37,99,235,0.08)",
+                        border: "1px solid var(--border2)", borderRadius: "var(--r8)", padding: "4px 8px",
+                      }}>
+                        📎 {file.name} ({fmtSize(file.size)})
+                        <span
+                          onClick={() => setReplyAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                          style={{ cursor: "pointer", fontWeight: 700, color: "var(--text3)" }}
+                        >
+                          ×
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <label style={{
+                    fontFamily: "var(--head)", fontSize: 12, fontWeight: 600, color: "var(--text)",
+                    cursor: "pointer", padding: "6px 12px", borderRadius: "var(--r8)",
+                    border: "1.5px solid var(--border2)",
+                  }}>
+                    📎 Attach files
+                    <input
+                      type="file"
+                      multiple
+                      onChange={e => {
+                        const picked = Array.from(e.target.files || []);
+                        setReplyAttachments(prev => [...prev, ...picked].slice(0, 5));
+                        e.target.value = "";
+                      }}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+
+                  <button
+                    onClick={sendReply}
+                    disabled={sending || !replyText.trim()}
+                    style={{
+                      fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 600,
+                      padding: "8px 18px", borderRadius: "var(--r8)", border: "none",
+                      background: sending || !replyText.trim() ? "rgba(37,99,235,0.35)" : "#2563eb",
+                      color: "#fff", cursor: sending || !replyText.trim() ? "default" : "pointer",
+                    }}
+                  >
+                    {sending ? "Sending…" : "Send Reply"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

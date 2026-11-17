@@ -1,0 +1,3628 @@
+/**
+ * App.jsx — Multi-tenant BGV Portal
+ *
+ * FIX: Super Admin's internal staff can now see their allocated clients + records.
+ *
+ * ROOT CAUSE:
+ * Internal staff (isInternal=true, tenantId=null, ownerAdminEmail=null) had no
+ * path in visibleClients or loadAllocationsForUser to find the super admin's
+ * allocation key (clientAllocations_superadmin@tervies.com).
+ *
+ * THE FIX (3 places):
+ * 1. loadAllocationsForUser — adds a path for internal staff to find SA allocations
+ * 2. visibleClients useMemo — adds internal staff lookup via SUPER_ADMIN_EMAIL
+ * 3. loadClientsDataForUser — internal staff now reads from SA's DB data (they have
+ *    no tenantId so tenant-keyed lookup always returned null)
+ *
+ * All other fixes preserved (no dancing rows, company admin DB sync, etc.)
+ */
+
+import { useState, useEffect, useMemo, useRef, startTransition } from "react";
+const APP_VERSION = "v25";
+import Upload          from "./components/Upload";
+import { MASTER_KEY }  from "./components/Upload";
+import MyTable         from "./components/MyTable.jsx";
+import CostSummary     from "./components/CostSummary.jsx";
+import TotalBusiness   from "./components/TotalBusiness.jsx";
+import Allocations     from "./components/Allocations.jsx";
+import TAT             from "./components/TAT.jsx";
+import AdminDataView   from "./components/AdminDataView.jsx";
+import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
+import DailyUploads      from "./components/DailyUploads.jsx";
+import DailyClosedCases  from "./components/DailyClosedCases.jsx";
+import Inbox              from "./components/Inbox.jsx";
+import InboxWidget        from "./components/InboxWidget.jsx";
+import StatusAuditLog    from "./components/StatusAuditLog.jsx";
+import VendorContacts    from "./components/VendorContacts.jsx";
+import SentReports       from "./components/SentReports.jsx";
+import ClientContacts    from "./components/ClientContacts.jsx";
+import { useNavigate } from "react-router-dom";
+import { uploadAPI, tenantSyncAPI, pricingAPI, inboxAPI }   from "./api/api";
+import { idbGet, idbSet } from "./utils/idbCache";
+import { canAccessScreen, isManagerOrTL } from "./utils/permissions";
+import terviesLogo from "./terviesLogo";
+import {
+  isSuperAdmin, isTenantAdmin, isTeamMember, isInternalUser,
+  getTenantId, getTenantData,
+  getAllUsers, saveAllUsers, getAllTenants,
+} from "./utils/tenantAuth";
+
+/* ══════════════════════════════════════════════════════════════
+   SUPER ADMIN EMAIL — must match tenantAuth.js + authController.js
+══════════════════════════════════════════════════════════════ */
+const SUPER_ADMIN_EMAIL = "superadmin@tervies.com";
+
+/* Super Admin internal-team sync helpers only */
+const API_BASE =
+  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://localhost:5002/api"
+  : "/api";
+function getAuthTokenForApp() {
+  try {
+    const cu = JSON.parse(localStorage.getItem("currentUser") || "{}");
+    return cu?.token || localStorage.getItem("token") || localStorage.getItem("authToken") || localStorage.getItem("jwt") || "";
+  } catch {
+    return localStorage.getItem("token") || localStorage.getItem("authToken") || localStorage.getItem("jwt") || "";
+  }
+}
+
+function normaliseSAInternalUser(u = {}) {
+  const roleRaw = String(u.role || "").trim().toLowerCase();
+  // Internal-by-convention: the SAME fallback used everywhere else in this
+  // codebase for internal-staff detection (allocation scoping, mailbox
+  // resolution, etc.) — isInternal===true OR (no tenantId AND no
+  // ownerAdminEmail). Some genuinely-internal users have isInternal
+  // explicitly false in the database with no tenant/owner, which this
+  // function used to miss entirely (checking isInternal alone), so they
+  // never got the "Tervies Internal" badge and never qualified for the
+  // Manager/TL role options, which read this same normalized isInternal.
+  const isInternalByConvention =
+    u.isInternal === true || (!u.tenantId && !u.ownerAdminEmail);
+
+  // manager/tl are their own distinct internal roles now — must NOT be
+  // collapsed into generic "team" the way plain internal team members are,
+  // or their role would silently redisplay as "Team" everywhere in Manage
+  // Users despite being saved correctly in the database.
+  const internalTeam =
+    isInternalByConvention &&
+    roleRaw !== "superadmin" &&
+    roleRaw !== "admin" &&
+    roleRaw !== "secondary_admin" &&
+    roleRaw !== "manager" &&
+    roleRaw !== "tl";
+
+  return {
+    ...u,
+    email: String(u.email || "").trim().toLowerCase(),
+    role: internalTeam ? "team" : (roleRaw || "team"),
+    status: String(u.status || "pending").trim().toLowerCase(),
+    isInternal: isInternalByConvention,
+    _orgName: isInternalByConvention ? "Tervies Internal" : u._orgName,
+  };
+}
+
+function isSAInternalTeamUser(u = {}) {
+  const role = String(u.role || "").trim().toLowerCase();
+  return u.isInternal === true && role !== "superadmin" && role !== "admin" && role !== "secondary_admin";
+}
+
+function mergeUsersByEmail(localUsers = [], remoteUsers = []) {
+  const map = new Map();
+  [...localUsers, ...remoteUsers].forEach(raw => {
+    const u = normaliseSAInternalUser(raw);
+    if (!u.email) return;
+    map.set(u.email, { ...(map.get(u.email) || {}), ...u });
+  });
+  return Array.from(map.values());
+}
+
+async function fetchUsersForSuperAdminManagement() {
+  const token = getAuthTokenForApp();
+  if (!token) return [];
+
+  const endpoints = ["/auth/users", "/auth/all-users"];
+  for (const ep of endpoints) {
+    try {
+      const res = await fetch(`${API_BASE}${ep}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) continue;
+      const arr = Array.isArray(data) ? data : (Array.isArray(data.users) ? data.users : []);
+      if (arr.length) return arr.map(normaliseSAInternalUser);
+    } catch (e) {
+      console.warn("Super Admin user sync failed:", e.message);
+    }
+  }
+  return [];
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root {
+  --bg:#f0f6ff; --bg2:#e6f0ff; --card:#ffffff;
+  --border:rgba(59,130,246,0.12); --border2:rgba(59,130,246,0.22);
+  --text:#0f1c3f; --text2:#4a6080; --text3:#8ba3c0;
+  --accent:#2563eb; --accent2:#06b6d4;
+  --accentg:linear-gradient(135deg,#2563eb 0%,#06b6d4 100%);
+  --green:#10b981; --amber:#f59e0b; --red:#ef4444;
+  --gold:#f5a623; --purple:#7c3aed;
+  --sidebar-w:240px; --sidebar-collapsed:64px;
+  --r8:8px; --r12:12px; --r16:16px;
+  --head:'Space Grotesk',sans-serif;
+  --body:'Plus Jakarta Sans',sans-serif;
+  --ease:cubic-bezier(.4,0,.2,1);
+  --shadow:0 4px 24px rgba(37,99,235,0.09);
+  --shadow-md:0 8px 36px rgba(37,99,235,0.13);
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+.app-shell { font-family:var(--body); background:var(--bg); color:var(--text); min-height:100vh; display:flex; position:relative; overflow:hidden; }
+.app-mesh { position:fixed; inset:0; pointer-events:none; z-index:0; background: radial-gradient(ellipse 80% 50% at 10% 0%,rgba(37,99,235,0.09) 0%,transparent 60%), radial-gradient(ellipse 55% 40% at 90% 10%,rgba(6,182,212,0.07) 0%,transparent 50%), radial-gradient(ellipse 50% 55% at 80% 85%,rgba(16,185,129,0.05) 0%,transparent 55%); }
+.sidebar { position:fixed; top:0; left:0; bottom:0; width:var(--sidebar-w); background:#fff; border-right:1.5px solid var(--border2); box-shadow:4px 0 24px rgba(37,99,235,0.07); z-index:100; display:flex; flex-direction:column; transition:width 0.28s var(--ease); overflow:hidden; }
+.sidebar.collapsed { width:var(--sidebar-collapsed); }
+.sidebar-logo { display:flex; align-items:center; gap:10px; padding:20px 16px 18px; border-bottom:1px solid var(--border2); min-height:68px; flex-shrink:0; }
+.sidebar-logo-icon { width:36px; height:36px; border-radius:10px; background:var(--accentg); display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; box-shadow:0 4px 12px rgba(37,99,235,0.25); }
+.sidebar-logo-text { font-family:var(--head); font-size:14px; font-weight:700; color:var(--text); white-space:nowrap; overflow:hidden; line-height:1.2; }
+.sidebar-logo-sub { font-size:11px; color:var(--text3); margin-top:1px; white-space:nowrap; overflow:hidden; }
+.sidebar-toggle { position:absolute; top:20px; right:-14px; width:28px; height:28px; border-radius:50%; background:#fff; border:1.5px solid var(--border2); box-shadow:0 2px 8px rgba(37,99,235,0.12); display:flex; align-items:center; justify-content:center; cursor:pointer; z-index:101; font-size:12px; color:var(--accent); transition:all 0.2s var(--ease); }
+.sidebar-toggle:hover { background:var(--bg2); }
+.sidebar-nav { flex:1; padding:12px 8px; overflow-y:auto; overflow-x:hidden; }
+.sidebar-nav::-webkit-scrollbar { width:3px; }
+.sidebar-nav::-webkit-scrollbar-thumb { background:var(--border2); border-radius:99px; }
+.sidebar-section-label { font-family:var(--head); font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.10em; color:var(--text3); padding:10px 10px 6px; white-space:nowrap; overflow:hidden; transition:opacity 0.2s; }
+.sidebar.collapsed .sidebar-section-label { opacity:0; }
+.nav-item { display:flex; align-items:center; gap:11px; padding:10px 10px; border-radius:var(--r8); cursor:pointer; margin-bottom:2px; transition:all 0.18s var(--ease); position:relative; white-space:nowrap; overflow:hidden; }
+.nav-item:hover { background:var(--bg2); }
+.nav-item.active { background:linear-gradient(135deg,rgba(37,99,235,0.12),rgba(6,182,212,0.08)); border:1px solid rgba(37,99,235,0.20); }
+.nav-item.active .nav-label { color:var(--accent); font-weight:700; }
+.nav-item.active::before { content:''; position:absolute; left:0; top:6px; bottom:6px; width:3px; border-radius:99px; background:var(--accentg); }
+.nav-icon { width:36px; height:36px; border-radius:var(--r8); display:flex; align-items:center; justify-content:center; font-size:17px; flex-shrink:0; }
+.nav-item.active .nav-icon { background:rgba(37,99,235,0.10); }
+.nav-label { font-family:var(--head); font-size:13px; font-weight:600; color:var(--text2); flex:1; overflow:hidden; text-overflow:ellipsis; transition:opacity 0.2s; }
+.sidebar.collapsed .nav-label { opacity:0; width:0; }
+.nav-badge { background:#ef4444; color:#fff; font-size:10px; font-weight:800; min-width:18px; height:18px; border-radius:99px; display:flex; align-items:center; justify-content:center; padding:0 5px; font-family:var(--head); flex-shrink:0; transition:opacity 0.2s; }
+.sidebar.collapsed .nav-badge { opacity:0; }
+.sidebar-bottom { padding:10px 8px 16px; border-top:1px solid var(--border2); flex-shrink:0; }
+.license-box { margin:0 4px 10px; padding:10px 12px; background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(6,182,212,0.06)); border:1px solid rgba(37,99,235,0.15); border-radius:10px; overflow:hidden; transition:opacity 0.2s; }
+.sidebar.collapsed .license-box { opacity:0; height:0; margin:0; padding:0; border:none; }
+.license-label { font-family:var(--head); font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color:var(--text3); margin-bottom:4px; }
+.license-days { font-family:var(--head); font-size:20px; font-weight:800; color:var(--accent); line-height:1; }
+.license-days-sub { font-family:var(--head); font-size:10px; color:var(--text3); margin-top:1px; margin-bottom:7px; }
+.license-bar-bg { height:4px; background:rgba(37,99,235,0.10); border-radius:99px; overflow:hidden; }
+.license-bar-fill { height:100%; border-radius:99px; transition:width 0.5s; }
+.sidebar.collapsed .nav-item:hover::after { content:attr(data-label); position:absolute; left:calc(var(--sidebar-collapsed) - 4px); top:50%; transform:translateY(-50%); background:var(--text); color:#fff; font-family:var(--head); font-size:12px; font-weight:600; padding:5px 10px; border-radius:7px; white-space:nowrap; z-index:200; box-shadow:0 4px 12px rgba(0,0,0,0.18); pointer-events:none; }
+.app-main { flex:1; min-width:0; margin-left:var(--sidebar-w); min-height:100vh; transition:margin-left 0.28s var(--ease); position:relative; z-index:1; display:flex; flex-direction:column; }
+.app-main.sidebar-collapsed { margin-left:var(--sidebar-collapsed); }
+.topbar { position:sticky; top:0; z-index:50; background:rgba(240,246,255,0.92); backdrop-filter:blur(12px); border-bottom:1px solid var(--border2); padding:0 28px; height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+.topbar-left  { display:flex; align-items:center; gap:12px; }
+.topbar-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.topbar-page-title { font-family:var(--head); font-size:17px; font-weight:700; color:var(--text); display:flex; align-items:center; gap:8px; }
+.topbar-breadcrumb { font-size:12px; color:var(--text3); display:flex; align-items:center; gap:5px; }
+.topbar-role-badge { display:inline-flex; align-items:center; gap:5px; font-family:var(--head); font-size:11px; font-weight:700; padding:4px 11px; border-radius:99px; }
+.role-superadmin { background:linear-gradient(135deg,rgba(245,166,35,0.14),rgba(245,166,35,0.08)); border:1px solid rgba(245,166,35,0.40); color:#92610a; }
+.role-admin     { background:rgba(37,99,235,0.09);  border:1px solid rgba(37,99,235,0.25);  color:var(--accent); }
+.role-secondary { background:rgba(124,58,237,0.09); border:1px solid rgba(124,58,237,0.25); color:#6d28d9; }
+.role-team      { background:rgba(16,185,129,0.09); border:1px solid rgba(16,185,129,0.25); color:#059669; }
+.topbar-org-badge { display:inline-flex; align-items:center; gap:6px; background:rgba(124,58,237,0.08); border:1px solid rgba(124,58,237,0.22); color:var(--purple); font-family:var(--head); font-size:11px; font-weight:700; padding:4px 11px; border-radius:99px; }
+.topbar-admin-badge { display:inline-flex; align-items:center; gap:6px; background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.22); color:#059669; font-family:var(--head); font-size:11px; font-weight:700; padding:4px 11px; border-radius:99px; }
+.app-total-badge { background:var(--card); border:1px solid var(--border2); border-radius:var(--r12); padding:8px 18px; display:flex; flex-direction:column; align-items:flex-end; box-shadow:var(--shadow); }
+.app-total-label { font-family:var(--head); font-size:9.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.09em; color:var(--text3); }
+.app-total-value { font-family:var(--head); font-size:20px; font-weight:700; background:var(--accentg); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; line-height:1.1; }
+.admin-btn { font-family:var(--head); font-size:13px; font-weight:600; display:inline-flex; align-items:center; gap:7px; padding:8px 16px; border-radius:var(--r8); cursor:pointer; transition:all 0.18s var(--ease); white-space:nowrap; background:linear-gradient(135deg,rgba(37,99,235,0.10),rgba(6,182,212,0.08)); border:1.5px solid rgba(37,99,235,0.28); color:var(--accent); box-shadow:0 2px 10px rgba(37,99,235,0.08); position:relative; }
+.admin-btn:hover { background:linear-gradient(135deg,rgba(37,99,235,0.16),rgba(6,182,212,0.12)); transform:translateY(-1px); }
+.admin-btn-badge { position:absolute; top:-6px; right:-6px; background:#ef4444; color:#fff; font-size:10px; font-weight:800; width:18px; height:18px; border-radius:50%; display:flex; align-items:center; justify-content:center; box-shadow:0 2px 6px rgba(239,68,68,0.40); }
+.logout-btn { font-family:var(--head); font-size:13px; font-weight:600; display:inline-flex; align-items:center; gap:6px; padding:8px 16px; border-radius:var(--r8); cursor:pointer; transition:all 0.18s var(--ease); background:#fff; border:1.5px solid rgba(239,68,68,0.28); color:#dc2626; box-shadow:0 2px 8px rgba(239,68,68,0.07); }
+.logout-btn:hover { background:#fef2f2; transform:translateY(-1px); }
+.page-content { padding:28px 28px 48px; flex:1; min-width:0; }
+.panel { background:var(--card); border:1px solid var(--border2); border-radius:var(--r16); box-shadow:var(--shadow); overflow:hidden; min-width:0; }
+.app-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:20px; }
+.stat-card { background:var(--card); border:1.5px solid var(--border2); border-radius:var(--r16); padding:18px 20px; display:flex; align-items:center; gap:14px; box-shadow:var(--shadow); transition:all 0.2s var(--ease); position:relative; overflow:hidden; cursor:pointer; user-select:none; }
+.stat-card:hover { transform:translateY(-3px); box-shadow:var(--shadow-md); }
+.stat-card:active { transform:scale(0.98); }
+.stat-card.active-green  { border-color:rgba(16,185,129,0.55);  background:linear-gradient(135deg,rgba(16,185,129,0.06),rgba(52,211,153,0.04));  box-shadow:0 0 0 3px rgba(16,185,129,0.14),var(--shadow-md); }
+.stat-card.active-amber  { border-color:rgba(245,158,11,0.55);  background:linear-gradient(135deg,rgba(245,158,11,0.06),rgba(251,191,36,0.04));  box-shadow:0 0 0 3px rgba(245,158,11,0.14),var(--shadow-md); }
+.stat-card.active-blue   { border-color:rgba(37,99,235,0.55);   background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(6,182,212,0.04));    box-shadow:0 0 0 3px rgba(37,99,235,0.14),var(--shadow-md); }
+.stat-card.active-purple { border-color:rgba(124,58,237,0.55);  background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(139,92,246,0.04));  box-shadow:0 0 0 3px rgba(124,58,237,0.14),var(--shadow-md); }
+.stat-card.active-red    { border-color:rgba(239,68,68,0.55);   background:linear-gradient(135deg,rgba(239,68,68,0.06),rgba(248,113,113,0.04));   box-shadow:0 0 0 3px rgba(239,68,68,0.14),var(--shadow-md); }
+.stat-card.active-teal   { border-color:rgba(20,184,166,0.55);  background:linear-gradient(135deg,rgba(20,184,166,0.06),rgba(45,212,191,0.04));   box-shadow:0 0 0 3px rgba(20,184,166,0.14),var(--shadow-md); }
+.stat-filter-badge { position:absolute; top:10px; right:10px; background:var(--accentg); color:#fff; font-size:9px; font-weight:700; padding:2px 7px; border-radius:99px; font-family:var(--head); text-transform:uppercase; }
+.stat-icon-wrap { width:40px; height:40px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
+.sicon-green  { background:rgba(16,185,129,0.10); border:1px solid rgba(16,185,129,0.20); }
+.sicon-amber  { background:rgba(245,158,11,0.10); border:1px solid rgba(245,158,11,0.20); }
+.sicon-blue   { background:rgba(37,99,235,0.10);  border:1px solid rgba(37,99,235,0.20);  }
+.sicon-purple { background:rgba(124,58,237,0.10); border:1px solid rgba(124,58,237,0.20); }
+.sicon-red    { background:rgba(239,68,68,0.10);  border:1px solid rgba(239,68,68,0.20);  }
+.sicon-teal   { background:rgba(20,184,166,0.10); border:1px solid rgba(20,184,166,0.20); }
+.stat-label { font-family:var(--head); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--text3); }
+.stat-value { font-family:var(--head); font-size:26px; font-weight:700; line-height:1.15; margin-top:2px; }
+.sv-green  { background:linear-gradient(135deg,#10b981,#34d399); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.sv-amber  { background:linear-gradient(135deg,#f59e0b,#fbbf24); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.sv-blue   { background:var(--accentg); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.sv-purple { background:linear-gradient(135deg,#7c3aed,#a78bfa); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.sv-red    { background:linear-gradient(135deg,#ef4444,#f87171); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.sv-teal   { background:linear-gradient(135deg,#14b8a6,#2dd4bf); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.stat-bar-wrap { margin-top:6px; height:3px; background:var(--border2); border-radius:99px; overflow:hidden; width:90px; }
+.stat-bar { height:100%; border-radius:99px; transition:width 0.6s var(--ease); }
+.sbar-green  { background:linear-gradient(90deg,#10b981,#34d399); }
+.sbar-amber  { background:linear-gradient(90deg,#f59e0b,#fbbf24); }
+.sbar-purple { background:linear-gradient(90deg,#7c3aed,#a78bfa); }
+.sbar-red    { background:linear-gradient(90deg,#ef4444,#f87171); }
+.sbar-teal   { background:linear-gradient(90deg,#14b8a6,#2dd4bf); }
+.stat-hint { font-size:10px; color:var(--text3); margin-top:4px; font-family:var(--head); opacity:0.7; }
+.live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 0 3px rgba(16,185,129,0.20); animation:lglow 2s ease infinite; display:inline-block; }
+@keyframes lglow { 0%,100%{box-shadow:0 0 0 3px rgba(16,185,129,0.20);}50%{box-shadow:0 0 0 7px rgba(16,185,129,0.07);} }
+.alloc-team-notice { display:flex; align-items:center; gap:10px; background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(6,182,212,0.04)); border:1.5px solid rgba(37,99,235,0.20); border-radius:12px; padding:12px 18px; margin-bottom:16px; }
+.alloc-team-notice-icon { font-size:18px; flex-shrink:0; }
+.alloc-team-notice-text { font-family:var(--head); font-size:13px; font-weight:600; color:var(--accent); }
+.alloc-team-notice-sub  { font-size:12px; color:var(--text3); margin-top:2px; }
+.tenant-notice { display:flex; align-items:center; gap:10px; background:linear-gradient(135deg,rgba(124,58,237,0.07),rgba(139,92,246,0.04)); border:1.5px solid rgba(124,58,237,0.22); border-radius:12px; padding:12px 18px; margin-bottom:16px; }
+.tenant-notice-icon { font-size:18px; flex-shrink:0; }
+.tenant-notice-text { font-family:var(--head); font-size:13px; font-weight:600; color:var(--purple); }
+.tenant-notice-sub  { font-size:12px; color:var(--text3); margin-top:2px; }
+.admin-under-notice { display:flex; align-items:center; gap:10px; background:linear-gradient(135deg,rgba(16,185,129,0.07),rgba(6,182,212,0.04)); border:1.5px solid rgba(16,185,129,0.22); border-radius:12px; padding:12px 18px; margin-bottom:16px; }
+.admin-under-notice-icon { font-size:18px; flex-shrink:0; }
+.admin-under-notice-text { font-family:var(--head); font-size:13px; font-weight:600; color:#059669; }
+.admin-under-notice-sub  { font-size:12px; color:var(--text3); margin-top:2px; }
+.data-loading { display:flex; align-items:center; justify-content:center; gap:10px; padding:14px 20px; background:rgba(37,99,235,0.04); border:1px solid rgba(37,99,235,0.14); border-radius:var(--r12); margin-bottom:16px; font-family:var(--head); font-size:13px; color:var(--accent); font-weight:600; }
+.data-loading-spin { width:16px; height:16px; border-radius:50%; border:2px solid rgba(37,99,235,0.20); border-top-color:var(--accent); animation:spin 0.7s linear infinite; flex-shrink:0; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.client-filter-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; background:var(--card); border:1.5px solid var(--border2); border-radius:var(--r12); padding:14px 18px; box-shadow:var(--shadow); }
+.client-filter-label { font-family:var(--head); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.09em; color:var(--text3); flex-shrink:0; }
+.client-filter-all { font-family:var(--head); font-size:12px; font-weight:700; padding:6px 16px; border-radius:99px; cursor:pointer; transition:all 0.15s; flex-shrink:0; }
+.client-filter-all.active { background:linear-gradient(135deg,#2563eb,#06b6d4); border:1px solid transparent; color:#fff; box-shadow:0 3px 12px rgba(37,99,235,0.28); }
+.client-filter-all:not(.active) { background:rgba(37,99,235,0.08); border:1px solid rgba(37,99,235,0.22); color:var(--accent); }
+.client-filter-select { font-family:var(--head); font-size:13px; font-weight:600; background:#f8faff; border:1.5px solid var(--border2); border-radius:var(--r8); padding:7px 32px 7px 12px; color:var(--text); outline:none; cursor:pointer; appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 10px center; min-width:200px; max-width:340px; transition:all 0.18s; }
+.client-filter-select:focus { background-color:#fff; border-color:var(--accent); box-shadow:0 0 0 3px rgba(37,99,235,0.09); }
+.client-active-badge { display:inline-flex; align-items:center; gap:8px; margin-left:auto; }
+.client-active-pill { font-family:var(--head); font-size:12px; font-weight:700; background:linear-gradient(135deg,rgba(37,99,235,0.10),rgba(6,182,212,0.08)); border:1px solid rgba(37,99,235,0.25); color:var(--accent); padding:5px 14px; border-radius:99px; display:inline-flex; align-items:center; gap:6px; }
+.client-clear-btn { font-family:var(--head); font-size:11px; font-weight:600; color:var(--text3); border:1px solid var(--border2); background:transparent; border-radius:99px; padding:4px 10px; cursor:pointer; transition:all 0.15px; }
+.client-clear-btn:hover { color:var(--accent); border-color:rgba(37,99,235,0.30); }
+.app-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:320px; gap:12px; }
+.app-empty-icon { font-size:48px; opacity:0.25; }
+.app-empty-text { font-family:var(--head); font-size:15px; color:var(--text3); }
+.app-empty-sub  { font-size:13px; color:var(--text3); opacity:0.7; text-align:center; max-width:320px; }
+.access-denied { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:320px; gap:14px; background:linear-gradient(135deg,rgba(239,68,68,0.04),rgba(245,158,11,0.03)); border:1.5px dashed rgba(239,68,68,0.22); border-radius:var(--r16); }
+.access-denied-icon  { font-size:48px; opacity:0.35; }
+.access-denied-title { font-family:var(--head); font-size:18px; font-weight:700; color:#b91c1c; }
+.access-denied-sub   { font-size:13px; color:var(--text3); text-align:center; max-width:320px; line-height:1.6; }
+.modal-overlay { position:fixed; inset:0; z-index:1000; background:rgba(15,28,63,0.45); backdrop-filter:blur(6px); display:flex; align-items:center; justify-content:center; padding:20px; animation:fadeIn 0.2s var(--ease); }
+@keyframes fadeIn { from{opacity:0;} to{opacity:1;} }
+.modal-box { background:var(--card); border:1.5px solid var(--border2); border-radius:20px; width:100%; max-width:720px; max-height:90vh; overflow:hidden; box-shadow:0 24px 80px rgba(37,99,235,0.18); display:flex; flex-direction:column; animation:slideUp 0.25s var(--ease); }
+@keyframes slideUp { from{opacity:0;transform:translateY(20px);}to{opacity:1;transform:translateY(0);} }
+.modal-header { padding:20px 24px 16px; border-bottom:1.5px solid var(--border2); display:flex; align-items:center; justify-content:space-between; flex-shrink:0; flex-wrap:wrap; gap:10px; }
+.modal-title { font-family:var(--head); font-size:17px; font-weight:700; color:var(--text); display:flex; align-items:center; gap:10px; }
+.modal-title-icon { width:34px; height:34px; border-radius:10px; background:linear-gradient(135deg,rgba(37,99,235,0.12),rgba(6,182,212,0.08)); border:1px solid rgba(37,99,235,0.22); display:flex; align-items:center; justify-content:center; font-size:16px; }
+.modal-close { width:32px; height:32px; border-radius:8px; border:1.5px solid var(--border2); background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:16px; color:var(--text3); transition:all 0.15s; }
+.modal-close:hover { background:var(--bg2); color:var(--text); }
+.modal-org-tabs { display:flex; gap:6px; flex-wrap:wrap; padding:12px 24px; border-bottom:1.5px solid var(--border2); flex-shrink:0; }
+.modal-org-tab { font-family:var(--head); font-size:11.5px; font-weight:600; padding:4px 13px; border-radius:99px; cursor:pointer; transition:all 0.15s; border:1.5px solid rgba(37,99,235,0.20); background:rgba(37,99,235,0.06); color:var(--accent); white-space:nowrap; }
+.modal-org-tab:hover { background:rgba(37,99,235,0.12); }
+.modal-org-tab.active { background:linear-gradient(135deg,#2563eb,#06b6d4); border-color:transparent; color:#fff; box-shadow:0 2px 10px rgba(37,99,235,0.25); }
+.modal-section-tabs { display:flex; border-bottom:1.5px solid var(--border2); flex-shrink:0; }
+.modal-section-tab { flex:1; padding:12px 16px; font-family:var(--head); font-size:13px; font-weight:600; text-align:center; cursor:pointer; color:var(--text3); border:none; background:transparent; transition:all 0.15s; position:relative; display:flex; align-items:center; justify-content:center; gap:7px; }
+.modal-section-tab:hover { color:var(--text2); background:var(--bg); }
+.modal-section-tab.active { color:var(--accent); }
+.modal-section-tab.active::after { content:''; position:absolute; bottom:-1.5px; left:0; right:0; height:2.5px; background:var(--accentg); border-radius:99px; }
+.modal-section-count { font-size:10px; font-weight:800; padding:2px 7px; border-radius:99px; font-family:var(--head); }
+.sc-admin  { background:rgba(37,99,235,0.10);  color:var(--accent); border:1px solid rgba(37,99,235,0.22); }
+.sc-team   { background:rgba(16,185,129,0.10); color:#059669; border:1px solid rgba(16,185,129,0.22); }
+.sc-pend   { background:rgba(245,158,11,0.12); color:#b45309; border:1px solid rgba(245,158,11,0.25); }
+.modal-status-tabs { display:flex; gap:4px; padding:10px 22px; border-bottom:1px solid var(--border2); flex-shrink:0; }
+.modal-status-tab { font-family:var(--head); font-size:11.5px; font-weight:600; padding:4px 12px; border-radius:99px; cursor:pointer; transition:all 0.14s; }
+.mst-pending  { background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.22); color:#b45309; }
+.mst-pending.active  { background:rgba(245,158,11,0.18); border-color:rgba(245,158,11,0.45); }
+.mst-approved { background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.22); color:#059669; }
+.mst-approved.active { background:rgba(16,185,129,0.18); border-color:rgba(16,185,129,0.45); }
+.mst-rejected { background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.22); color:#b91c1c; }
+.mst-rejected.active { background:rgba(239,68,68,0.18); border-color:rgba(239,68,68,0.45); }
+.modal-body { overflow-y:auto; flex:1; padding:14px 22px 22px; }
+.modal-body::-webkit-scrollbar { width:4px; }
+.modal-body::-webkit-scrollbar-thumb { background:var(--border2); border-radius:99px; }
+.user-card { background:var(--bg); border:1.5px solid var(--border2); border-radius:12px; padding:14px 16px; margin-bottom:10px; display:flex; align-items:flex-start; gap:14px; transition:all 0.15s; flex-wrap:wrap; }
+.user-card:hover { border-color:rgba(37,99,235,0.30); box-shadow:0 2px 12px rgba(37,99,235,0.07); }
+.user-card:last-child { margin-bottom:0; }
+.user-card-admin { border-color:rgba(37,99,235,0.20); background:linear-gradient(135deg,rgba(37,99,235,0.03),rgba(6,182,212,0.02)); }
+.user-avatar { width:40px; height:40px; border-radius:11px; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:17px; font-weight:700; font-family:var(--head); color:#fff; }
+.ua-superadmin{ background:linear-gradient(135deg,#f5a623,#fbbf24); }
+.ua-admin     { background:linear-gradient(135deg,#2563eb,#06b6d4); }
+.ua-secondary { background:linear-gradient(135deg,#7c3aed,#a78bfa); }
+.ua-team      { background:linear-gradient(135deg,#10b981,#34d399); }
+.ua-pending   { background:linear-gradient(135deg,#f59e0b,#fbbf24); }
+.ua-rejected  { background:linear-gradient(135deg,#ef4444,#f87171); }
+.user-info { flex:1; min-width:0; }
+.user-name  { font-family:var(--head); font-size:14px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.user-email { font-size:12px; color:var(--text3); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.user-meta  { font-size:11px; color:var(--text3); margin-top:3px; font-family:var(--head); display:flex; flex-wrap:wrap; gap:8px; }
+.user-meta-item { display:inline-flex; align-items:center; gap:3px; }
+.user-org-badge { display:inline-flex; align-items:center; gap:4px; background:rgba(245,166,35,0.10); border:1px solid rgba(245,166,35,0.30); color:#92400e; font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:99px; font-family:var(--head); margin-top:4px; }
+.user-access-code { font-family:monospace; font-size:10.5px; background:rgba(37,99,235,0.08); border:1px solid rgba(37,99,235,0.18); color:var(--accent); padding:2px 7px; border-radius:5px; margin-top:4px; display:inline-block; }
+.usb { padding:3px 10px; border-radius:99px; font-size:11px; font-weight:700; font-family:var(--head); text-transform:uppercase; flex-shrink:0; }
+.usb-pending  { background:rgba(245,158,11,0.10); border:1px solid rgba(245,158,11,0.25); color:#b45309; }
+.usb-approved { background:rgba(16,185,129,0.10); border:1px solid rgba(16,185,129,0.25); color:#059669; }
+.usb-rejected { background:rgba(239,68,68,0.10);  border:1px solid rgba(239,68,68,0.22); color:#b91c1c; }
+.user-actions { display:flex; gap:6px; flex-shrink:0; flex-wrap:wrap; align-items:center; }
+.ua-btn { font-family:var(--head); font-size:12px; font-weight:600; border:none; border-radius:7px; padding:6px 13px; cursor:pointer; transition:all 0.15s; display:inline-flex; align-items:center; gap:5px; }
+.ua-btn:active { transform:scale(0.96); }
+.ua-approve { background:linear-gradient(135deg,#10b981,#34d399); color:#001a0d; }
+.ua-approve:hover { filter:brightness(1.08); transform:translateY(-1px); }
+.ua-reject  { background:rgba(239,68,68,0.09); border:1px solid rgba(239,68,68,0.25); color:#b91c1c; }
+.ua-reject:hover  { background:rgba(239,68,68,0.15); }
+.ua-revoke  { background:rgba(245,158,11,0.09); border:1px solid rgba(245,158,11,0.25); color:#92400e; }
+.ua-revoke:hover  { background:rgba(245,158,11,0.15); }
+.ua-reset  { background:rgba(37,99,235,0.09); border:1px solid rgba(37,99,235,0.25); color:var(--accent); }
+.ua-reset:hover  { background:rgba(37,99,235,0.15); transform:translateY(-1px); }
+.role-select { font-family:var(--head); font-size:11.5px; font-weight:600; border:1.5px solid var(--border2); border-radius:7px; padding:5px 28px 5px 10px; background:#f8faff; color:var(--text); outline:none; cursor:pointer; appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%238ba3c0' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 8px center; }
+.role-select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(37,99,235,0.09); }
+.role-pill-admin     { display:inline-flex;align-items:center;gap:4px;background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.22);color:var(--accent);font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:99px;font-family:var(--head); }
+.role-pill-secondary { display:inline-flex;align-items:center;gap:4px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.22);color:#6d28d9;font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:99px;font-family:var(--head); }
+.role-pill-team      { display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.22);color:#059669;font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:99px;font-family:var(--head); }
+.modal-empty { text-align:center; padding:40px 20px; color:var(--text3); }
+.modal-empty-icon { font-size:32px; opacity:0.3; margin-bottom:10px; }
+.modal-empty-text { font-family:var(--head); font-size:13.5px; }
+/* ── Hamburger + mobile sidebar overlay ── */
+.hamburger-btn{display:none;align-items:center;justify-content:center;width:36px;height:36px;border:1.5px solid var(--border2);border-radius:8px;background:#fff;cursor:pointer;font-size:20px;color:var(--text);flex-shrink:0;transition:all 0.18s var(--ease);}
+.hamburger-btn:hover{background:var(--bg2);}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.40);z-index:99;}
+/* ── Mobile breakpoint (≤768 px) ── */
+@media(max-width:768px){
+  .sidebar{transform:translateX(-100%);width:var(--sidebar-w)!important;}
+  .sidebar.mobile-open{transform:translateX(0);box-shadow:8px 0 40px rgba(37,99,235,0.18);}
+  .sidebar-toggle{display:none;}
+  .sidebar-overlay.active{display:block;}
+  .app-main,.app-main.sidebar-collapsed{margin-left:0!important;}
+  .hamburger-btn{display:inline-flex;}
+  .topbar{padding:0 14px;height:56px;}
+  .topbar-page-title{font-size:14px;}
+  .topbar-breadcrumb{display:none;}
+  .app-total-badge,.topbar-org-badge,.topbar-admin-badge{display:none;}
+  .page-content{padding:14px 14px 32px;}
+  .modal-box{border-radius:14px;}
+}
+/* ── Small phone (≤480 px) ── */
+@media(max-width:480px){
+  .topbar{padding:0 10px;height:52px;}
+  .page-content{padding:10px 10px 24px;}
+  .stat-value{font-size:22px;}
+  .stat-card{padding:14px 16px;gap:12px;}
+}
+`;
+
+if (typeof document !== "undefined" && !document.getElementById("app-css")) {
+  const s = document.createElement("style");
+  s.id = "app-css";
+  s.textContent = CSS;
+  document.head.appendChild(s);
+}
+
+const NAV_ITEMS = [
+  { id:"dashboard",   label:"Dashboard",    icon:"📊", section:"main"                  },
+  { id:"upload",      label:"Add Clients",  icon:"📤", section:"main", teamHidden:true },
+  { id:"records",     label:"Records",      icon:"📋", section:"main"                  },
+  { id:"inbox",       label:"Inbox",        icon:"📧", section:"main"                  },
+  { id:"tat",         label:"TAT Tracker",  icon:"⏱️", section:"main"                  },
+  { id:"admindata",   label:"All Records",  icon:"🗄️", section:"main", adminOnly:true  },
+  { id:"cost",        label:"Cost Summary", icon:"💰", section:"main", adminOnly:true  },
+  { id:"totalbusiness", label:"Total Business", icon:"💼", section:"main", superOnly:true },
+  { id:"allocations",    label:"Allocations",     icon:"🗂️", section:"admin", adminOnly:true },
+  { id:"auditlog",       label:"Close History",   icon:"🕐", section:"admin", adminOnly:true },
+  { id:"sentreports",    label:"Sent Reports",    icon:"📤", section:"admin", adminOnly:true },
+  { id:"clientcontacts", label:"Client Contacts", icon:"📬", section:"admin", adminOnly:true },
+  { id:"tenants",        label:"All Tenants",     icon:"🌐", section:"super", superOnly:true },
+  { id:"vendorcontacts", label:"Vendor Contacts", icon:"📧", section:"super", superOnly:true },
+];
+
+const STATUS_DEFS = [
+  { key:"Sent",    icon:"✅", cls:"active-green",  icls:"sicon-green",  vcls:"sv-green",  bar:"sbar-green",  color:"#059669", bg:"rgba(16,185,129,0.09)", border:"rgba(16,185,129,0.25)", hint:"sent cases"    },
+  { key:"Closed",  icon:"🔒", cls:"active-teal",   icls:"sicon-teal",   vcls:"sv-teal",   bar:"sbar-teal",   color:"#0d9488", bg:"rgba(20,184,166,0.09)", border:"rgba(20,184,166,0.25)", hint:"closed cases"  },
+  { key:"Pending", icon:"⏳", cls:"active-amber",  icls:"sicon-amber",  vcls:"sv-amber",  bar:"sbar-amber",  color:"#b45309", bg:"rgba(245,158,11,0.09)", border:"rgba(245,158,11,0.25)", hint:"pending cases" },
+  { key:"Insuff",  icon:"⚠️", cls:"active-purple", icls:"sicon-purple", vcls:"sv-purple", bar:"sbar-purple", color:"#6d28d9", bg:"rgba(124,58,237,0.08)", border:"rgba(124,58,237,0.22)", hint:"insuff cases"  },
+  { key:"Hold",    icon:"✋", cls:"active-amber",  icls:"sicon-amber",  vcls:"sv-amber",  bar:"sbar-amber",  color:"#92400e", bg:"rgba(245,158,11,0.07)", border:"rgba(245,158,11,0.20)", hint:"on hold cases" },
+  { key:"Stop",    icon:"🛑", cls:"active-red",    icls:"sicon-red",    vcls:"sv-red",    bar:"sbar-red",    color:"#b91c1c", bg:"rgba(239,68,68,0.08)",  border:"rgba(239,68,68,0.22)",  hint:"stopped cases" },
+];
+
+// Secondary-admin-only status — appended to STATUS_DEFS at render time,
+// gated by showInsuffClearOption. Kept separate from STATUS_DEFS itself so
+// super admin's pill list (and anything else that reads STATUS_DEFS
+// directly) is completely untouched.
+const INSUFF_CLEAR_DEF =
+  { key:"Insuff Clear", icon:"✔️", cls:"active-blue", icls:"sicon-blue", vcls:"sv-blue", bar:"sbar-blue", color:"#1d4ed8", bg:"rgba(37,99,235,0.08)", border:"rgba(37,99,235,0.22)", hint:"insuff cleared cases" };
+
+/* ─────────────────────────── HELPERS ──────────────────────────────────────  */
+function AccessDenied({ title }) {
+  return (
+    <div className="access-denied">
+      <div className="access-denied-icon">🔒</div>
+      <div className="access-denied-title">Access Restricted</div>
+      <div className="access-denied-sub">{title} is not available for your role.</div>
+    </div>
+  );
+}
+
+function safeLocalSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); }
+  catch (e) { console.warn(`localStorage quota exceeded for "${key}" — skipping.`); }
+}
+
+function safeLocalGet(key, fallback = null) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw === undefined) return fallback;
+    return JSON.parse(raw);
+  } catch { return fallback; }
+}
+
+
+// These three used to also scan EVERY "xAllocations_*" key in localStorage,
+// regardless of which admin it belonged to. That let a team member's session
+// pick up an unrelated admin's stale/leftover allocation bucket if it merely
+// happened to also contain their email — showing incorrect data that no
+// longer matched what was actually assigned to them, and made a removed
+// allocation not reliably disappear. Only the caller-supplied, correctly
+// scoped candidate keys (their own admin's bucket, the SA-internal-staff
+// bucket, or their tenant admin's bucket — computed by the caller) are
+// checked now.
+function getAllClientAllocationStorageKeys(extraKeys = []) {
+  const keys = [];
+  const push = (k) => { if (k && !keys.includes(k)) keys.push(k); };
+  extraKeys.forEach(push);
+  push("clientAllocations"); // legacy single shared key — kept for backward compat
+  return keys;
+}
+
+function getAllVendorAllocationStorageKeys(extraKeys = []) {
+  const keys = [];
+  const push = (k) => { if (k && !keys.includes(k)) keys.push(k); };
+  extraKeys.forEach(push);
+  return keys;
+}
+
+function getAllCheckAllocationStorageKeys(extraKeys = []) {
+  const keys = [];
+  const push = (k) => { if (k && !keys.includes(k)) keys.push(k); };
+  extraKeys.forEach(push);
+  return keys;
+}
+function normalizeAllocationMapKeys(map = {}) {
+  if (!map || typeof map !== "object" || Array.isArray(map)) return {};
+  const out = { ...map };
+  Object.keys(map).forEach(k => {
+    const nk = String(k || "").trim().toLowerCase();
+    if (nk && Array.isArray(map[k]) && !out[nk]) out[nk] = map[k];
+  });
+  return out;
+}
+
+function findUserAllocationsInMap(map, user = {}) {
+  if (!map || typeof map !== "object") return [];
+
+  const candidates = [
+    user.email,
+    String(user.email || "").trim().toLowerCase(),
+    user.name,
+    String(user.name || "").trim().toLowerCase(),
+    user._id,
+    user.id,
+  ]
+    .filter(Boolean)
+    .map(v => String(v).trim());
+
+  for (const c of candidates) {
+    if (Array.isArray(map[c]) && map[c].length > 0) return map[c];
+  }
+
+  const lowerSet = new Set(candidates.map(v => v.toLowerCase()));
+  for (const [k, v] of Object.entries(map)) {
+    if (Array.isArray(v) && v.length > 0 && lowerSet.has(String(k).trim().toLowerCase())) return v;
+  }
+
+  return [];
+}
+function pickAllocationMapForUserFromServerMap(serverMap = {}, user = {}) {
+  const role = String(user?.role || "").trim().toLowerCase();
+  const tenantId = user?.tenantId || null;
+  const keysToTry = [];
+
+  if (role === "team") {
+    if (user?.ownerAdminEmail) {
+      keysToTry.push(`clientAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+
+    // Super Admin internal staff must read Super Admin allocation bucket on every device.
+    if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+      keysToTry.push(`clientAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+
+    if (tenantId) {
+      const tenants = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`clientAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+  } else if (role === "admin" || role === "superadmin") {
+    keysToTry.push(`clientAllocations_${String(user.email || "").trim().toLowerCase()}`);
+  }
+
+  const allKeys = Array.from(new Set([
+    ...keysToTry,
+    ...Object.keys(serverMap || {}).filter(k => String(k).startsWith("clientAllocations_")),
+  ]));
+
+  // Prefer the bucket that actually has this team member's allocations.
+  for (const key of allKeys) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+  }
+
+  // Then return the expected admin bucket, even if empty.
+  for (const key of keysToTry) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) return parsed;
+  }
+
+  return {};
+}
+
+async function fetchSyncedAllocationsForUser(user = {}) {
+  try {
+    const all = await tenantSyncAPI.getAllocations();
+    const serverMap = all && typeof all === "object" ? all : {};
+
+    Object.entries(serverMap).forEach(([key, value]) => {
+      try {
+        if (key && String(key).startsWith("clientAllocations_")) {
+          localStorage.setItem(key, JSON.stringify(normalizeAllocationMapKeys(value || {})));
+        }
+      } catch (_) {}
+    });
+
+    const picked = pickAllocationMapForUserFromServerMap(serverMap, user);
+    if (picked && Object.keys(picked).length > 0) return picked;
+  } catch (e) {
+    console.warn("Allocation server sync failed:", e.message);
+  }
+
+  return loadAllocationsForUser(user);
+}
+
+function loadVendorAllocationsForUser(user) {
+  const role     = user?.role     || "";
+  const tenantId = user?.tenantId || null;
+
+  try {
+    if (role === "team") {
+      const keysToTry = [];
+
+      // Company team members read only their company/admin vendor allocation bucket.
+      if (user?.ownerAdminEmail) {
+        keysToTry.push(`vendorAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+      }
+
+      // Super Admin internal team reads only Super Admin vendor allocation bucket.
+      if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+        keysToTry.push(`vendorAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+      }
+
+      // Company team fallback: tenant admin bucket.
+      if (tenantId) {
+        const tenants    = getAllTenants();
+        const adminEmail = tenants[tenantId]?.adminEmail;
+        if (adminEmail) keysToTry.push(`vendorAllocations_${String(adminEmail).trim().toLowerCase()}`);
+      }
+
+      for (const key of getAllVendorAllocationStorageKeys(keysToTry)) {
+        try {
+          const saved = localStorage.getItem(key);
+          if (!saved) continue;
+          const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+          if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+        } catch (_) {}
+      }
+    } else if (role === "admin" || role === "superadmin") {
+      const key   = `vendorAllocations_${String(user.email || "").trim().toLowerCase()}`;
+      const saved = localStorage.getItem(key);
+      if (saved) return normalizeAllocationMapKeys(JSON.parse(saved));
+    }
+  } catch (_) {}
+
+  return {};
+}
+
+function pickVendorAllocationMapForUserFromServerMap(serverMap = {}, user = {}) {
+  const role = String(user?.role || "").trim().toLowerCase();
+  const tenantId = user?.tenantId || null;
+  const keysToTry = [];
+
+  if (role === "team") {
+    if (user?.ownerAdminEmail) {
+      keysToTry.push(`vendorAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+
+    if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+      keysToTry.push(`vendorAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+
+    if (tenantId) {
+      const tenants = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`vendorAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+  } else if (role === "admin" || role === "superadmin") {
+    keysToTry.push(`vendorAllocations_${String(user.email || "").trim().toLowerCase()}`);
+  }
+
+  const allKeys = Array.from(new Set([
+    ...keysToTry,
+    ...Object.keys(serverMap || {}).filter(k => String(k).startsWith("vendorAllocations_")),
+  ]));
+
+  // Prefer bucket that has this team member's vendor allocations.
+  for (const key of allKeys) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+  }
+
+  // Then return expected admin bucket, even if empty.
+  for (const key of keysToTry) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) return parsed;
+  }
+
+  return {};
+}
+
+async function fetchSyncedVendorAllocationsForUser(user = {}) {
+  try {
+    const all = await tenantSyncAPI.getAllocations();
+    const serverMap = all && typeof all === "object" ? all : {};
+
+    Object.entries(serverMap).forEach(([key, value]) => {
+      try {
+        if (key && String(key).startsWith("vendorAllocations_")) {
+          localStorage.setItem(key, JSON.stringify(normalizeAllocationMapKeys(value || {})));
+        }
+      } catch (_) {}
+    });
+
+    const picked = pickVendorAllocationMapForUserFromServerMap(serverMap, user);
+    if (picked && Object.keys(picked).length > 0) return picked;
+  } catch (e) {
+    console.warn("Vendor allocation server sync failed:", e.message);
+  }
+
+  return loadVendorAllocationsForUser(user);
+}
+
+/* ── CHECK ALLOCATION (mirrors vendor allocation exactly) ── */
+function loadCheckAllocationsForUser(user) {
+  const role     = user?.role     || "";
+  const tenantId = user?.tenantId || null;
+
+  try {
+    if (role === "team") {
+      const keysToTry = [];
+
+      if (user?.ownerAdminEmail) {
+        keysToTry.push(`checkAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+      }
+
+      if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+        keysToTry.push(`checkAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+      }
+
+      if (tenantId) {
+        const tenants    = getAllTenants();
+        const adminEmail = tenants[tenantId]?.adminEmail;
+        if (adminEmail) keysToTry.push(`checkAllocations_${String(adminEmail).trim().toLowerCase()}`);
+      }
+
+      for (const key of getAllCheckAllocationStorageKeys(keysToTry)) {
+        try {
+          const saved = localStorage.getItem(key);
+          if (!saved) continue;
+          const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+          if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+        } catch (_) {}
+      }
+    } else if (role === "admin" || role === "superadmin") {
+      const key   = `checkAllocations_${String(user.email || "").trim().toLowerCase()}`;
+      const saved = localStorage.getItem(key);
+      if (saved) return normalizeAllocationMapKeys(JSON.parse(saved));
+    }
+  } catch (_) {}
+
+  return {};
+}
+
+function pickCheckAllocationMapForUserFromServerMap(serverMap = {}, user = {}) {
+  const role     = String(user?.role || "").trim().toLowerCase();
+  const tenantId = user?.tenantId || null;
+  const keysToTry = [];
+
+  if (role === "team") {
+    if (user?.ownerAdminEmail) {
+      keysToTry.push(`checkAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+    if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+      keysToTry.push(`checkAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+    if (tenantId) {
+      const tenants = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`checkAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+  } else if (role === "admin" || role === "superadmin") {
+    keysToTry.push(`checkAllocations_${String(user.email || "").trim().toLowerCase()}`);
+  }
+
+  const allKeys = Array.from(new Set([
+    ...keysToTry,
+    ...Object.keys(serverMap || {}).filter(k => String(k).startsWith("checkAllocations_")),
+  ]));
+
+  for (const key of allKeys) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+  }
+
+  for (const key of keysToTry) {
+    const parsed = normalizeAllocationMapKeys(serverMap[key] || {});
+    if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) return parsed;
+  }
+
+  return {};
+}
+
+async function fetchSyncedCheckAllocationsForUser(user = {}) {
+  try {
+    const all = await tenantSyncAPI.getAllocations();
+    const serverMap = all && typeof all === "object" ? all : {};
+
+    Object.entries(serverMap).forEach(([key, value]) => {
+      try {
+        if (key && String(key).startsWith("checkAllocations_")) {
+          localStorage.setItem(key, JSON.stringify(normalizeAllocationMapKeys(value || {})));
+        }
+      } catch (_) {}
+    });
+
+    const picked = pickCheckAllocationMapForUserFromServerMap(serverMap, user);
+    if (picked && Object.keys(picked).length > 0) return picked;
+  } catch (e) {
+    console.warn("Check allocation server sync failed:", e.message);
+  }
+
+  return loadCheckAllocationsForUser(user);
+}
+
+
+function getRowStatusValue(row) {
+  if (!row) return "Pending";
+  return (
+    row["Status"] || row["status"] || row["STATUS"] ||
+    row["Case Status"] || row["case status"] || row["BGV Status"] ||
+    row["bgv status"] || row["Verification Status"] || row["Current Status"] ||
+    (row.rawData && typeof row.rawData === "object" && (
+      row.rawData["Status"] || row.rawData["status"] || row.rawData["STATUS"] ||
+      row.rawData["Case Status"] || row.rawData["BGV Status"] ||
+      row.rawData["Verification Status"] || row.rawData["Current Status"]
+    )) || "Pending"
+  );
+}
+
+function getClientName(row) {
+  return (
+    row["clientName"] || row["Client Name"] || row["client_name"] ||
+    row["Company Name"] || row["company_name"] || row["COMPANY NAME"] ||
+    row["client"] || row["Client"] ||
+    (row.rawData && typeof row.rawData === "object" && (
+      row.rawData["Client Name"] || row.rawData["client name"] ||
+      row.rawData["CLIENT NAME"] || row.rawData["Company Name"] ||
+      row.rawData["company name"] || row.rawData["Client"] || row.rawData["client"]
+    )) || ""
+  ).toString().trim();
+}
+
+function getVendorName(row) {
+  return (
+    row["vendorName"] || row["Vendor Name"] || row["vendor name"] ||
+    row["VendorName"] || row["Vendor Company"] || row["vendor company"] ||
+    row["Vendor Company Name"] || row["vendor company name"] ||
+    row["Vendor"] || row["vendor"] ||
+    (row.rawData && typeof row.rawData === "object" && (
+      row.rawData["Vendor Name"] || row.rawData["vendor name"] ||
+      row.rawData["VendorName"] || row.rawData["Vendor Company"] ||
+      row.rawData["vendor company"] || row.rawData["Vendor Company Name"] ||
+      row.rawData["vendor company name"] || row.rawData["Vendor"] || row.rawData["vendor"]
+    )) || ""
+  ).toString().trim();
+}
+
+function normalizeNameKey(v = "") {
+  return String(v || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function hasName(list = [], value = "") {
+  const target = normalizeNameKey(value);
+  return !!target && (Array.isArray(list) ? list : []).some(item => normalizeNameKey(item) === target);
+}
+
+function uniqueNames(list = []) {
+  const map = new Map();
+  (Array.isArray(list) ? list : []).forEach(item => {
+    const raw = String(item || "").replace(/\s+/g, " ").trim();
+    const key = normalizeNameKey(raw);
+    if (key && !map.has(key)) map.set(key, raw);
+  });
+  return Array.from(map.values());
+}
+
+/* ══════════════════════════════════════════════════════════════
+   getAdminInfo — for team members, find their admin's details.
+   FIX: internal staff (isInternal=true, no tenantId) now correctly
+   resolves to the Super Admin as their admin.
+══════════════════════════════════════════════════════════════ */
+function getAdminInfo(currentUser) {
+  if (!currentUser?.email || currentUser.role !== "team") return null;
+  const allUsers = getAllUsers();
+  const tenants  = getAllTenants();
+
+  // 1. ownerAdminEmail (set at registration for company team members)
+  const ownerEmail = currentUser.ownerAdminEmail;
+  if (ownerEmail) {
+    const adminUser = allUsers.find(u => u.email?.toLowerCase().trim() === ownerEmail.toLowerCase().trim());
+    if (adminUser) return {
+      adminName:  adminUser.name || adminUser.email,
+      adminEmail: adminUser.email,
+      orgName:    adminUser.orgName || tenants[adminUser.tenantId]?.name || null,
+    };
+  }
+
+  // 2. Internal staff (isInternal=true) → Super Admin is their admin
+  if (currentUser.isInternal || (!currentUser.tenantId && !ownerEmail)) {
+    return {
+      adminName:  "Super Admin",
+      adminEmail: SUPER_ADMIN_EMAIL,
+      orgName:    "Tervies (Internal)",
+    };
+  }
+
+  // 3. Fallback via tenantId
+  const tenantId = currentUser.tenantId;
+  if (tenantId && tenants[tenantId]) {
+    const tenant     = tenants[tenantId];
+    const adminEmail = tenant.adminEmail;
+    if (adminEmail) {
+      const adminUser = allUsers.find(u => u.email?.toLowerCase().trim() === adminEmail.toLowerCase().trim());
+      return { adminName: adminUser?.name || adminEmail, adminEmail, orgName: tenant.name || null };
+    }
+  }
+  return null;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   loadAllocationsForUser — FIX for internal staff
+   Internal staff (isInternal=true, no tenantId, no ownerAdminEmail)
+   now look up the Super Admin's allocation key directly.
+══════════════════════════════════════════════════════════════ */
+function loadAllocationsForUser(user) {
+  const role     = user?.role     || "";
+  const tenantId = user?.tenantId || null;
+
+  try {
+    if (role === "team") {
+      const keysToTry = [];
+
+      // Company team members: keep existing owner-admin allocation logic.
+      if (user?.ownerAdminEmail) {
+        keysToTry.push(`clientAllocations_${String(user.ownerAdminEmail).trim().toLowerCase()}`);
+      }
+
+      // Super Admin internal team: always read Super Admin allocation bucket.
+      if (user?.isInternal || (!tenantId && !user?.ownerAdminEmail)) {
+        keysToTry.push(`clientAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+      }
+
+      // Company team fallback: tenant admin bucket.
+      if (tenantId) {
+        const tenants    = getAllTenants();
+        const adminEmail = tenants[tenantId]?.adminEmail;
+        if (adminEmail) keysToTry.push(`clientAllocations_${String(adminEmail).trim().toLowerCase()}`);
+      }
+
+      // Safety fallback: check all allocation buckets in this browser.
+      const allUsers = getAllUsers();
+      allUsers
+        .filter(u => (u.role === "admin" || u.role === "superadmin") &&
+          (tenantId ? u.tenantId === tenantId : !u.tenantId || u.role === "superadmin"))
+        .forEach(a => keysToTry.push(`clientAllocations_${String(a.email).trim().toLowerCase()}`));
+
+      const allKeys = getAllClientAllocationStorageKeys(keysToTry);
+
+      for (const key of allKeys) {
+        try {
+          const saved = localStorage.getItem(key);
+          if (!saved) continue;
+          const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+          if (findUserAllocationsInMap(parsed, user).length > 0) return parsed;
+        } catch (_) {}
+      }
+
+      // Return the first valid allocation map so visibleClients can still inspect it.
+      for (const key of allKeys) {
+        try {
+          const saved = localStorage.getItem(key);
+          if (!saved) continue;
+          const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+          if (parsed && typeof parsed === "object") return parsed;
+        } catch (_) {}
+      }
+    } else if (role === "admin" || role === "superadmin") {
+      const key   = `clientAllocations_${String(user.email || "").trim().toLowerCase()}`;
+      const saved = localStorage.getItem(key);
+      if (saved) return normalizeAllocationMapKeys(JSON.parse(saved));
+    }
+  } catch (_) {}
+  try {
+    const saved = localStorage.getItem("clientAllocations");
+    if (saved) return normalizeAllocationMapKeys(JSON.parse(saved));
+  } catch (_) {}
+  return {};
+}
+
+/* ══════════════════════════════════════════════════════════════
+   persistClientsDataFull — writes to BOTH storage keys
+══════════════════════════════════════════════════════════════ */
+function persistClientsDataFull(val, tenantId, adminEmail) {
+  if (!val || typeof val !== "object") return;
+  // Only save client list to localStorage (data is too large for 5MB limit)
+  // Full data lives in MongoDB; token users fetch from DB on load
+  if (tenantId) {
+    const clientList = Object.keys(val).filter(k => k !== MASTER_KEY);
+    safeLocalSet(`tenant_${tenantId}_saved_upload_clients`, clientList);
+  }
+  // For non-JWT / internal staff: save minimal client list under admin email key
+  if (adminEmail) {
+    const clientList = Object.keys(val).filter(k => k !== MASTER_KEY);
+    safeLocalSet(`admin_clientsList_${String(adminEmail).trim().toLowerCase()}`, clientList);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   loadClientsDataForUser
+   FIX: internal staff (no tenantId) now fetch from DB via JWT
+   instead of trying localStorage (which has no data for them).
+   For non-JWT fallback, we still try all relevant keys.
+══════════════════════════════════════════════════════════════ */
+function loadClientsDataForUser(currentUser) {
+  const myTenantId = currentUser?.tenantId || null;
+  const role       = currentUser?.role || "";
+  const isInternal = currentUser?.isInternal || (!myTenantId && role === "team");
+
+  // Internal staff have no tenantId — their data comes from DB (JWT path)
+  // For localStorage fallback, return null so we show empty state
+  // rather than trying to load wrong data
+  if (isInternal) return null;
+
+  const emailCandidates = [];
+
+  if (role === "team") {
+    if (currentUser?.ownerAdminEmail) {
+      emailCandidates.push(String(currentUser.ownerAdminEmail).trim().toLowerCase());
+    }
+    if (myTenantId) {
+      const tenants    = getAllTenants();
+      const adminEmail = tenants[myTenantId]?.adminEmail;
+      if (adminEmail) emailCandidates.push(String(adminEmail).trim().toLowerCase());
+    }
+    const allUsers = getAllUsers();
+    allUsers
+      .filter(u => (u.role === "admin" || u.role === "superadmin") && u.tenantId === myTenantId)
+      .forEach(a => emailCandidates.push((a.email || "").toLowerCase().trim()));
+  } else if (role === "admin") {
+    if (currentUser?.email) {
+      emailCandidates.push(String(currentUser.email).trim().toLowerCase());
+    }
+  }
+  for (const adminEmail of emailCandidates) {
+    if (!adminEmail) continue;
+    const emailKey = `admin_clientsData_${adminEmail}`;
+    try {
+      const raw = localStorage.getItem(emailKey);
+      if (!raw) continue;
+      const val = JSON.parse(raw);
+      if (val && typeof val === "object" && !Array.isArray(val) && Object.keys(val).length > 0) {
+        return val;
+      }
+    } catch (_) {}
+  }
+
+  if (myTenantId) {
+    for (const key of [
+      `tenant_${myTenantId}_clientsData`,
+      `tenant_${myTenantId}_clientsdata`,
+      `clientsData_${myTenantId}`,
+    ]) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const val = JSON.parse(raw);
+        if (val && typeof val === "object" && !Array.isArray(val) && Object.keys(val).length > 0) {
+          return val;
+        }
+      } catch (_) {}
+    }
+  }
+
+  return null;
+}
+
+function buildClientGroupFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const grouped = {};
+  for (const row of rows) {
+    const flat = { ...row };
+    if (row.rawData && typeof row.rawData === "object") {
+      Object.keys(row.rawData).forEach(k => {
+        const nk = k.trim();
+        if (flat[nk] === undefined || flat[nk] === null || flat[nk] === "") flat[nk] = row.rawData[k];
+      });
+    }
+    const trueStatus = getRowStatusValue(flat);
+    flat["Status"] = trueStatus;
+    flat["status"] = trueStatus;
+    const client = getClientName(flat) || "Unknown";
+    if (!grouped[client]) grouped[client] = [];
+    grouped[client].push(flat);
+  }
+  const allRows = [];
+  Object.entries(grouped).forEach(([k, v]) => { if (k !== MASTER_KEY) allRows.push(...v); });
+  grouped[MASTER_KEY] = allRows;
+  return grouped;
+}
+
+function getUsersForModal(currentUser) {
+  const all      = getAllUsers();
+  const tenants  = getAllTenants();
+  const SA       = isSuperAdmin(currentUser);
+  const email    = (currentUser.email || "").toLowerCase().trim();
+  const tenantId = currentUser.tenantId;
+
+  if (SA) {
+    return all
+      .map(normaliseSAInternalUser)
+      .filter(u => u.role !== "superadmin" || u.email === currentUser.email)
+      .map(u => ({
+        ...u,
+        _orgName: u.isInternal ? "Tervies Internal" : (u.tenantId ? (tenants[u.tenantId]?.name || u.tenantId) : "—")
+      }));
+  }
+
+  const tenant    = tenantId ? tenants[tenantId] : null;
+  const isPrimary = tenant && tenant.adminEmail?.toLowerCase().trim() === email;
+
+  if (isPrimary) {
+    return all
+      .filter(u => u.tenantId === tenantId && u.role !== "superadmin")
+      .map(u => ({ ...u, _orgName: tenant?.name || tenantId }));
+  }
+
+  return all.filter(u =>
+    u.role !== "superadmin" &&
+    (u.ownerAdminEmail?.toLowerCase().trim() === email ||
+     u.email?.toLowerCase().trim() === email)
+  ).map(u => ({ ...u, _orgName: tenant?.name || tenantId || "—" }));
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SPECIAL CASES VIEW (super-admin only)
+══════════════════════════════════════════════════════════════ */
+function SpecialCasesView() {
+  // Fetches only isSpecialCase:true records directly from the server —
+  // avoids depending on the full eager-loaded dataset (dashboardData used
+  // to require scanning every record of every status just to find the rare
+  // special-cased ones), which doesn't scale as record volume grows.
+  const [specialRows, setSpecialRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    uploadAPI.getRecords({ specialCasesOnly: "true", limit: 100000 })
+      .then(rows => { if (!cancelled) setSpecialRows(Array.isArray(rows) ? rows : []); })
+      .catch(err => console.warn("Special cases fetch failed:", err.message))
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // A bad-year legacy record (e.g. year 22 instead of 2026, from the
+  // now-fixed input bug) is a technically-valid Date, not NaN — so the NaN
+  // check alone won't catch it. Flag anything outside a sane range instead
+  // of silently showing "Jul 22".
+  const isSaneYear = (d) => {
+    const y = d.getFullYear();
+    return y >= 2000 && y <= 2100;
+  };
+  const fmtDate = (val) => {
+    if (!val) return "—";
+    const d = new Date(val);
+    if (isNaN(d.getTime()) || !isSaneYear(d)) return String(val);
+    return d.toLocaleDateString("en-IN", { day:"2-digit", month:"short", year:"numeric" });
+  };
+  const fmtMonth = (val) => {
+    if (!val) return "—";
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return String(val);
+    if (!isSaneYear(d)) return "⚠️ invalid date";
+    return d.toLocaleString("en-IN", { month:"short", year:"numeric" });
+  };
+  const getCompletedDate = (r) =>
+    r["Completed Date"] || r.completedDate || r.closedDate ||
+    r?.rawData?.["Completed Date"] || r?.rawData?.completedDate || r?.rawData?.closedDate || "";
+
+  return (
+    <div className="panel" style={{ padding:"28px" }}>
+      <div style={{ fontFamily:"var(--head)", fontSize:20, fontWeight:700, color:"var(--text)", marginBottom:6 }}>
+        📌 Special Cases
+      </div>
+      <div style={{ fontSize:13, color:"var(--text3)", marginBottom:20 }}>
+        Cases whose client billing month has been overridden. These count in Cost Summary under their special billing month, not their completion month.
+      </div>
+      {loading ? (
+        <div style={{ padding:"40px 0", textAlign:"center", color:"var(--text3)", fontSize:14 }}>
+          Loading…
+        </div>
+      ) : specialRows.length === 0 ? (
+        <div style={{ padding:"40px 0", textAlign:"center", color:"var(--text3)", fontSize:14 }}>
+          No special cases marked yet. Use the Special checkbox in the Records table (Edit mode) to mark a case.
+        </div>
+      ) : (
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13, fontFamily:"var(--body)" }}>
+            <thead>
+              <tr style={{ background:"rgba(245,158,11,0.08)", borderBottom:"2px solid rgba(245,158,11,0.25)" }}>
+                {["#","Candidate Name","Client Name","Check Name","Real Completed Date","Special Billing Month"].map(h => (
+                  <th key={h} style={{ padding:"10px 14px", textAlign:"left", fontFamily:"var(--head)", fontSize:12, fontWeight:700, color:"#92400e", whiteSpace:"nowrap" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {specialRows.map((r, i) => (
+                <tr key={r._id || i} style={{ borderBottom:"1px solid var(--border)", background: i%2===0?"transparent":"rgba(245,158,11,0.03)" }}>
+                  <td style={{ padding:"9px 14px", color:"var(--text3)", fontWeight:600 }}>{i+1}</td>
+                  <td style={{ padding:"9px 14px", fontWeight:500 }}>{r["Candidate Name"] || r.candidateName || "—"}</td>
+                  <td style={{ padding:"9px 14px" }}>{r["Client Name"] || r.clientName || "—"}</td>
+                  <td style={{ padding:"9px 14px", color:"var(--text3)" }}>{r["Check Name"] || r.checkName || "—"}</td>
+                  <td style={{ padding:"9px 14px" }}>{fmtDate(getCompletedDate(r))}</td>
+                  <td style={{ padding:"9px 14px", fontWeight:700, color:"#b45309" }}>{fmtMonth(r.specialBillingDate)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ marginTop:14, fontSize:12, color:"var(--text3)" }}>
+            {specialRows.length} special case{specialRows.length !== 1 ? "s" : ""} total
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MAIN EXPORT
+══════════════════════════════════════════════════════════════ */
+export default function App() {
+  useEffect(() => {
+
+  const oldVersion = localStorage.getItem("app_version");
+
+  if (oldVersion !== APP_VERSION) {
+
+    localStorage.clear();
+    sessionStorage.clear();
+
+    if ("caches" in window) {
+      caches.keys().then((names) => {
+        names.forEach((name) => caches.delete(name));
+      });
+    }
+
+    localStorage.setItem("app_version", APP_VERSION);
+
+    window.location.reload();
+  }
+
+}, []);
+  const navigate = useNavigate();
+
+  /* ─────────────────────────────
+     Safe Login Guard
+  ───────────────────────────── */
+  useEffect(() => {
+    // Secondary guard (belt-and-suspenders after the ProtectedRoute in main.jsx).
+    // Catches cases where token expires while the app is already open.
+    let user = null;
+    try { user = JSON.parse(localStorage.getItem("currentUser") || "null"); } catch { /* fall through */ }
+
+    const hasEmail = user && typeof user === "object" && !!user.email;
+    const tok = (
+      user?.token ||
+      localStorage.getItem("token") ||
+      localStorage.getItem("authToken") ||
+      localStorage.getItem("jwt") ||
+      ""
+    ).trim();
+    const hasToken = tok.startsWith("eyJ");
+
+    if (!hasEmail || !hasToken) {
+      localStorage.removeItem("currentUser");
+      localStorage.removeItem("token");
+      localStorage.removeItem("authToken");
+      localStorage.removeItem("jwt");
+      navigate("/login", { replace: true });
+    }
+  }, [navigate]);
+
+  const currentUser = JSON.parse(localStorage.getItem("currentUser") || "{}");
+
+  /* AUTO LOGOUT — 30 min inactivity
+     FIXED:
+     - User activity is tracked on document + window with capture mode.
+     - Any typing, clicking, scrolling, mouse movement, touch, drag/drop, focus keeps session alive.
+     - 1-minute silent refresh does NOT reset activity.
+     - Logout happens only when there is no real user activity for 30 minutes.
+  */
+  useEffect(() => {
+    if (!currentUser || !currentUser.email) return;
+
+    const INACTIVITY_LIMIT = 30 * 60 * 1000;
+    const CHECK_EVERY = 10 * 1000;
+    const LAST_ACTIVITY_KEY = "bgv_last_user_activity";
+
+    let lastActivity = Date.now();
+    let checkTimer = null;
+
+    const saveLastActivity = () => {
+      lastActivity = Date.now();
+      try {
+        localStorage.setItem(LAST_ACTIVITY_KEY, String(lastActivity));
+      } catch (_) {}
+    };
+
+    const getLastActivity = () => {
+      try {
+        const saved = Number(localStorage.getItem(LAST_ACTIVITY_KEY) || 0);
+        return saved || lastActivity;
+      } catch (_) {
+        return lastActivity;
+      }
+    };
+
+    const clearSessionAndLogout = () => {
+      localStorage.removeItem("currentUser");
+      localStorage.removeItem("token");
+      localStorage.removeItem("authToken");
+      localStorage.removeItem("jwt");
+      navigate("/login", { replace: true });
+    };
+
+    const checkInactivity = () => {
+      const inactiveFor = Date.now() - getLastActivity();
+
+      if (inactiveFor >= INACTIVITY_LIMIT) {
+        clearSessionAndLogout();
+      }
+    };
+
+    const activityEvents = [
+      "mousemove",
+      "mousedown",
+      "mouseup",
+      "click",
+      "dblclick",
+      "keydown",
+      "keyup",
+      "input",
+      "change",
+      "scroll",
+      "wheel",
+      "touchstart",
+      "touchmove",
+      "pointerdown",
+      "pointermove",
+      "dragstart",
+      "dragover",
+      "drop",
+      "focus",
+    ];
+
+    saveLastActivity();
+
+    activityEvents.forEach((eventName) => {
+      document.addEventListener(eventName, saveLastActivity, {
+        passive: true,
+        capture: true,
+      });
+      window.addEventListener(eventName, saveLastActivity, {
+        passive: true,
+        capture: true,
+      });
+    });
+
+    document.addEventListener("visibilitychange", saveLastActivity, true);
+    window.addEventListener("focus", saveLastActivity, true);
+
+    checkTimer = setInterval(checkInactivity, CHECK_EVERY);
+
+    return () => {
+      if (checkTimer) clearInterval(checkTimer);
+
+      activityEvents.forEach((eventName) => {
+        document.removeEventListener(eventName, saveLastActivity, true);
+        window.removeEventListener(eventName, saveLastActivity, true);
+      });
+
+      document.removeEventListener("visibilitychange", saveLastActivity, true);
+      window.removeEventListener("focus", saveLastActivity, true);
+    };
+  }, [currentUser?.email, navigate]);
+  const SA       = isSuperAdmin(currentUser);
+  const ADM      = isTenantAdmin(currentUser) || SA;
+  const TEAM     = isTeamMember(currentUser);
+  const tenantId = getTenantId(currentUser);
+
+  // New super-admin-side-only roles. Purely additive — SA/ADM/TEAM above
+  // are computed exactly as before, and role==="manager"/"tl" never
+  // satisfies isTenantAdmin/isTeamMember/isSuperAdmin, so existing behavior
+  // for superadmin/admin/team is unchanged.
+  const MGR = String(currentUser?.role || "").trim().toLowerCase() === "manager";
+  const TL  = String(currentUser?.role || "").trim().toLowerCase() === "tl";
+
+  // "Insuff Clear" status/filter is secondary-admin-only — secondary admin
+  // themselves, and any team member belonging to a secondary admin. Super
+  // admin (and super admin's own internal team, via isInternalUser) keeps
+  // the existing Sent/Closed/Pending/Insuff/Hold/Stop set unchanged.
+  const showInsuffClearOption = !isInternalUser(currentUser);
+  const visibleStatusDefs = showInsuffClearOption ? [...STATUS_DEFS, INSUFF_CLEAR_DEF] : STATUS_DEFS;
+
+  // Internal staff: isInternal=true OR (role=team AND no tenantId AND no ownerAdminEmail)
+  const isInternalStaff = TEAM && (
+    currentUser.isInternal === true ||
+    (!currentUser.tenantId && !currentUser.ownerAdminEmail)
+  );
+
+
+  /* ─────────────────────────────
+     FIX: Strong JWT detection
+  ───────────────────────────── */
+
+  const storedToken =
+    currentUser?.token ||
+    localStorage.getItem("token") ||
+    localStorage.getItem("authToken") ||
+    localStorage.getItem("jwt") ||
+    "";
+
+  const hasRealToken =
+    typeof storedToken === "string" &&
+    storedToken.trim().startsWith("eyJ");
+
+  // Inbox unread count for the sidebar nav badge — same audience as the
+  // floating InboxWidget (super admin + their internal team only). Fetched
+  // once on load, same lightweight approach as the Records count badge
+  // (not a live poll) — reusing the same listMessages call the Inbox page
+  // itself already uses, just counting unread rather than rendering them.
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
+  useEffect(() => {
+    if (!hasRealToken || !isInternalUser(currentUser)) { setInboxUnreadCount(0); return; }
+    inboxAPI.listMessages(50)
+      .then(({ messages }) => {
+        const count = Array.isArray(messages) ? messages.filter(m => m.unread).length : 0;
+        setInboxUnreadCount(count);
+      })
+      .catch(() => {});
+  }, [hasRealToken, currentUser?.email]);
+
+  const instantRecordsCacheKey = `bgv_instant_records_${String(currentUser?.email || "").trim().toLowerCase()}_${String(tenantId || "no_tenant")}_${String(currentUser?.role || "").trim().toLowerCase()}`;
+  const instantRecordsLatestKey = `bgv_instant_records_latest_${String(currentUser?.email || "").trim().toLowerCase()}`;
+
+  const loadInstantRecordsCache = () => {
+    try {
+      const exact = safeLocalGet(instantRecordsCacheKey, null);
+      if (exact && typeof exact === "object" && Object.keys(exact).length > 0) return exact;
+
+      const latest = safeLocalGet(instantRecordsLatestKey, null);
+      if (latest && typeof latest === "object" && Object.keys(latest).length > 0) return latest;
+
+      const emailPart = String(currentUser?.email || "").trim().toLowerCase();
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || !k.startsWith("bgv_instant_records_")) continue;
+        if (emailPart && !k.includes(emailPart)) continue;
+        const val = safeLocalGet(k, null);
+        if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+      }
+    } catch (_) {}
+    return {};
+  };
+
+  /* ─────────────────────────────
+     Verify JWT session
+  ───────────────────────────── */
+
+  useEffect(() => {
+    const verifySession = async () => {
+      if (!hasRealToken) return;
+
+      try {
+        const res = await fetch(
+          `${window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:5002/api" : "https://profeix.info/api"}/auth/me`,
+          {
+            headers: {
+              Authorization: `Bearer ${storedToken}`,
+            },
+          }
+        );
+
+        if (!res.ok) {
+          console.warn("auth/me failed with status:", res.status);
+          return;
+        }
+
+        const me = await res.json();
+        const existing = JSON.parse(localStorage.getItem("currentUser") || "{}");
+
+        localStorage.setItem(
+          "currentUser",
+          JSON.stringify({
+            ...existing,
+            ...(me.user || me),
+            token: storedToken,
+          })
+        );
+
+        localStorage.setItem("token", storedToken);
+        localStorage.setItem("authToken", storedToken);
+        localStorage.setItem("jwt", storedToken);
+      } catch (err) {
+        console.warn("Session verification failed, keeping local session:", err.message);
+      }
+    };
+
+    verifySession();
+  }, [hasRealToken, storedToken]);
+
+  const tGet = (key, fallback) => getTenantData(key, tenantId, fallback);
+  const tSet = (key, val)      => safeLocalSet(`tenant_${tenantId}_${key}`, val);
+
+  const adminInfo = useMemo(() => getAdminInfo(currentUser), [currentUser.email]);
+
+  const [clientsData,    setClientsDataRaw]   = useState(() => loadInstantRecordsCache());
+  const [allTenantsData, setAllTenantsData]   = useState({});   // SA "All Records" view
+  const [allTenantsLoading, setAllTenantsLoading] = useState(false);
+  const [dbLoading,    setDbLoading]      = useState(false);
+  // Server-computed dashboard totals (Admin/SA only — a fast countDocuments
+  // aggregation, not a scan of the full loaded dataset). Lets the stat cards
+  // show correct numbers immediately, even before/without the full progressive
+  // records load completing. Team members are untouched — getStats() only
+  // does tenant scoping today, not allocation scoping, so their dashboard
+  // keeps using the existing clientsData-derived computation unchanged.
+  // Now also used for team members (allocation-scoped via getStats'
+  // scopeToAllocations param) — see the fetch effect below.
+  const [serverStats, setServerStats] = useState(null);
+  // Records-page "Filter by Client" dropdown for Admin/SA — client names +
+  // per-client counts from a lightweight server aggregation, instead of the
+  // dropdown depending on the full eager-loaded clientsData object (the gap
+  // that let the OOM crash persist through an earlier pagination attempt).
+  // Team members are unchanged: they keep using visibleClients/clientsData.
+  const [serverClientNames, setServerClientNames] = useState(null);
+  const [allocLoading, setAllocLoading]   = useState(false);
+  const [dbError,      setDbError]        = useState(null);
+  // FIX: increment to force a fresh DB fetch (e.g. when navigating to Records)
+  const [refreshKey,   setRefreshKey]     = useState(0);
+
+  // Dashboard totals via a lightweight server aggregation instead of
+  // scanning the full loaded dataset. Refetches on the same triggers as the
+  // main records load (tenantId/refreshKey) so it stays in step with it.
+  // Team members: scoped to their allocated clients/vendors/check-types via
+  // scopeToAllocations, same server-side resolution the Records page fetch
+  // now uses — no dependency on the full eager-loaded dataset finishing.
+  useEffect(() => {
+    if (!hasRealToken) return;
+    let cancelled = false;
+    uploadAPI.getStats(TEAM ? { scopeToAllocations: "true" } : {})
+      .then(stats => { if (!cancelled && stats && typeof stats === "object") setServerStats(stats); })
+      .catch(err => console.warn("Dashboard stats fetch failed:", err.message));
+    return () => { cancelled = true; };
+  }, [TEAM, hasRealToken, tenantId, refreshKey]);
+
+  useEffect(() => {
+    if (TEAM || !hasRealToken) return; // team members: unchanged, existing path
+    let cancelled = false;
+    uploadAPI.getNameLists()
+      .then(res => { if (!cancelled && res && Array.isArray(res.clients)) setServerClientNames(res.clients); })
+      .catch(err => console.warn("Client name-list fetch failed:", err.message));
+    return () => { cancelled = true; };
+  }, [TEAM, hasRealToken, tenantId, refreshKey]);
+
+  // Moved up from further below so the eager-load-gating effect right after
+  // this can read it — see eagerLoadedRef/LAZY_EAGER_LOAD_PAGES below.
+  const [activePage, setActivePage] = useState("dashboard");
+
+  // Debounce refs: prevent synchronous JSON.stringify of 12k rows on every
+  // status/field edit. The write fires 4 s after the last change so rapid
+  // edits coalesce into a single IDB write.
+  const cacheTimerRef   = useRef(null);
+  const cachePendingRef = useRef(null);
+
+  const [selectedClient, setSelectedClientRaw] = useState(MASTER_KEY);
+
+  // Records-page status pills when a specific client is selected — the
+  // account-wide serverStats (used for "All Records") doesn't know about
+  // the client filter, so a client-filtered view would otherwise still show
+  // totals across every client. Only fetches when a specific client (not
+  // "All Records") is selected; falls back to the existing serverStats for
+  // "All Records", exactly as before.
+  const [clientScopedStats, setClientScopedStats] = useState(null);
+
+  useEffect(() => {
+    if (TEAM || !hasRealToken) return;
+    if (!selectedClient || selectedClient === MASTER_KEY) {
+      setClientScopedStats(null);
+      return;
+    }
+    let cancelled = false;
+    uploadAPI.getStats({ clientName: selectedClient })
+      .then(stats => { if (!cancelled && stats && typeof stats === "object") setClientScopedStats(stats); })
+      .catch(err => console.warn("Client-scoped stats fetch failed:", err.message));
+    return () => { cancelled = true; };
+  }, [TEAM, hasRealToken, selectedClient, tenantId, refreshKey]);
+  const [pricingRules,   setPricingRulesRaw]   = useState(() => { const p = tGet("pricingRules",{}); return Array.isArray(p)?{}:p; });
+  const [clientPricing,  setClientPricingRaw]  = useState(() => { const p = tGet("clientPricingRules",{}); return Array.isArray(p)?{}:p; });
+  const [allocations,    setAllocationsRaw]    = useState(() => loadAllocationsForUser(currentUser));
+  const [vendorAllocations, setVendorAllocationsRaw] = useState(() => loadVendorAllocationsForUser(currentUser));
+  const [checkAllocations,  setCheckAllocationsRaw]  = useState(() => loadCheckAllocationsForUser(currentUser));
+
+  const setClientsData    = v => setClientsDataRaw(typeof v==="function"?v(clientsData):v);
+  const setSelectedClient = v => setSelectedClientRaw(v);
+  const setPricingRules   = v => { const val = typeof v==="function"?v(pricingRules):v;  setPricingRulesRaw(val);  tSet("pricingRules",val); };
+  const setClientPricing  = v => { const val = typeof v==="function"?v(clientPricing):v; setClientPricingRaw(val); tSet("clientPricingRules",val); };
+
+  // Load pricing from DB on startup for SA and internal staff.
+  // SA may go directly to Records without visiting Add Clients (which normally
+  // loads pricing), so localStorage could be stale — always sync from DB.
+  useEffect(() => {
+    if (!isInternalStaff && !SA) return;
+    pricingAPI.getAll()
+      .then(data => {
+        if (data && typeof data === "object") {
+          setPricingRulesRaw(prev => ({ ...prev, ...data }));
+        }
+      })
+      .catch(err => console.warn("Pricing load failed:", err.message));
+  }, [isInternalStaff, SA]); // eslint-disable-line react-hooks/exhaustive-deps
+  const setAllocations    = v => {
+    const val = normalizeAllocationMapKeys(typeof v==="function"?v(allocations):v);
+    setAllocationsRaw(val);
+    const adminEmailKey = String(currentUser.email || "").trim().toLowerCase();
+    if (adminEmailKey) safeLocalSet(`clientAllocations_${adminEmailKey}`, val);
+    if (SA) safeLocalSet(`clientAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`, val);
+  };
+
+  /* ══════════════════════════════════════════════════════════════
+     DATA LOADING
+     JWT users (including internal staff with token) → fetch from DB
+     Non-JWT → load from localStorage
+  ══════════════════════════════════════════════════════════════ */
+  // Pages that still need the full clientsData object: company-admin's
+  // admindata view, and Allocations' client/check name lists. TAT, Cost
+  // Summary, Special Cases, and Daily Closed now fetch their own
+  // status-scoped data directly (see Tat.jsx/CostSummary.jsx/
+  // DailyClosedCases.jsx/SpecialCasesView) and no longer need this at all.
+  const LAZY_EAGER_LOAD_PAGES = ["admindata", "allocations"];
+  const eagerLoadTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    if (TEAM || ADM) setAllocLoading(true);
+
+    // Instant records cache: show last loaded records immediately after login,
+    // then refresh from MongoDB in the background. This does not change DB logic.
+
+    if (!hasRealToken) {
+      setDbLoading(true);
+      setDbError(null);
+      try {
+        let loaded = loadClientsDataForUser(currentUser);
+        if (!loaded && tenantId) {
+          const flatKeys = [`tenant_${tenantId}_rows`,`tenant_${tenantId}_allRows`,`tenant_${tenantId}_data`,`allRows_${tenantId}`];
+          for (const fk of flatKeys) {
+            const rows = safeLocalGet(fk);
+            if (Array.isArray(rows) && rows.length > 0) { loaded = buildClientGroupFromRows(rows); if (loaded) break; }
+          }
+        }
+        if (loaded && Object.keys(loaded).length > 0) {
+          setClientsDataRaw(loaded);
+          if (tenantId) {
+            const clientList = Object.keys(loaded).filter(k => k !== MASTER_KEY);
+            safeLocalSet(`tenant_${tenantId}_saved_upload_clients`, clientList);
+          }
+        } else {
+          setClientsDataRaw({});
+        }
+      } catch (err) {
+        console.warn("localStorage load failed:", err.message);
+        setClientsDataRaw({});
+      }
+      if (TEAM || ADM) {
+        Promise.all([
+          fetchSyncedAllocationsForUser(currentUser)
+            .then(m => setAllocationsRaw(normalizeAllocationMapKeys(m)))
+            .catch(() => setAllocationsRaw(loadAllocationsForUser(currentUser))),
+          fetchSyncedVendorAllocationsForUser(currentUser)
+            .then(m => setVendorAllocationsRaw(normalizeAllocationMapKeys(m)))
+            .catch(() => setVendorAllocationsRaw(loadVendorAllocationsForUser(currentUser))),
+          fetchSyncedCheckAllocationsForUser(currentUser)
+            .then(m => setCheckAllocationsRaw(normalizeAllocationMapKeys(m)))
+            .catch(() => setCheckAllocationsRaw(loadCheckAllocationsForUser(currentUser))),
+        ]).finally(() => setAllocLoading(false));
+      }
+      if (!(TEAM || ADM)) setAllocLoading(false);
+      setDbLoading(false);
+      return;
+    }
+
+    // Pure SA / internal staff only, matching the original scope of this
+    // once-per-session gate. NOTE: `ADM` in this file means "tenant admin OR
+    // superadmin" — using it here would accidentally exempt SA from this
+    // gate too, which is exactly the account this fix needs to cover (SA has
+    // the largest dataset, 6000+ records). Use isTenantAdmin() directly so
+    // only real company admins (and TEAM) are exempted from THIS gate —
+    // TEAM still always reaches fetchFromDB() below (needed for allocation
+    // syncing), but fetchFromDB() itself now short-circuits the expensive
+    // full-dataset fetch for TEAM specifically (see inside it) — Records
+    // (server-paginated) and Dashboard stats (serverStats, allocation-
+    // scoped) no longer depend on that full load for them, and it was the
+    // confirmed cause of repeated OOM crashes on team member accounts as
+    // data grew, for exactly the same reason it was for SA.
+    if (!TEAM && !isTenantAdmin(currentUser)) {
+      // Once the full progressive dataset load has run one time this
+      // session, the data is already sitting in clientsData — re-running it
+      // on every later page click (this effect depends on `activePage`) was
+      // re-fetching all 6000+ records from scratch on every single
+      // navigation, permanently, for the rest of the session. That's the
+      // opposite of what "already run once" was supposed to mean here, and
+      // it was competing for bandwidth with whatever the user actually
+      // clicked into (e.g. Cost Summary's own fetch). Skip unconditionally
+      // once it's already run, regardless of which page is now active.
+      if (eagerLoadTriggeredRef.current) {
+        setDbLoading(false);
+        setAllocLoading(false);
+        return;
+      }
+      if (!LAZY_EAGER_LOAD_PAGES.includes(activePage)) {
+        setDbLoading(false);
+        setAllocLoading(false);
+        return;
+      }
+      eagerLoadTriggeredRef.current = true;
+    }
+
+    const fetchFromDB = async () => {
+      // Team members: skip the full-dataset load entirely — Records now
+      // fetches its own paginated, allocation-scoped pages (see MyTable's
+      // fetch effect), and Dashboard stats now come from the scoped
+      // getStats call above. Only the lightweight allocation maps (which
+      // clients/vendors/checks this person is allocated) still need syncing
+      // here — that's small (a handful of names), not the full record set.
+      // This is the actual fix for the repeated OOM crashes on team member
+      // accounts: they used to load the entire scoped dataset (thousands of
+      // records) into browser memory on every navigation, just for this.
+      if (TEAM) {
+        try {
+          const syncedAlloc = await fetchSyncedAllocationsForUser(currentUser);
+          setAllocationsRaw(normalizeAllocationMapKeys(syncedAlloc));
+          const syncedVendorAlloc = await fetchSyncedVendorAllocationsForUser(currentUser);
+          setVendorAllocationsRaw(normalizeAllocationMapKeys(syncedVendorAlloc));
+          const syncedCheckAlloc = await fetchSyncedCheckAllocationsForUser(currentUser);
+          setCheckAllocationsRaw(normalizeAllocationMapKeys(syncedCheckAlloc));
+        } catch (err) {
+          console.warn("Allocation sync failed:", err.message);
+        } finally {
+          setAllocLoading(false);
+          setDbLoading(false);
+        }
+        return;
+      }
+
+      const cachedInstantRecords = loadInstantRecordsCache();
+      const hasCachedInstantRecords =
+        cachedInstantRecords &&
+        typeof cachedInstantRecords === "object" &&
+        Object.keys(cachedInstantRecords).length > 0;
+
+      // Show cached records immediately and refresh in background.
+      // Do not show the loading banner when cached data exists.
+      if (hasCachedInstantRecords) {
+        setClientsDataRaw(cachedInstantRecords);
+        setDbLoading(false);
+      } else {
+        setDbLoading(true);
+      }
+      setDbError(null);
+
+      // localStorage cannot hold large record sets (its ~5MB limit is exceeded
+      // well before 12k records), so on real datasets the block above usually
+      // finds nothing. Fall back to the IndexedDB cache to paint records
+      // instantly while the network refresh continues in the background.
+      if (!hasCachedInstantRecords) {
+        try {
+          const idbCached = await idbGet(instantRecordsCacheKey);
+          if (
+            idbCached &&
+            typeof idbCached === "object" &&
+            Object.keys(idbCached).length > 0
+          ) {
+            setClientsDataRaw(idbCached);
+            setDbLoading(false);
+          }
+        } catch (_) {}
+      }
+
+      try {
+        // SA: no params → backend defaults to tenantId:null (SA's own records only)
+        // Company admin/team: always scope to their tenantId
+        // Internal staff: no tenantId → backend returns tenantId:null records
+        const params = SA ? {} : tenantId ? { tenantId } : {};
+
+        // PROGRESSIVE LOAD:
+        // The backend returns records newest-first (sorted by uploadedAt desc).
+        // We fetch in batches: the first batch paints the table almost instantly,
+        // then the remaining batches keep loading in the background and merge in
+        // until ALL records are loaded. No record is ever hidden — this only
+        // changes HOW records arrive, not which records are shown.
+        const BATCH_SIZE = 500;
+        let pageNo = 1;
+        let allRows = [];
+        let firstPaintDone = false;
+
+        while (true) {
+          const batch = await uploadAPI.getRecords({
+            ...params,
+            page: pageNo,
+            limit: BATCH_SIZE,
+          });
+
+          if (!Array.isArray(batch) || batch.length === 0) break;
+
+          allRows = allRows.concat(batch);
+
+          // startTransition: mark as non-urgent so React yields between frames.
+          // Without this, 7 synchronous batch renders on a slow Windows machine
+          // block the main thread long enough to trigger "Page Unresponsive".
+          startTransition(() => {
+            setClientsDataRaw(buildClientGroupFromRows(allRows) || {});
+          });
+
+          if (!firstPaintDone) {
+            setDbLoading(false); // hide the loading banner after the first batch
+            firstPaintDone = true;
+          }
+
+          if (batch.length < BATCH_SIZE) break; // last page reached
+          pageNo += 1;
+        }
+
+        if (allRows.length === 0) {
+          if (!hasCachedInstantRecords) setClientsDataRaw({});
+          if (TEAM || ADM) {
+            const syncedAlloc = await fetchSyncedAllocationsForUser(currentUser);
+            setAllocationsRaw(normalizeAllocationMapKeys(syncedAlloc));
+            const syncedVendorAlloc = await fetchSyncedVendorAllocationsForUser(currentUser);
+            setVendorAllocationsRaw(normalizeAllocationMapKeys(syncedVendorAlloc));
+            const syncedCheckAlloc = await fetchSyncedCheckAllocationsForUser(currentUser);
+            setCheckAllocationsRaw(normalizeAllocationMapKeys(syncedCheckAlloc));
+          }
+          setAllocLoading(false);
+          setDbLoading(false);
+          return;
+        }
+
+        // All records are now loaded — build the final grouped set once and cache it.
+        const grouped = buildClientGroupFromRows(allRows) || {};
+        startTransition(() => { setClientsDataRaw(grouped); });
+        idbSet(instantRecordsCacheKey, grouped); // IndexedDB only — localStorage always fails for large sets
+        persistClientsDataFull(grouped, tenantId, currentUser?.email);
+
+        if (TEAM || ADM) {
+          const syncedAlloc = await fetchSyncedAllocationsForUser(currentUser);
+          setAllocationsRaw(normalizeAllocationMapKeys(syncedAlloc));
+
+          // Vendor allocation must also refresh here.
+          // Without this, a team member with ONLY vendor allocation sees 0 assigned
+          // until some later refresh, and sometimes stays empty on another laptop.
+          const syncedVendorAlloc = await fetchSyncedVendorAllocationsForUser(currentUser);
+          setVendorAllocationsRaw(normalizeAllocationMapKeys(syncedVendorAlloc));
+
+          const syncedCheckAlloc = await fetchSyncedCheckAllocationsForUser(currentUser);
+          setCheckAllocationsRaw(normalizeAllocationMapKeys(syncedCheckAlloc));
+        }
+
+      } catch (err) {
+        console.warn("DB fetch failed:", err.message);
+
+        const isAuthError =
+          err.message.includes("401") || err.message.includes("403") ||
+          err.message.toLowerCase().includes("no token") ||
+          err.message.toLowerCase().includes("invalid token") ||
+          err.message.toLowerCase().includes("unauthori");
+
+        if (isAuthError) {
+          // JWT expired or missing — clear the stale session and force re-login.
+          // This handles machines whose 30-day token has expired and have no IDB
+          // cache to fall back on, so they would otherwise show 0 records forever.
+          try {
+            localStorage.removeItem("currentUser");
+            localStorage.removeItem("token");
+            localStorage.removeItem("authToken");
+            localStorage.removeItem("jwt");
+          } catch (_) {}
+          navigate("/login", { replace: true });
+          return;
+        }
+
+        const cached = loadInstantRecordsCache() || loadClientsDataForUser(currentUser);
+        if (cached && Object.keys(cached).length > 0) {
+          setClientsDataRaw(cached);
+        }
+        setDbError("Could not connect to database. Working in local mode.");
+      } finally {
+        setAllocLoading(false);
+        setDbLoading(false);
+      }
+    };
+
+    try {
+      Object.keys(localStorage)
+        .filter(k => k.toLowerCase().includes("clientsdata") && !k.startsWith("tenant_") && !k.startsWith("admin_"))
+        .forEach(k => localStorage.removeItem(k));
+    } catch(_) {}
+
+    fetchFromDB();
+  // eslint-disable-next-line
+  // refreshKey is intentionally included: incrementing it forces a re-fetch
+  // when the user navigates to the Records page so they always see fresh data.
+  // activePage is included so the lazy-load gate above re-evaluates when a
+  // pure SA/internal-staff user navigates to a page that needs clientsData.
+  }, [tenantId, hasRealToken, refreshKey, activePage]);
+
+  // Only ever do this once per session (the first time clientsData actually
+  // gets data) — without a guard, this fires on EVERY clientsData update,
+  // which would silently discard a client filter the user just picked the
+  // moment clientsData next changes for any reason (e.g. background data
+  // finishing load after a lazy-triggered TAT/Cost Summary visit).
+  const didDefaultSelectedClientRef = useRef(false);
+  useEffect(() => {
+    if (didDefaultSelectedClientRef.current) return;
+    if (clientsData[MASTER_KEY]?.length > 0) {
+      didDefaultSelectedClientRef.current = true;
+      setSelectedClientRaw(MASTER_KEY);
+    }
+  }, [clientsData]);
+
+  const [data,             setData]             = useState([]);
+  const [statusFilter,     setStatusFilter]     = useState(null);
+  const [showModal,        setShowModal]        = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarOpen,      setSidebarOpen]      = useState(false); // mobile overlay
+  const [sentReportsPending, setSentReportsPending] = useState(0);
+
+  const [modalUsers,     setModalUsers]     = useState([]);
+  const [modalSection,   setModalSection]   = useState("admins");
+  const [modalStatus,    setModalStatus]    = useState("approved");
+  const [modalOrgFilter, setModalOrgFilter] = useState("all");
+
+  /* AUTO REFRESH — DISABLED on request.
+     The on-screen data must never move, flicker, or reload by itself.
+     Records now load once (on login, when you open the Records page, or on a
+     manual browser refresh) and then stay completely still. This does NOT
+     change the backend or database in any way — only the automatic frontend
+     re-fetch is turned off. To restore silent background refresh later, set
+     ENABLE_AUTO_REFRESH back to true. */
+  const ENABLE_AUTO_REFRESH = false;
+  useEffect(() => {
+    if (!ENABLE_AUTO_REFRESH) return; // ← frontend never auto-refreshes / never moves
+    if (!currentUser?.email) return;
+
+    const interval = setInterval(async () => {
+      try {
+        // Silent DB refresh: update records without turning on dbLoading,
+        // so the "Loading records..." refresh sign does not appear.
+        if (hasRealToken) {
+          const params = SA ? {} : tenantId ? { tenantId } : {};
+          const result = await uploadAPI.getRecords(params);
+
+          if (Array.isArray(result)) {
+            const grouped = buildClientGroupFromRows(result) || {};
+            setClientsDataRaw(grouped);
+            try {
+              const autoCacheKey = `bgv_instant_records_${String(currentUser?.email || "").trim().toLowerCase()}_${String(tenantId || "no_tenant")}_${String(currentUser?.role || "").trim().toLowerCase()}`;
+              safeLocalSet(autoCacheKey, grouped);
+              idbSet(autoCacheKey, grouped);
+            } catch (_) {}
+            persistClientsDataFull(grouped, tenantId, currentUser?.email);
+          }
+        }
+
+        // Refresh allocations for super admin/company admin/team across systems.
+        if (TEAM || ADM) {
+          const syncedAlloc = await fetchSyncedAllocationsForUser(currentUser);
+          setAllocationsRaw(normalizeAllocationMapKeys(syncedAlloc));
+          const syncedVendorAlloc = await fetchSyncedVendorAllocationsForUser(currentUser);
+          setVendorAllocationsRaw(normalizeAllocationMapKeys(syncedVendorAlloc));
+          window.dispatchEvent(new Event("storage"));
+        }
+      } catch (err) {
+        console.warn("15-minute auto refresh failed:", err.message);
+      }
+    }, 15 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [currentUser?.email, tenantId, TEAM, ADM, SA, hasRealToken]);
+
+  /* ════════════════════════════════════════════════════════════════════
+     REAL-TIME REPORT SYNC (lightweight, non-disruptive)
+     Every few seconds, ask the server ONLY for reports uploaded since the last
+     check (tiny payload). Any new report is merged into the row already on
+     screen, matched by record _id. Unchanged rows keep their exact identity, so
+     the table does NOT move, scroll, or flicker — only the affected row gains
+     its "Report ready / View PDF" button. This lets an admin see a teammate's
+     freshly uploaded report within seconds. Backend is additive only.
+     To turn this off, set ENABLE_REPORT_LIVE_SYNC = false.
+  ════════════════════════════════════════════════════════════════════ */
+  const ENABLE_REPORT_LIVE_SYNC = true;
+  useEffect(() => {
+    if (!ENABLE_REPORT_LIVE_SYNC) return;
+    if (!currentUser?.email || !hasRealToken) return;
+
+    let stopped = false;
+    // Start the "since" cursor at now, so we only pick up NEW uploads from here
+    // on (everything already present came from the initial records load).
+    let sinceCursor = new Date().toISOString();
+
+    const REPORT_PATCH_FIELDS = [
+      "status",
+      "reportFile",
+      "reportFileName",
+      "reportUploaded",
+      "reportUploadedAt",
+      "reportUploadedBy",
+    ];
+
+    const idOf = (r) =>
+      String(
+        r?._id || r?.id || r?.recordId || r?.rawData?._id || r?.rawData?.id || ""
+      ).trim();
+
+    const reportChanged = (existingRow, fresh) =>
+      REPORT_PATCH_FIELDS.some((k) => {
+        const a = existingRow?.[k] ?? existingRow?.rawData?.[k] ?? "";
+        const b = fresh?.[k] ?? "";
+        return String(a) !== String(b);
+      });
+
+    const mergeUpdates = (groups, updatesById) => {
+      if (!groups || typeof groups !== "object") return null;
+      let anyChange = false;
+      const next = {};
+
+      for (const key of Object.keys(groups)) {
+        const arr = groups[key];
+        if (!Array.isArray(arr)) {
+          next[key] = arr;
+          continue;
+        }
+
+        let arrChanged = false;
+        const newArr = arr.map((row) => {
+          const id = idOf(row);
+          if (!id) return row;
+          const fresh = updatesById.get(id);
+          if (!fresh) return row;
+          if (!reportChanged(row, fresh)) return row; // keep identity → no movement
+
+          arrChanged = true;
+          anyChange = true;
+
+          const patch = {};
+          REPORT_PATCH_FIELDS.forEach((f) => {
+            if (fresh[f] !== undefined) patch[f] = fresh[f];
+          });
+          // Mark report as present so the row shows the View button immediately.
+          if (patch.reportFile) patch._hasReport = true;
+
+          return {
+            ...row,
+            ...patch,
+            rawData: { ...(row.rawData || {}), ...patch },
+          };
+        });
+
+        next[key] = arrChanged ? newArr : arr; // keep array identity if unchanged
+      }
+
+      return anyChange ? next : null;
+    };
+
+    const tick = async () => {
+      // Don't poll while this tab is in the background (e.g. you're viewing a
+      // report PDF in another tab). This avoids piling up work that can make the
+      // page unresponsive.
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const token = getAuthTokenForApp();
+        if (!token) return;
+
+        const qs = new URLSearchParams();
+        qs.set("since", sinceCursor);
+        if (!SA && tenantId) qs.set("tenantId", tenantId);
+
+        const res = await fetch(`${API_BASE}/upload/report-status?${qs.toString()}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+
+        const data = await res.json().catch(() => ({}));
+        if (stopped) return;
+
+        // Advance the cursor so each poll only fetches the next deltas.
+        if (data?.serverTime) sinceCursor = data.serverTime;
+
+        const updates = Array.isArray(data?.updates) ? data.updates : [];
+        if (!updates.length) return;
+
+        const updatesById = new Map();
+        updates.forEach((u) => {
+          const id = idOf(u);
+          if (id) updatesById.set(id, u);
+        });
+
+        // startTransition marks this as non-urgent — React yields to user interactions first
+        startTransition(() => {
+          setClientsDataRaw((prev) => {
+            const merged = mergeUpdates(prev, updatesById);
+            return merged || prev;
+          });
+        });
+      } catch (_) {
+        /* silent — a failed poll just retries next tick */
+      }
+    };
+
+    const interval = setInterval(tick, 90000); // every 90 seconds (20s was too aggressive — caused main-thread stalls)
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+    };
+  }, [currentUser?.email, hasRealToken, tenantId, SA]);
+
+  const allClients = useMemo(() => {
+    const fromData = Object.keys(clientsData).filter(k => k !== MASTER_KEY);
+
+    // FINAL CLIENT ISOLATION FIX:
+    // Super Admin/Admin list must be built from current scoped records only.
+    // Do not merge old laptop localStorage client cache, because another laptop may
+    // still contain Secondary Admin clients under stale keys and show them again.
+    if (SA || ADM) {
+      return Array.from(new Set(fromData));
+    }
+
+    const fromStorage = (() => {
+      try {
+        const raw = localStorage.getItem(`tenant_${tenantId}_saved_upload_clients`);
+        return raw ? JSON.parse(raw) : [];
+      } catch { return []; }
+    })();
+    return Array.from(new Set([...fromData, ...(Array.isArray(fromStorage) ? fromStorage : [])]));
+  }, [clientsData, tenantId, SA, ADM]);
+
+  const allVendors = useMemo(() => {
+    const rows = clientsData[MASTER_KEY] || [];
+    return Array.from(new Set(rows.map(getVendorName).filter(Boolean)));
+  }, [clientsData]);
+
+  const allCheckNames = useMemo(() => {
+    const rows = clientsData[MASTER_KEY] || [];
+    return Array.from(new Set(
+      rows.map(r => r["Check Name"] || r.checkName || "").filter(Boolean)
+    )).sort();
+  }, [clientsData]);
+
+  const visibleVendors = useMemo(() => {
+    if (!TEAM) return allVendors;
+
+    const fromState = uniqueNames(findUserAllocationsInMap(vendorAllocations, currentUser));
+    if (fromState.length > 0) return fromState;
+
+    const keysToTry = [];
+
+    if (currentUser.ownerAdminEmail) {
+      keysToTry.push(`vendorAllocations_${String(currentUser.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+
+    if (isInternalStaff) {
+      keysToTry.push(`vendorAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+
+    if (tenantId) {
+      const tenants    = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`vendorAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+
+    for (const key of getAllVendorAllocationStorageKeys(keysToTry)) {
+      try {
+        const saved = localStorage.getItem(key);
+        if (!saved) continue;
+        const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+        const found  = findUserAllocationsInMap(parsed, currentUser);
+        if (found.length > 0) return uniqueNames(found);
+      } catch (_) {}
+    }
+
+    return [];
+  }, [TEAM, vendorAllocations, currentUser.email, currentUser.name, currentUser.ownerAdminEmail, currentUser.isInternal, tenantId, isInternalStaff, allVendors]);
+
+  /* ── visibleChecks (mirrors visibleVendors) ── */
+  const visibleChecks = useMemo(() => {
+    if (!TEAM) return [];
+
+    const fromState = uniqueNames(findUserAllocationsInMap(checkAllocations, currentUser));
+    if (fromState.length > 0) return fromState;
+
+    const keysToTry = [];
+
+    if (currentUser.ownerAdminEmail) {
+      keysToTry.push(`checkAllocations_${String(currentUser.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+
+    if (isInternalStaff) {
+      keysToTry.push(`checkAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+
+    if (tenantId) {
+      const tenants    = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`checkAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+
+    for (const key of getAllCheckAllocationStorageKeys(keysToTry)) {
+      try {
+        const saved = localStorage.getItem(key);
+        if (!saved) continue;
+        const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+        const found  = findUserAllocationsInMap(parsed, currentUser);
+        if (found.length > 0) return uniqueNames(found);
+      } catch (_) {}
+    }
+
+    return [];
+  }, [TEAM, checkAllocations, currentUser.email, currentUser.name, currentUser.ownerAdminEmail, currentUser.isInternal, tenantId, isInternalStaff]);
+
+  /* ══════════════════════════════════════════════════════════════
+     visibleClients — THE CORE FIX
+     
+     For internal staff (isInternal=true, no tenantId):
+       → look up Super Admin's allocation key directly
+       → clientsData already has all records from DB fetch above
+       → filter to only their allocated clients
+     
+     For company team members:
+       → same as before (ownerAdminEmail key)
+     
+     For admins/SA:
+       → all clients
+  ══════════════════════════════════════════════════════════════ */
+  const visibleClients = useMemo(() => {
+    if (!TEAM) return allClients;
+
+    // First check the live React state.
+    const fromState = uniqueNames(findUserAllocationsInMap(allocations, currentUser));
+    if (fromState.length > 0) return fromState;
+
+    // Then re-check storage buckets. This fixes Super Admin internal team members
+    // when allocations are saved under Super Admin's bucket from the Allocations page.
+    const keysToTry = [];
+
+    if (currentUser.ownerAdminEmail) {
+      keysToTry.push(`clientAllocations_${String(currentUser.ownerAdminEmail).trim().toLowerCase()}`);
+    }
+
+    if (isInternalStaff) {
+      keysToTry.push(`clientAllocations_${SUPER_ADMIN_EMAIL.toLowerCase()}`);
+    }
+
+    if (tenantId) {
+      const tenants    = getAllTenants();
+      const adminEmail = tenants[tenantId]?.adminEmail;
+      if (adminEmail) keysToTry.push(`clientAllocations_${String(adminEmail).trim().toLowerCase()}`);
+    }
+
+    for (const key of getAllClientAllocationStorageKeys(keysToTry)) {
+      try {
+        const saved = localStorage.getItem(key);
+        if (!saved) continue;
+        const parsed = normalizeAllocationMapKeys(JSON.parse(saved));
+        const found  = findUserAllocationsInMap(parsed, currentUser);
+        if (found.length > 0) return uniqueNames(found);
+      } catch (_) {}
+    }
+
+    return [];
+  }, [TEAM, allocations, currentUser.email, currentUser.name, currentUser.ownerAdminEmail, currentUser.isInternal, tenantId, isInternalStaff, allClients]);
+
+  /* ══════════════════════════════════════════════════════════════
+     data sync
+  ══════════════════════════════════════════════════════════════ */
+  useEffect(() => {
+    if (TEAM) {
+      // MyTable now fetches and manages its own server-paginated, allocation-
+      // scoped "working set" of records directly for team members too (see
+      // the fetch effect in MyTable.jsx, scopeToAllocations) — this branch
+      // must NOT overwrite it from clientsData. clientsData is deliberately
+      // never populated for team members anymore (see fetchFromDB's TEAM
+      // short-circuit above), so re-deriving `data` from it here would just
+      // permanently reset `data` back to empty, fighting with and undoing
+      // every page MyTable fetches. This used to be real client-side
+      // filtering logic before that migration; kept only as a comment for
+      // context, not because anything below still needs it.
+    } else {
+      // Admin/SA: MyTable now fetches and manages its own server-paginated
+      // "working set" of records directly (see the fetch effect in
+      // MyTable.jsx) — this branch must NOT overwrite it from clientsData.
+      // It used to run every time clientsData changed (i.e. on every batch
+      // of the background eager load), which re-inflated `data` back to the
+      // full dataset and undid the whole point of server pagination.
+    }
+  // eslint-disable-next-line
+  }, [selectedClient, clientsData, TEAM, visibleClients.join(","), visibleVendors.join(","), visibleChecks.join(",")]);
+
+  useEffect(() => {
+    if (TEAM && selectedClient && selectedClient !== MASTER_KEY && !hasName(visibleClients, selectedClient))
+      setSelectedClientRaw(visibleClients[0] || MASTER_KEY);
+  // eslint-disable-next-line
+  }, [visibleClients.join(",")]);
+
+  useEffect(() => {
+    if (!showModal) return;
+
+    setModalUsers(getUsersForModal(currentUser));
+
+    // Only Super Admin modal is synced with backend so internal Tervies staff
+    // requests created on another laptop appear here. Company admin/team logic is untouched.
+    if (!SA) return;
+
+    let cancelled = false;
+    (async () => {
+      const backendUsers = await fetchUsersForSuperAdminManagement();
+      if (cancelled || backendUsers.length === 0) return;
+      const merged = mergeUsersByEmail(getAllUsers(), backendUsers);
+      saveAllUsers(merged);
+      setModalUsers(getUsersForModal(currentUser));
+    })();
+
+    return () => { cancelled = true; };
+  }, [showModal, SA, currentUser.email, currentUser.role, currentUser.tenantId]);
+
+  useEffect(() => {
+    if (TEAM && ["cost","allocations","tenants","admindata"].includes(activePage)) setActivePage("dashboard");
+    if (!SA && activePage === "tenants") setActivePage("dashboard");
+    if (!SA && !MGR && activePage === "admindata") setActivePage("dashboard");
+    if (!SA && !MGR && activePage === "specialcases") setActivePage("dashboard");
+
+    // SA opens "All Records" → lazy-fetch all tenants data
+    if (SA && activePage === "admindata" && hasRealToken && Object.keys(allTenantsData).length === 0 && !allTenantsLoading) {
+      setAllTenantsLoading(true);
+      uploadAPI.getRecords({ showAll: "true" }).then(result => {
+        if (!result || !Array.isArray(result)) { setAllTenantsLoading(false); return; }
+        const grouped = {};
+        result.forEach(row => {
+          const flat = { ...row };
+          if (row.rawData && typeof row.rawData === "object") {
+            Object.keys(row.rawData).forEach(k => {
+              const nk = k.trim();
+              if (flat[nk] === undefined || flat[nk] === null || flat[nk] === "") flat[nk] = row.rawData[k];
+            });
+          }
+          const trueStatus = getRowStatusValue(flat);
+          flat["Status"] = trueStatus; flat["status"] = trueStatus;
+          const client = getClientName(flat) || "Unknown";
+          if (!grouped[client]) grouped[client] = [];
+          grouped[client].push(flat);
+        });
+        const allRows = [];
+        Object.entries(grouped).forEach(([k,v]) => { if (k !== MASTER_KEY) allRows.push(...v); });
+        grouped[MASTER_KEY] = allRows;
+        setAllTenantsData(grouped);
+        setAllTenantsLoading(false);
+      }).catch(err => {
+        console.warn("allTenantsData fetch failed:", err.message);
+        setAllTenantsLoading(false);
+      });
+    }
+
+    // Release the all-tenants dataset once SA leaves "All Records". This can be
+    // significantly larger than a single admin's own records (spans every
+    // tenant) and was staying in memory for the rest of the session even after
+    // navigating away, contributing to browser tab out-of-memory crashes.
+    // Revisiting "All Records" later simply re-fetches it fresh.
+    if (activePage !== "admindata" && Object.keys(allTenantsData).length > 0) {
+      setAllTenantsData({});
+    }
+  }, [activePage]);
+
+  const dashboardData = useMemo(() => {
+    if (TEAM) {
+      if (visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0) return [];
+      const seen   = new Set();
+      const result = [];
+      const addRows = (rows) => {
+        for (const row of rows) {
+          const id  = row._id || row["Check Id"] || row["Case ID"] || row["Application ID"];
+          const key = id ? String(id) : null;
+          if (key && seen.has(key)) continue;
+          if (key) seen.add(key);
+          result.push(row);
+        }
+      };
+
+      for (const vc of visibleClients) {
+        let rows = clientsData[vc] || [];
+        if (rows.length === 0) {
+          rows = (clientsData[MASTER_KEY] || []).filter(row =>
+normalizeNameKey(getClientName(row)) === normalizeNameKey(vc)
+          );
+        }
+        addRows(rows);
+      }
+
+      for (const vv of visibleVendors) {
+        addRows((clientsData[MASTER_KEY] || []).filter(row =>
+normalizeNameKey(getVendorName(row)) === normalizeNameKey(vv)
+        ));
+      }
+
+      for (const vck of visibleChecks) {
+        addRows((clientsData[MASTER_KEY] || []).filter(row => {
+          const rck = String(row["Check Name"] || row.checkName || "").trim().toLowerCase();
+          return rck && rck === vck.trim().toLowerCase();
+        }));
+      }
+
+      return result;
+    }
+    return clientsData[MASTER_KEY] || [];
+  }, [clientsData, TEAM, visibleClients.join(","), visibleVendors.join(","), visibleChecks.join(",")]);
+
+  const statusCounts = useMemo(() => {
+    const counts = {Sent:0,Closed:0,Pending:0,Insuff:0,Hold:0,Stop:0};
+    for (const row of dashboardData) {
+      const s = (getRowStatusValue(row) || "").trim();
+      const k = Object.keys(counts).find(v => v.toLowerCase() === s.toLowerCase());
+      if (k) counts[k]++;
+    }
+    return counts;
+  }, [dashboardData]);
+
+  const totalCount = dashboardData.length;
+
+  const specialCaseCount = useMemo(() =>
+    dashboardData.filter(r => r.isSpecialCase === true).length,
+  [dashboardData]);
+
+  const dashboardStatsCacheKey = `bgv_dashboard_stats_${String(currentUser?.email || "").trim().toLowerCase()}_${String(tenantId || "no_tenant")}_${String(currentUser?.role || "").trim().toLowerCase()}`;
+  const dashboardStatsLatestKey = `bgv_dashboard_stats_latest_${String(currentUser?.email || "").trim().toLowerCase()}`;
+
+  const cachedDashboardStats = useMemo(() => {
+    const exact = safeLocalGet(dashboardStatsCacheKey, null);
+    if (exact && typeof exact === "object") return exact;
+    const latest = safeLocalGet(dashboardStatsLatestKey, null);
+    if (latest && typeof latest === "object") return latest;
+    return null;
+  }, [dashboardStatsCacheKey, dashboardStatsLatestKey]);
+
+  useEffect(() => {
+    if (totalCount > 0) {
+      const stats = { totalCount, statusCounts };
+      safeLocalSet(dashboardStatsCacheKey, stats);
+      safeLocalSet(dashboardStatsLatestKey, stats);
+    }
+  }, [totalCount, statusCounts, dashboardStatsCacheKey, dashboardStatsLatestKey]);
+
+  // Prefer the server-computed totals (instant, no dependency on the full
+  // records load finishing) for everyone — team members now get an
+  // allocation-scoped serverStats too (see the fetch effect above), not
+  // just Admin/SA.
+  const displayTotalCount =
+    serverStats ? serverStats.total :
+    totalCount > 0 ? totalCount : (dbLoading && cachedDashboardStats?.totalCount ? cachedDashboardStats.totalCount : totalCount);
+
+  const displayStatusCounts =
+    serverStats
+      ? { Sent: serverStats.sent || 0, Closed: serverStats.closed || 0, Pending: serverStats.pending || 0, Insuff: serverStats.insuff || 0, "Insuff Clear": serverStats.insuffClear || 0, Hold: serverStats.hold || 0, Stop: serverStats.stop || 0 }
+      : totalCount > 0 ? statusCounts : (dbLoading && cachedDashboardStats?.statusCounts ? cachedDashboardStats.statusCounts : statusCounts);
+
+  // Records-page pills specifically: when a client filter is active, prefer
+  // the client-scoped stats fetched above over the account-wide ones (only
+  // relevant for !TEAM — team members never populate clientScopedStats).
+  const recordsPillTotalCount = clientScopedStats ? clientScopedStats.total : displayTotalCount;
+  const recordsPillStatusCounts = clientScopedStats
+    ? { Sent: clientScopedStats.sent || 0, Closed: clientScopedStats.closed || 0, Pending: clientScopedStats.pending || 0, Insuff: clientScopedStats.insuff || 0, "Insuff Clear": clientScopedStats.insuffClear || 0, Hold: clientScopedStats.hold || 0, Stop: clientScopedStats.stop || 0 }
+    : displayStatusCounts;
+
+  const orgTabs = useMemo(() => {
+    if (!SA) return [];
+    const seen = {};
+    modalUsers.forEach(u => { if (u.tenantId && !seen[u.tenantId]) seen[u.tenantId] = u._orgName || u.tenantId; });
+    return Object.entries(seen).map(([id, name]) => ({ id, name }));
+  }, [SA, modalUsers]);
+
+  const isModalAdminUser = (u) => u.role === "admin" || u.role === "secondary_admin";
+  const isModalTeamUser = (u) => {
+    if (!SA) return u.role === "team";
+    return u.role === "team" || isSAInternalTeamUser(u);
+  };
+
+  const displayedUsers = useMemo(() => {
+    let list = SA ? modalUsers.map(normaliseSAInternalUser) : [...modalUsers];
+    if (SA && modalOrgFilter !== "all") list = list.filter(u => u.tenantId === modalOrgFilter);
+    if (modalSection === "admins") list = list.filter(u => u.role === "admin" || u.role === "secondary_admin");
+    else list = list.filter(u => isModalTeamUser(u));
+    list = list.filter(u => (u.status || "pending") === modalStatus);
+    return list;
+  }, [modalUsers, SA, modalOrgFilter, modalSection, modalStatus]);
+
+  const adminCount   = useMemo(() => (SA ? modalUsers.map(normaliseSAInternalUser) : modalUsers).filter(u => u.role === "admin" && (SA || modalOrgFilter === "all" || u.tenantId === modalOrgFilter)).length, [modalUsers, SA, modalOrgFilter]);
+  const teamCount    = useMemo(() => (SA ? modalUsers.map(normaliseSAInternalUser) : modalUsers).filter(u => isModalTeamUser(u) && (SA || modalOrgFilter === "all" || u.tenantId === modalOrgFilter)).length, [modalUsers, SA, modalOrgFilter]);
+  const pendingCount = useMemo(() => (SA ? modalUsers.map(normaliseSAInternalUser) : modalUsers).filter(u => u.status === "pending").length, [modalUsers, SA]);
+
+  const updateUser = async (email, patch) => {
+    const targetEmail = String(email || "").trim().toLowerCase();
+    const all = getAllUsers();
+
+    saveAllUsers(all.map(u =>
+      String(u.email || "").trim().toLowerCase() === targetEmail
+        ? { ...u, ...patch }
+        : u
+    ));
+
+    setModalUsers(prev => prev.map(u =>
+      String(u.email || "").trim().toLowerCase() === targetEmail
+        ? { ...u, ...patch }
+        : u
+    ));
+
+    // Backend update for Super Admin/Admin so password reset works across devices.
+    const target =
+      all.find(u => String(u.email || "").trim().toLowerCase() === targetEmail) ||
+      modalUsers.find(u => String(u.email || "").trim().toLowerCase() === targetEmail);
+
+    const backendId = target?._id || target?.id;
+    const token = getAuthTokenForApp();
+
+    if (token && backendId) {
+      try {
+        await fetch(`${API_BASE}/auth/users/${backendId}`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(patch),
+        });
+      } catch (e) {
+        console.warn("Backend user update failed, local state saved:", e.message);
+      }
+    }
+  };
+
+  const resetUserPassword = async (user) => {
+    const targetEmail = String(user?.email || "").trim().toLowerCase();
+    const userId = user?._id || user?.id;
+
+    if (!targetEmail) {
+      alert("User email missing.");
+      return;
+    }
+
+    if (!userId) {
+      alert("User ID missing. Please refresh Manage Users and try again.");
+      return;
+    }
+
+    if (targetEmail === String(currentUser?.email || "").trim().toLowerCase()) {
+      alert("You cannot reset your own password from here.");
+      return;
+    }
+
+    const newPassword = window.prompt(
+      `Enter new password for ${targetEmail} (minimum 6 characters):`,
+      ""
+    );
+
+    if (newPassword === null) return;
+
+    if (String(newPassword).length < 6) {
+      alert("Password must be at least 6 characters.");
+      return;
+    }
+
+    const confirmPassword = window.prompt("Confirm new password:", "");
+
+    if (confirmPassword === null) return;
+
+    if (newPassword !== confirmPassword) {
+      alert("Password confirmation does not match.");
+      return;
+    }
+
+    const ok = window.confirm(
+      `Reset password for ${targetEmail}?\n\nAfter this, the user can login with the new password.`
+    );
+
+    if (!ok) return;
+
+    try {
+      const token = getAuthTokenForApp();
+
+      const res = await fetch(`${API_BASE}/auth/users/${userId}/password`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ password: newPassword }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.error || data.message || "Password reset failed");
+      }
+
+      // Keep old local user list updated also, without changing any other logic.
+      try {
+        const all = getAllUsers();
+        saveAllUsers(
+          all.map((u) => {
+            const sameById = String(u._id || u.id || "") === String(userId);
+            const sameByEmail = String(u.email || "").trim().toLowerCase() === targetEmail;
+            return sameById || sameByEmail
+              ? {
+                  ...u,
+                  password: newPassword,
+                  passwordUpdatedAt: new Date().toISOString(),
+                  passwordUpdatedBy: currentUser?.email || "admin",
+                }
+              : u;
+          })
+        );
+
+        setModalUsers((prev) =>
+          prev.map((u) => {
+            const sameById = String(u._id || u.id || "") === String(userId);
+            const sameByEmail = String(u.email || "").trim().toLowerCase() === targetEmail;
+            return sameById || sameByEmail
+              ? {
+                  ...u,
+                  passwordUpdatedAt: new Date().toISOString(),
+                  passwordUpdatedBy: currentUser?.email || "admin",
+                }
+              : u;
+          })
+        );
+      } catch (localErr) {
+        console.warn("Local password sync skipped:", localErr);
+      }
+
+      alert(`✅ Password reset successfully for ${targetEmail}`);
+    } catch (err) {
+      console.error("Reset password failed:", err);
+      alert(err.message || "Password reset failed. Please try again.");
+    }
+  };
+
+  const assignToMyTenant = (email) => {
+    const t = getAllTenants();
+    const adminEmail = t[tenantId]?.adminEmail || currentUser.email;
+    updateUser(email, { tenantId, status:"approved", ownerAdminEmail: adminEmail });
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("currentUser");
+    localStorage.removeItem("token");
+    localStorage.removeItem("authToken");
+    localStorage.removeItem("jwt");
+    window.location.href = "/login";
+  };
+
+  // Vendor-allocated team members (assigned via Allocations → Vendor
+  // Allocation, not Client Allocation) don't get their own mailbox context —
+  // they share the same "Inbox" and floating widget as everyone else, which
+  // isn't relevant to their vendor-scoped work, so both are hidden for them.
+  const isVendorScopedTeam = TEAM && visibleVendors.length > 0;
+
+  const navItems = NAV_ITEMS.filter(item => {
+    // Manager/TL consult the centralized permission map instead of the
+    // existing flags below — superadmin/admin/team never take this branch
+    // (isManagerOrTL is false for them), so their filtering is byte-for-byte
+    // what it was before this feature existed.
+    if (isManagerOrTL(currentUser?.role)) return !!canAccessScreen(currentUser?.role, item.id);
+    if (item.id === "inbox" && isVendorScopedTeam) return false;
+    if (item.superOnly)  return SA;
+    if (item.adminOnly)  return ADM;
+    if (item.teamHidden) return !TEAM;
+    return true;
+  });
+
+  const orgName = (() => {
+    if (SA) return "Super Admin";
+    const t = getAllTenants();
+    return (
+      t[tenantId]?.name ||
+      currentUser.companyName ||
+      currentUser.company ||
+      currentUser.orgName ||
+      currentUser._orgName ||
+      tenantId ||
+      "—"
+    );
+  })();
+
+  /* ─────────────────────────────
+     Branding / Logo Display
+     Super Admin = TERVIES branding.
+     Admin / Secondary Admin / Team = own company branding.
+  ───────────────────────────── */
+  const brandInfo = useMemo(() => {
+    const tenants = getAllTenants();
+    const tenant = tenants[tenantId] || {};
+
+    const companyName =
+      tenant.name ||
+      currentUser.companyName ||
+      currentUser.company ||
+      currentUser.orgName ||
+      currentUser._orgName ||
+      currentUser.name ||
+      orgName ||
+      "Company";
+
+    const companyLogo =
+      tenant.logo ||
+      tenant.logoUrl ||
+      tenant.companyLogo ||
+      tenant.orgLogo ||
+      currentUser.logo ||
+      currentUser.logoUrl ||
+      currentUser.companyLogo ||
+      currentUser.orgLogo ||
+      "";
+
+    if (SA) {
+      return {
+        name: "TERVIES",
+        sub: "Super Admin",
+        logo: terviesLogo,
+        useImage: true,
+      };
+    }
+
+    return {
+      name: companyName,
+      sub: TEAM && adminInfo ? `Admin: ${adminInfo.adminName}` : (ADM ? "Admin" : "Team"),
+      logo: companyLogo,
+      useImage: Boolean(companyLogo),
+    };
+  }, [SA, TEAM, ADM, tenantId, currentUser, orgName, adminInfo]);
+
+  const roleBadge = useMemo(() => {
+    if (SA) return { cls:"role-superadmin", label:"👑 Super Admin" };
+    if (ADM) {
+      const t = getAllTenants();
+      const tenant = t[tenantId];
+      const isPrimary = tenant?.adminEmail?.toLowerCase().trim() === (currentUser.email || "").toLowerCase().trim();
+      return isPrimary
+        ? { cls:"role-admin",     label:"🔑 Admin" }
+        : { cls:"role-secondary", label:"🧩 Secondary Admin" };
+    }
+    return { cls:"role-team", label:"👤 Team" };
+  }, [SA, ADM, tenantId, currentUser.email]);
+
+  const lastFileName = (() => { try { return localStorage.getItem("lastUploadedFileName") || ""; } catch { return ""; } })();
+  const recordsLabel = selectedClient === MASTER_KEY || !selectedClient
+    ? `All Records · ${data.length} rows`
+    : `${selectedClient} · ${data.length} rows`;
+
+  const pageInfo = {
+    dashboard:   { title:"Dashboard",    icon:"📊", sub:"Overview of BGV records"                                   },
+    upload:      { title:"Add Clients",  icon:"📤", sub:"Import Excel & configure pricing"                          },
+    records:     { title:"Records",      icon:"📋", sub:recordsLabel                                                },
+    tat:         { title:"TAT Tracker",  icon:"⏱️", sub:"Turnaround time · auto-penalty engine"                     },
+    admindata:   { title:"All Records",  icon:"🗄️", sub:`All uploaded records across ${allClients.length} clients`   },
+    cost:        { title:"Cost Summary", icon:"💰", sub:"Vendor & client cost breakdown"                             },
+    allocations: { title:"Allocations",  icon:"🗂️", sub:`Assign clients to team · ${allClients.length} clients`     },
+    tenants:     { title:"All Tenants",  icon:"🌐", sub:"Super admin console — all organisations"                    },
+  };
+  const current = pageInfo[activePage] || pageInfo["dashboard"];
+  const avatarInitial = u => (u.name || u.email || "?")[0].toUpperCase();
+
+  const avatarCls = u => {
+    if (u.role === "superadmin") return "ua-superadmin";
+    if (u.role === "admin") {
+      const t = getAllTenants();
+      const isPrimary = t[u.tenantId]?.adminEmail?.toLowerCase() === u.email?.toLowerCase();
+      return isPrimary ? "ua-admin" : "ua-secondary";
+    }
+    if (u.status === "pending")  return "ua-pending";
+    if (u.status === "rejected") return "ua-rejected";
+    return "ua-team";
+  };
+
+  return (
+    <div className="app-shell">
+      <div className="app-mesh"/>
+
+      {/* Mobile sidebar overlay */}
+      <div className={`sidebar-overlay${sidebarOpen ? " active" : ""}`} onClick={() => setSidebarOpen(false)} />
+
+      {/* SIDEBAR */}
+      <div className={`sidebar ${sidebarCollapsed ? "collapsed" : ""} ${sidebarOpen ? "mobile-open" : ""}`}>
+        <div className="sidebar-logo">
+          <div
+            className="sidebar-logo-icon"
+            style={{
+              background: brandInfo.useImage ? "transparent" : "var(--accentg)",
+              border: "none",
+              boxShadow: brandInfo.useImage ? "none" : "0 4px 12px rgba(37,99,235,0.25)",
+              padding: 0,
+              color: "#fff",
+              fontFamily: "var(--head)",
+              fontWeight: 800,
+            }}
+          >
+            {brandInfo.useImage ? (
+              <img
+                src={brandInfo.logo}
+                alt={brandInfo.name}
+                style={{ width: 36, height: 36, objectFit: "contain", borderRadius: 8 }}
+              />
+            ) : (
+              String(brandInfo.name || "?").charAt(0).toUpperCase()
+            )}
+          </div>
+          {!sidebarCollapsed && (
+            <div>
+              <div className="sidebar-logo-text" title={brandInfo.name}>
+                {brandInfo.name}
+              </div>
+              <div className="sidebar-logo-sub" title={brandInfo.sub}>
+                {brandInfo.sub}
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="sidebar-toggle" onClick={() => setSidebarCollapsed(p => !p)}>
+          {sidebarCollapsed ? "▶️" : "◀️"}
+        </div>
+        <div className="sidebar-nav">
+          {!sidebarCollapsed && <div className="sidebar-section-label">Navigation</div>}
+          {navItems.filter(i => i.section === "main").map(item => (
+            <div key={item.id}
+              className={`nav-item ${activePage === item.id ? "active" : ""}`}
+              data-label={item.label}
+              onClick={() => {
+                setActivePage(item.id);
+                setSidebarOpen(false);
+                // Open Records instantly without showing refresh/loading jump.
+                // Only force DB fetch if no records are loaded yet. Silent auto-refresh still runs in background.
+                if (
+                  item.id === "records" &&
+                  hasRealToken &&
+                  Object.keys(clientsData || {}).length === 0
+                ) {
+                  setRefreshKey(k => k + 1);
+                }
+              }}>
+              <div className="nav-icon">{item.icon}</div>
+              <span className="nav-label">{item.label}</span>
+              {item.id === "records" && !sidebarCollapsed && data.length > 0 && (
+                <span style={{fontSize:10,color:"var(--accent)",fontFamily:"var(--head)",fontWeight:700,background:"rgba(37,99,235,0.08)",padding:"2px 7px",borderRadius:99,border:"1px solid rgba(37,99,235,0.18)"}}>
+                  {(!TEAM && displayTotalCount) ? displayTotalCount : data.length}
+                </span>
+              )}
+              {item.id === "inbox" && !sidebarCollapsed && inboxUnreadCount > 0 && (
+                <span style={{fontSize:10,color:"var(--accent)",fontFamily:"var(--head)",fontWeight:700,background:"rgba(37,99,235,0.08)",padding:"2px 7px",borderRadius:99,border:"1px solid rgba(37,99,235,0.18)"}}>
+                  {inboxUnreadCount}
+                </span>
+              )}
+            </div>
+          ))}
+          {ADM && (
+            <>
+              {!sidebarCollapsed && <div className="sidebar-section-label" style={{marginTop:8}}>Admin</div>}
+              {navItems.filter(i => i.section === "admin").map(item => (
+                <div key={item.id}
+                  className={`nav-item ${activePage === item.id ? "active" : ""}`}
+                  data-label={item.label}
+                  onClick={() => { setActivePage(item.id); setSidebarOpen(false); }}>
+                  <div className="nav-icon">{item.icon}</div>
+                  <span className="nav-label">{item.label}</span>
+                </div>
+              ))}
+              <div className="nav-item" data-label="Manage Users" onClick={() => { setShowModal(true); setSidebarOpen(false); }}>
+                <div className="nav-icon">👥</div>
+                <span className="nav-label">Manage Users</span>
+                {pendingCount > 0 && <span className="nav-badge">{pendingCount}</span>}
+              </div>
+            </>
+          )}
+          {SA && (
+            <>
+              {!sidebarCollapsed && <div className="sidebar-section-label" style={{marginTop:8}}>Platform</div>}
+              {navItems.filter(i => i.section === "super").map(item => (
+                <div key={item.id}
+                  className={`nav-item ${activePage === item.id ? "active" : ""}`}
+                  data-label={item.label}
+                  onClick={() => { setActivePage(item.id); setSidebarOpen(false); }}>
+                  <div className="nav-icon">{item.icon}</div>
+                  <span className="nav-label">{item.label}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+        <div className="sidebar-bottom">
+          {(SA || isInternalStaff) && !isVendorScopedTeam && (() => {
+            const END = new Date("2029-07-14T00:00:00");
+            const START = new Date("2026-07-14T00:00:00");
+            const now = new Date();
+            const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const daysLeft = Math.max(0, Math.round((END - todayMidnight) / 86400000));
+            const totalDays = Math.round((END - START) / 86400000);
+            const pct = Math.round((daysLeft / totalDays) * 100);
+            const timeColor = pct > 40 ? "#10b981" : pct > 20 ? "#f59e0b" : "#ef4444";
+            return (
+              <div className="license-box">
+                <div className="license-label">🎯 Target: ₹50 Crore</div>
+                <div style={{display:"flex",alignItems:"baseline",gap:4,marginBottom:1}}>
+                  <div className="license-days" style={{color:timeColor}}>{daysLeft.toLocaleString()}</div>
+                  <div style={{fontFamily:"var(--head)",fontSize:10,fontWeight:700,color:"var(--text3)"}}>days left</div>
+                </div>
+                <div className="license-days-sub" style={{marginBottom:6}}>to achieve ₹50 Cr by 14 Jul 2029</div>
+                <div className="license-bar-bg">
+                  <div className="license-bar-fill" style={{width:`${pct}%`, background:timeColor}} />
+                </div>
+                <div style={{fontFamily:"var(--head)",fontSize:9,color:"var(--text3)",marginTop:4,textAlign:"right"}}>{pct}% time remaining</div>
+              </div>
+            );
+          })()}
+          <div className="nav-item" data-label="Logout" onClick={() => { handleLogout(); setSidebarOpen(false); }} style={{color:"#dc2626"}}>
+            <div className="nav-icon" style={{color:"#dc2626"}}>⎋</div>
+            <span className="nav-label" style={{color:"#dc2626"}}>Logout</span>
+          </div>
+        </div>
+      </div>
+
+      {/* MAIN */}
+      <div className={`app-main ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+        <div className="topbar">
+          <div className="topbar-left">
+            <button className="hamburger-btn" onClick={() => setSidebarOpen(p => !p)} aria-label="Toggle navigation">☰</button>
+            <span style={{fontSize:18}}>{current.icon}</span>
+            <div>
+              <div className="topbar-page-title">{current.title}</div>
+              <div className="topbar-breadcrumb">
+                <span className="live-dot" style={{marginRight:4}}/>{current.sub}
+              </div>
+            </div>
+          </div>
+          <div className="topbar-right">
+            <span className={`topbar-role-badge ${roleBadge.cls}`}>{roleBadge.label}</span>
+            {!SA && ADM && <span className="topbar-org-badge">🏢 {orgName}</span>}
+            {TEAM && adminInfo && <span className="topbar-admin-badge">🧩 Under: {adminInfo.adminName}</span>}
+            <div className="app-total-badge">
+              <span className="app-total-label">Total Records</span>
+              <span className="app-total-value">{displayTotalCount || 0}</span>
+            </div>
+            {ADM && (
+              <button className="admin-btn" onClick={() => setShowModal(true)}>
+                👥 Users
+                {pendingCount > 0 && <span className="admin-btn-badge">{pendingCount}</span>}
+              </button>
+            )}
+            <button className="logout-btn" onClick={handleLogout}>⎋ Logout</button>
+          </div>
+        </div>
+
+        <div className="page-content">
+          {dbLoading && activePage !== "dashboard" && Object.keys(clientsData || {}).length === 0 && (
+            <div className="data-loading">
+              <span className="data-loading-spin"/>Loading records…
+            </div>
+          )}
+          {dbError && !dbLoading && (
+            <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 18px",marginBottom:16,background:"rgba(245,158,11,0.07)",border:"1px solid rgba(245,158,11,0.28)",borderRadius:"var(--r12)",fontFamily:"var(--head)",fontSize:13,color:"#92400e"}}>
+              ⚠️ {dbError}
+            </div>
+          )}
+
+          {/* ════ DASHBOARD ════ */}
+          {activePage === "dashboard" && (
+            <div style={{display:"flex",flexDirection:"column",gap:20}}>
+              {TEAM && adminInfo && (
+                <div className="admin-under-notice">
+                  <span className="admin-under-notice-icon">🧩</span>
+                  <div>
+                    <div className="admin-under-notice-text">You are under: {adminInfo.adminName}</div>
+                    <div className="admin-under-notice-sub">
+                      {adminInfo.orgName && <>Org: {adminInfo.orgName} · </>}Contact: {adminInfo.adminEmail}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {TEAM && (
+                <div className="alloc-team-notice">
+                  <span className="alloc-team-notice-icon">🗂️</span>
+                  <div>
+                    <div className="alloc-team-notice-text">
+                      You have {visibleClients.length} client{visibleClients.length !== 1 ? "s" : ""}, {visibleVendors.length} vendor{visibleVendors.length !== 1 ? "s" : ""} and {visibleChecks.length} check type{visibleChecks.length !== 1 ? "s" : ""} assigned
+                    </div>
+                    <div className="alloc-team-notice-sub">
+                      {visibleClients.length > 0 || visibleVendors.length > 0 || visibleChecks.length > 0
+                        ? [
+                            visibleClients.length > 0 ? `Clients: ${visibleClients.join(", ")}` : "",
+                            visibleVendors.length > 0 ? `Vendors: ${visibleVendors.join(", ")}` : "",
+                            visibleChecks.length > 0  ? `Checks: ${visibleChecks.join(", ")}` : "",
+                          ].filter(Boolean).join(" · ")
+                        : "No client, vendor, or check type assigned yet — contact your admin."}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {ADM && !SA && (
+                <div className="tenant-notice">
+                  <span className="tenant-notice-icon">🧩</span>
+                  <div>
+                    <div className="tenant-notice-text">{orgName}</div>
+                    <div className="tenant-notice-sub">
+                      Your access code for team members:&nbsp;
+                      <code style={{fontFamily:"monospace",fontSize:11,background:"rgba(124,58,237,0.08)",padding:"1px 7px",borderRadius:4}}>
+                        {currentUser.adminAccessCode || tenantId}
+                      </code>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {displayTotalCount === 0 && !dbLoading && (
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:"48px 24px",background:"var(--card)",border:"1.5px dashed var(--border2)",borderRadius:"var(--r16)",boxShadow:"var(--shadow)"}}>
+                  <div style={{fontSize:48,opacity:0.25}}>📂</div>
+                  <div style={{fontFamily:"var(--head)",fontSize:18,fontWeight:700,color:"var(--text3)"}}>
+                    {TEAM && visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0 ? "Nothing assigned yet" : "No records yet"}
+                  </div>
+                  <div style={{fontSize:13,color:"var(--text3)",textAlign:"center",maxWidth:340}}>
+                    {TEAM && visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0
+                      ? "Your admin hasn't assigned any client, vendor, or check type to you yet. Contact your administrator."
+                      : TEAM
+                        ? "Your admin has assigned access but hasn't uploaded matching data yet."
+                        : "Upload your Excel file to get started."}
+                  </div>
+                  {!TEAM && (
+                    <button onClick={() => setActivePage("upload")}
+                      style={{fontFamily:"var(--head)",fontSize:13,fontWeight:600,background:"var(--accentg)",color:"#fff",border:"none",borderRadius:"var(--r8)",padding:"10px 24px",cursor:"pointer",boxShadow:"0 4px 14px rgba(37,99,235,0.26)"}}>
+                      📤 Go to Upload →
+                    </button>
+                  )}
+                </div>
+              )}
+              {displayTotalCount > 0 && (
+                <div className="app-stats">
+                  {visibleStatusDefs.map(s => {
+                    const count = displayStatusCounts[s.key] || 0;
+                    const pct   = displayTotalCount > 0 ? (count / displayTotalCount) * 100 : 0;
+                    return (
+                      <div key={s.key}
+                        className={`stat-card ${statusFilter === s.key ? s.cls : ""}`}
+                        onClick={() => { setStatusFilter(p => p === s.key ? null : s.key); setActivePage("records"); }}>
+                        {statusFilter === s.key && <span className="stat-filter-badge">Filtered</span>}
+                        <div className={`stat-icon-wrap ${s.icls}`}>{s.icon}</div>
+                        <div>
+                          <div className="stat-label">{s.key}</div>
+                          <div className={`stat-value ${s.vcls}`}>{count}</div>
+                          {s.bar && <div className="stat-bar-wrap"><div className={`stat-bar ${s.bar}`} style={{width:`${pct}%`}}/></div>}
+                          <div className="stat-hint">Click to view {s.hint}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="stat-card" style={{cursor:"default"}} onClick={() => setActivePage("records")}>
+                    <div className="stat-icon-wrap sicon-blue">📋</div>
+                    <div>
+                      <div className="stat-label">Total</div>
+                      <div className="stat-value sv-blue">{displayTotalCount}</div>
+                      <div className="stat-hint">all records</div>
+                    </div>
+                  </div>
+                  {ADM && (
+                    <div className="stat-card" onClick={() => setActivePage("sentreports")}
+                      style={{borderColor:"rgba(124,58,237,0.30)"}}>
+                      <div className="stat-icon-wrap sicon-purple">📤</div>
+                      <div>
+                        <div className="stat-label">Sent Report</div>
+                        <div className="stat-value sv-purple">{sentReportsPending}</div>
+                        <div className="stat-hint">pending today</div>
+                      </div>
+                    </div>
+                  )}
+                  {SA && (
+                    <div className="stat-card" onClick={() => setActivePage("specialcases")}
+                      style={{borderColor:"rgba(245,158,11,0.35)"}}>
+                      <div className="stat-icon-wrap sicon-amber">📌</div>
+                      <div>
+                        <div className="stat-label">Special Case</div>
+                        <div className="stat-value sv-amber">{specialCaseCount}</div>
+                        <div className="stat-hint">pushed to later month</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:14}}>
+                {[
+                  ...(!TEAM ? [{id:"upload", icon:"📤", title:"Add Clients", sub:"Import Excel & pricing", color:"rgba(37,99,235"}] : []),
+                  {id:"records",  icon:"📋", title:"View Records",  sub:"Browse & manage BGV cases",       color:"rgba(16,185,129"},
+                  {id:"tat",      icon:"⏱️", title:"TAT Tracker",   sub:"Turnaround time & penalties",     color:"rgba(37,99,235"},
+                  ...(ADM ? [
+                    {id:"cost",        icon:"💰", title:"Cost Summary", sub:"Vendor & client cost reports",    color:"rgba(245,158,11"},
+                    {id:"allocations", icon:"🗂️", title:"Allocations",  sub:"Assign clients to team members",  color:"rgba(124,58,237"},
+                  ] : []),
+                  ...(ADM ? [
+                    {id:"admindata",   icon:"🗄️", title:"All Records",  sub:"All records across every client", color:"rgba(124,58,237"},
+                    {id:"cost",        icon:"💰", title:"Cost Summary", sub:"Vendor & client cost reports",    color:"rgba(245,158,11"},
+                    {id:"allocations", icon:"🗂️", title:"Allocations",  sub:"Assign clients to team members",  color:"rgba(124,58,237"},
+                  ] : []),
+                  ...(!TEAM || visibleVendors.length > 0 ? [{id:"dailyuploads", icon:"📅", title:"Daily Uploads", sub:"Browse & download Excel files", color:"rgba(20,184,166"}] : []),
+                  ...(SA ? [{id:"tenants", icon:"🌐", title:"All Tenants", sub:"Platform-wide org management", color:"rgba(245,166,35"}] : []),
+                  ...(SA ? [{id:"dailyclosed", icon:"📆", title:"Daily Closed Cases", sub:"Download closed cases by date", color:"rgba(16,185,129"}] : []),
+                ].map(q => (
+                  <div key={q.id} onClick={() => setActivePage(q.id)}
+                    style={{background:"var(--card)",border:`1.5px solid ${q.color},0.22)`,borderRadius:"var(--r16)",padding:"20px 22px",cursor:"pointer",transition:"all 0.2s var(--ease)",boxShadow:"var(--shadow)"}}
+                    onMouseEnter={e => { e.currentTarget.style.transform="translateY(-2px)"; e.currentTarget.style.boxShadow="var(--shadow-md)"; }}
+                    onMouseLeave={e => { e.currentTarget.style.transform=""; e.currentTarget.style.boxShadow="var(--shadow)"; }}>
+                    <div style={{fontSize:28,marginBottom:10}}>{q.icon}</div>
+                    <div style={{fontFamily:"var(--head)",fontSize:14,fontWeight:700,color:"var(--text)"}}>{q.title}</div>
+                    <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>{q.sub}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ════ UPLOAD ════ */}
+          {activePage === "upload" && (
+            TEAM ? <AccessDenied title="Upload Data" /> :
+            <div className="panel">
+              <Upload
+                setClientData={val => {
+                  const resolved = typeof val === "function" ? val(clientsData) : val;
+                  setClientsDataRaw(resolved);
+                  persistClientsDataFull(resolved, tenantId, currentUser?.email);
+                }}
+                selectedClient={selectedClient === MASTER_KEY ? "" : selectedClient}
+                setSelectedClient={c => {
+                  if (TEAM && c !== MASTER_KEY && !hasName(visibleClients, c) && c !== "") return;
+                  setSelectedClient(c || MASTER_KEY);
+                }}
+                pricingRules={pricingRules} setPricingRules={setPricingRules}
+                clientPricing={clientPricing} setClientPricing={setClientPricing}
+                isTeam={TEAM}
+                isSuperAdmin={SA}
+                isTeamMember={TEAM}
+                allowedClients={TEAM ? visibleClients : null}
+                tenantId={tenantId}/>
+            </div>
+          )}
+
+          {/* ════ RECORDS ════ */}
+          {activePage === "records" && (
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              {!dbLoading && (
+                <div className="client-filter-bar">
+                  <span className="client-filter-label">Filter by Client:</span>
+                  <span
+                    className={`client-filter-all ${selectedClient === MASTER_KEY || !selectedClient ? "active" : ""}`}
+                    onClick={() => setSelectedClientRaw(MASTER_KEY)}>
+                    {TEAM ? "My Clients" : "All Records"}
+                    {(TEAM ? data.length > 0 : true) && (
+                      <span style={{marginLeft:6,fontSize:10,opacity:0.8,background:selectedClient===MASTER_KEY?"rgba(255,255,255,0.22)":"rgba(37,99,235,0.10)",borderRadius:99,padding:"1px 7px"}}>
+                        {TEAM
+                          ? (clientsData[MASTER_KEY]||[]).filter(r => hasName(visibleClients, getClientName(r))).length
+                          : (serverStats ? serverStats.total : (clientsData[MASTER_KEY]||[]).length)}
+                      </span>
+                    )}
+                  </span>
+                  {(TEAM ? visibleClients : (serverClientNames || allClients.map(name => ({name})))).length > 0 && (
+                    <select className="client-filter-select"
+                      value={selectedClient === MASTER_KEY ? "" : selectedClient}
+                      onChange={e => {
+                        if (!e.target.value) setSelectedClientRaw(MASTER_KEY);
+                        else setSelectedClientRaw(e.target.value);
+                      }}>
+                      <option value="">— Filter by specific client —</option>
+                      {TEAM
+                        ? visibleClients.map(c => (
+                            <option key={c} value={c}>
+                              {c}{clientsData[c] ? ` (${clientsData[c].length})` : ""}
+                            </option>
+                          ))
+                        : (serverClientNames || allClients.map(name => ({ name }))).map(({ name, count }) => (
+                            <option key={name} value={name}>
+                              {name}{Number.isFinite(count) ? ` (${count})` : ""}
+                            </option>
+                          ))
+                      }
+                    </select>
+                  )}
+                  {selectedClient && selectedClient !== MASTER_KEY && (
+                    <div className="client-active-badge">
+                      <span className="client-active-pill">
+                        📁 {selectedClient}
+                        {TEAM ? (clientsData[selectedClient] && (
+                          <span style={{fontSize:11,opacity:0.75}}> · {clientsData[selectedClient].length} records</span>
+                        )) : (() => {
+                          const found = (serverClientNames || []).find(c => c.name === selectedClient);
+                          return found ? (
+                            <span style={{fontSize:11,opacity:0.75}}> · {found.count} records</span>
+                          ) : null;
+                        })()}
+                      </span>
+                      <button className="client-clear-btn" onClick={() => setSelectedClientRaw(MASTER_KEY)}>✕ Clear</button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {TEAM && visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0 && (
+                <div className="alloc-team-notice">
+                  <span className="alloc-team-notice-icon">🔒</span>
+                  <div>
+                    <div className="alloc-team-notice-text">No client, vendor, or check type assigned to you yet</div>
+                    <div className="alloc-team-notice-sub">Contact your administrator.</div>
+                  </div>
+                </div>
+              )}
+
+              {data.length > 0 && (
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  {visibleStatusDefs.map(s => {
+                    // Server-computed counts for everyone (client-scoped when
+                    // a specific "Filter by Client" is selected, account/
+                    // allocation-wide otherwise) — never just the small page
+                    // currently loaded client-side, since `data` only holds
+                    // the current working page under server pagination now
+                    // for both Admin/SA and team members.
+                    const count = recordsPillStatusCounts
+                      ? (recordsPillStatusCounts[s.key] || 0)
+                      : data.filter(d => getRowStatusValue(d).toLowerCase().trim() === s.key.toLowerCase()).length;
+                    if (count === 0) return null;
+                    const isActive = statusFilter === s.key;
+                    return (
+                      <div key={s.key}
+                        onClick={() => setStatusFilter(f => f === s.key ? null : s.key)}
+                        style={{display:"flex",alignItems:"center",gap:8,padding:"8px 16px",borderRadius:99,background:isActive?s.color:s.bg,border:`1px solid ${s.border}`,cursor:"pointer",transition:"all 0.15s"}}>
+                        <span style={{fontSize:14}}>{s.icon}</span>
+                        <span style={{fontFamily:"var(--head)",fontSize:11,fontWeight:600,color:isActive?"#fff":s.color,textTransform:"uppercase",letterSpacing:"0.06em"}}>{s.key}</span>
+                        <span style={{fontFamily:"var(--head)",fontSize:15,fontWeight:800,color:isActive?"#fff":s.color}}>{count}</span>
+                        {isActive && <span style={{fontSize:9,background:"rgba(255,255,255,0.25)",color:"#fff",borderRadius:99,padding:"1px 6px",fontFamily:"var(--head)",fontWeight:700}}>✓</span>}
+                      </div>
+                    );
+                  })}
+                  <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 16px",borderRadius:99,background:"rgba(37,99,235,0.08)",border:"1px solid rgba(37,99,235,0.22)"}}>
+                    <span style={{fontFamily:"var(--head)",fontSize:11,fontWeight:600,color:"var(--accent)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Total</span>
+                    <span style={{fontFamily:"var(--head)",fontSize:15,fontWeight:800,color:"var(--accent)"}}>{recordsPillTotalCount ? recordsPillTotalCount : data.length}</span>
+                  </div>
+                  {statusFilter && (
+                    <button onClick={() => setStatusFilter(null)}
+                      style={{fontFamily:"var(--head)",fontSize:12,fontWeight:600,color:"var(--accent)",border:"1px solid rgba(37,99,235,0.22)",background:"transparent",borderRadius:99,padding:"8px 14px",cursor:"pointer"}}>
+                      ✕ Clear filter
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <div className="panel">
+                {/* MyTable now always mounts and fetches its own paginated
+                    working set for every role, including team members
+                    (server pagination + scopeToAllocations). Gating the
+                    mount itself on data.length > 0 for TEAM was a deadlock:
+                    data is only ever populated BY MyTable's own fetch
+                    effect now, which can never run if MyTable never mounts
+                    in the first place. MyTable already handles its own
+                    loading/empty states internally (serverLoading,
+                    pagedData.length === 0), so this can just always render. */}
+                {true ? (
+                  <MyTable
+                    data={data}
+                    rawSelectedClient={selectedClient !== MASTER_KEY ? selectedClient : null}
+                    setData={updated => {
+                      // IMPORTANT FIX:
+                      // MyTable sometimes calls setData(prev => nextRows).
+                      // Earlier App.jsx saved that function into clientsData, so Records became empty
+                      // until you clicked another menu item. Resolve functional updates here first.
+                      setData(prevRows => {
+                        const resolvedRows = typeof updated === "function" ? updated(prevRows) : updated;
+                        const safeRows = Array.isArray(resolvedRows) ? resolvedRows : (Array.isArray(prevRows) ? prevRows : []);
+
+                        setClientsDataRaw(prev => {
+                          const clientKey = selectedClient && selectedClient !== MASTER_KEY
+                            ? selectedClient : null;
+                          const next = { ...prev };
+
+                          const getStableRowKey = (row = {}) => String(
+                            row?._id || row?.id || row?.recordId ||
+                            row?.rawData?._id || row?.rawData?.id || row?.rawData?.recordId ||
+                            row?.["Check Id"] || row?.["Case ID"] || row?.["Application ID"] ||
+                            row?.["Candidate ID"] || row?.["Reference ID"] || ""
+                          ).trim();
+
+                          const mergeRowsById = (baseRows = [], updatedRows = []) => {
+                            const updatesById = new Map();
+                            updatedRows.forEach(row => {
+                              const key = getStableRowKey(row);
+                              if (key) updatesById.set(key, row);
+                            });
+                            if (updatesById.size === 0) return Array.isArray(baseRows) ? baseRows : [];
+                            return (Array.isArray(baseRows) ? baseRows : []).map(row => {
+                              const key = getStableRowKey(row);
+                              return key && updatesById.has(key) ? updatesById.get(key) : row;
+                            });
+                          };
+
+                          if (clientKey) {
+                            next[clientKey] = safeRows;
+                            // Rebuild MASTER_KEY by merging updated rows back in
+                            // so full list stays fresh without a full re-fetch
+                            next[MASTER_KEY] = mergeRowsById(prev[MASTER_KEY], safeRows);
+                          } else if (TEAM) {
+                            // Internal/team users usually see an allocated subset while MASTER_KEY is selected.
+                            // Do NOT replace MASTER_KEY with that subset; merge changed rows into the full cache
+                            // so the changed status appears instantly and does not flip back until refresh.
+                            next[MASTER_KEY] = mergeRowsById(prev[MASTER_KEY], safeRows);
+                            Object.keys(next).forEach(key => {
+                              if (key !== MASTER_KEY && Array.isArray(next[key])) {
+                                next[key] = mergeRowsById(next[key], safeRows);
+                              }
+                            });
+                          } else {
+                            // MASTER_KEY is selected for admin/superadmin — safeRows IS the full list
+                            next[MASTER_KEY] = safeRows;
+                          }
+
+                          // Debounce the expensive full-cache write (4 s).
+                          // Previously this ran synchronously on every status change,
+                          // JSON-serializing all 12k rows and freezing the UI.
+                          clearTimeout(cacheTimerRef.current);
+                          cachePendingRef.current = next;
+                          cacheTimerRef.current = setTimeout(() => {
+                            const snapshot = cachePendingRef.current;
+                            if (!snapshot) return;
+                            idbSet(instantRecordsCacheKey, snapshot);
+                            cachePendingRef.current = null;
+                          }, 4000);
+                          return next;
+                        });
+
+                        return safeRows;
+                      });
+                    }}
+                    selectedClient={selectedClient === MASTER_KEY ? (lastFileName || "All Records") : selectedClient}
+                    pricingRules={pricingRules}
+                    clientPricing={clientPricing}
+                    statusFilter={statusFilter}
+                    isTeam={TEAM}
+                    currentUser={currentUser}
+                    tenantId={tenantId}
+                    hideClientNameForVendorTeam={TEAM && visibleClients.length === 0 && visibleVendors.length > 0}/>
+                ) : (
+                  <div className="app-empty">
+                    <div className="app-empty-icon">{dbLoading ? "⏳" : "📂"}</div>
+                    <div className="app-empty-text">
+                      {dbLoading ? "Loading records…"
+                        // Checks all three allocation types together, not just
+                        // visibleClients — a team member scoped only by check
+                        // type or vendor (no client allocation at all) was
+                        // incorrectly told "no clients assigned" here even
+                        // though they do have real access, just via a
+                        // different allocation type.
+                        : TEAM && visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0
+                          ? "No access assigned to you yet"
+                        : selectedClient && selectedClient !== MASTER_KEY
+                          ? `No records found for ${selectedClient}`
+                          : "No records found"}
+                    </div>
+                    <div className="app-empty-sub">
+                      {!dbLoading && (TEAM && visibleClients.length === 0 && visibleVendors.length === 0 && visibleChecks.length === 0
+                        ? "Contact your administrator to get access assigned."
+                        : TEAM
+                          ? "Your admin has assigned access but no matching data has been uploaded yet."
+                          : "Upload an Excel file to get started")}
+                    </div>
+                    {!dbLoading && !TEAM && (
+                      <button onClick={() => setActivePage("upload")}
+                        style={{fontFamily:"var(--head)",fontSize:13,fontWeight:600,background:"var(--accentg)",color:"#fff",border:"none",borderRadius:"var(--r8)",padding:"10px 20px",cursor:"pointer",marginTop:4,boxShadow:"0 4px 14px rgba(37,99,235,0.26)"}}>
+                        Go to Upload →
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {activePage === "inbox" && (
+            <Inbox currentUser={currentUser} isTeam={TEAM} />
+          )}
+
+          {activePage === "tat" && <TAT selectedClient={selectedClient} currentUser={currentUser}/>}
+
+          {activePage === "admindata" && (
+            (ADM || MGR)
+              ? <div className="panel" style={{padding:"28px"}}>
+                  {SA && allTenantsLoading && (
+                    <div className="data-loading"><span className="data-loading-spin"/>Loading all tenant records…</div>
+                  )}
+                  <AdminDataView
+                    clientsData={SA ? allTenantsData : clientsData}
+                    currentUser={currentUser}/>
+                </div>
+              : <AccessDenied title="All Records"/>
+          )}
+
+          {activePage === "cost" && (
+            ADM
+              ? <div className="panel">
+                  <CostSummary pricingRules={pricingRules} selectedClient={selectedClient} clientPricing={clientPricing}/>
+                </div>
+              : <AccessDenied title="Cost Summary"/>
+          )}
+
+          {activePage === "totalbusiness" && (
+            SA
+              ? <div className="panel">
+                  <TotalBusiness/>
+                </div>
+              : <AccessDenied title="Total Business"/>
+          )}
+
+          {activePage === "allocations" && (
+            (ADM || MGR || TL)
+              ? <div className="panel" style={{padding:"28px"}}>
+                  <Allocations
+                    allocations={allocations}
+                    setAllocations={setAllocations}
+                    clients={allClients}
+                    checkNames={allCheckNames}
+                    currentUserEmail={currentUser.email}
+                    tenantId={tenantId}/>
+                </div>
+              : <AccessDenied title="Allocations"/>
+          )}
+
+          {activePage === "tenants" && (
+            SA
+              ? <div className="panel" style={{padding:"28px"}}><SuperAdminPanel/></div>
+              : <AccessDenied title="Tenant Management"/>
+          )}
+
+          {activePage === "vendorcontacts" && (
+            (SA || MGR)
+              ? <div className="panel" style={{padding:"28px"}}><VendorContacts/></div>
+              : <AccessDenied title="Vendor Contacts"/>
+          )}
+
+          {activePage === "dailyuploads" && (
+            (TEAM && visibleVendors.length === 0)
+              ? <AccessDenied title="Daily Upload Allocation"/>
+              : <DailyUploads isVendorTeam={TEAM && visibleVendors.length > 0} canDelete={!TEAM} />
+          )}
+
+          {activePage === "dailyclosed" && (
+            SA
+              ? <DailyClosedCases currentUser={currentUser} isTeam={TEAM} />
+              : <AccessDenied title="Daily Closed Cases"/>
+          )}
+
+          {activePage === "specialcases" && (
+            SA
+              ? <SpecialCasesView />
+              : <AccessDenied title="Special Cases"/>
+          )}
+
+          {activePage === "auditlog" && (
+            ADM
+              ? <StatusAuditLog currentUser={currentUser} tenantId={tenantId} />
+              : <AccessDenied title="Close History"/>
+          )}
+
+          {activePage === "sentreports" && (
+            ADM
+              ? <div className="panel" style={{padding:"28px"}}>
+                  <SentReports onPendingCountChange={setSentReportsPending} />
+                </div>
+              : <AccessDenied title="Sent Reports"/>
+          )}
+
+          {activePage === "clientcontacts" && (
+            ADM
+              ? <div className="panel" style={{padding:"28px"}}><ClientContacts/></div>
+              : <AccessDenied title="Client Contacts"/>
+          )}
+        </div>
+      </div>
+
+      {/* USER MANAGEMENT MODAL */}
+      {showModal && (
+        <div className="modal-overlay"
+          onClick={e => e.target.classList.contains("modal-overlay") && setShowModal(false)}>
+          <div className="modal-box">
+            <div className="modal-header">
+              <div className="modal-title">
+                <div className="modal-title-icon">👥</div>
+                User Management
+                {!SA && <span style={{fontSize:12,color:"var(--text3)",fontFamily:"var(--head)",fontWeight:400}}>— {orgName}</span>}
+                {SA  && <span style={{fontSize:11,color:"var(--text3)",fontFamily:"var(--head)",fontWeight:400}}>— All Organisations</span>}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                {pendingCount > 0 && (
+                  <span style={{fontFamily:"var(--head)",fontSize:11,fontWeight:700,background:"rgba(239,68,68,0.10)",border:"1px solid rgba(239,68,68,0.25)",color:"#b91c1c",padding:"3px 10px",borderRadius:99}}>
+                    ⏳ {pendingCount} pending
+                  </span>
+                )}
+                <button className="modal-close" onClick={() => setShowModal(false)}>✕</button>
+              </div>
+            </div>
+
+            {SA && orgTabs.length > 0 && (
+              <div className="modal-org-tabs">
+                <button className={`modal-org-tab ${modalOrgFilter === "all" ? "active" : ""}`}
+                  onClick={() => setModalOrgFilter("all")}>
+                  🌐 All Orgs <span style={{fontSize:10,opacity:0.75}}>({modalUsers.length})</span>
+                </button>
+                {orgTabs.map(t => (
+                  <button key={t.id}
+                    className={`modal-org-tab ${modalOrgFilter === t.id ? "active" : ""}`}
+                    onClick={() => setModalOrgFilter(t.id)}>
+                    🏢 {t.name}
+                    <span style={{fontSize:10,opacity:0.75}}> ({modalUsers.filter(u => u.tenantId === t.id).length})</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="modal-section-tabs">
+              <button className={`modal-section-tab ${modalSection === "admins" ? "active" : ""}`}
+                onClick={() => setModalSection("admins")}>
+                🔑 Admins <span className="modal-section-count sc-admin">{adminCount}</span>
+              </button>
+              <button className={`modal-section-tab ${modalSection === "team" ? "active" : ""}`}
+                onClick={() => setModalSection("team")}>
+                👤 Team Members
+                <span className="modal-section-count sc-team">{teamCount}</span>
+                {pendingCount > 0 && modalSection === "team" && (
+                  <span className="modal-section-count sc-pend">{pendingCount} pending</span>
+                )}
+              </button>
+            </div>
+
+            <div className="modal-status-tabs">
+              {["approved","pending","rejected"].map(s => (
+                <button key={s}
+                  className={`modal-status-tab mst-${s} ${modalStatus === s ? "active" : ""}`}
+                  onClick={() => setModalStatus(s)}>
+                  {s === "approved" ? "✅" : s === "pending" ? "⏳" : "❌"} {s.charAt(0).toUpperCase()+s.slice(1)}
+                  <span style={{marginLeft:4,fontSize:10,opacity:0.75}}>
+                    ({modalUsers.filter(u =>
+                      (u.status||"pending") === s &&
+                      (modalSection === "admins" ? u.role === "admin" : isModalTeamUser(u)) &&
+                      (modalOrgFilter === "all" || u.tenantId === modalOrgFilter)
+                    ).length})
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="modal-body">
+              {displayedUsers.length === 0 ? (
+                <div className="modal-empty">
+                  <div className="modal-empty-icon">
+                    {modalStatus === "pending" ? "🎉" : modalStatus === "approved" ? "👤" : "🚫"}
+                  </div>
+                  <div className="modal-empty-text">
+                    No {modalStatus} {modalSection === "admins" ? "admins" : "team members"}
+                    {SA && modalOrgFilter !== "all" ? ` in ${orgTabs.find(t => t.id === modalOrgFilter)?.name || modalOrgFilter}` : ""}
+                  </div>
+                </div>
+              ) : displayedUsers.map((u, i) => {
+                const t = getAllTenants();
+                const uTenant = u.tenantId ? t[u.tenantId] : null;
+                const isPrimaryAdmin = uTenant?.adminEmail?.toLowerCase() === u.email?.toLowerCase();
+                return (
+                  <div key={i} className={`user-card ${u.role === "admin" ? "user-card-admin" : ""}`}>
+                    <div className={`user-avatar ${avatarCls(u)}`}>{avatarInitial(u)}</div>
+                    <div className="user-info">
+                      <div className="user-name">{u.name || "—"}</div>
+                      <div className="user-email">{u.email}</div>
+                      <div className="user-meta">
+                        {u.registeredAt && <span className="user-meta-item">📅 {u.registeredAt}</span>}
+                        {u.role === "admin" && (
+                          <span className={isPrimaryAdmin ? "role-pill-admin" : "role-pill-secondary"}>
+                            {isPrimaryAdmin ? "🔑 Main Admin" : "🧩 Secondary Admin"}
+                          </span>
+                        )}
+                        {isModalTeamUser(u) && u.role === "manager" && <span className="role-pill-team">🧭 Manager</span>}
+                        {isModalTeamUser(u) && u.role === "tl" && <span className="role-pill-team">🎯 TL</span>}
+                        {isModalTeamUser(u) && u.role !== "manager" && u.role !== "tl" && <span className="role-pill-team">👤 Team</span>}
+                      </div>
+                      {SA && u._orgName && <span className="user-org-badge">🏢 {u._orgName}</span>}
+                      {u.role === "admin" && u.adminAccessCode && (
+                        <div className="user-access-code">🔑 Code: {u.adminAccessCode}</div>
+                      )}
+                      {isModalTeamUser(u) && u.ownerAdminEmail && (
+                        <div style={{fontSize:11,color:"var(--text3)",marginTop:3,fontFamily:"var(--head)"}}>
+                          🧩 Under: {getAllUsers().find(a => a.email === u.ownerAdminEmail)?.name || u.ownerAdminEmail}
+                        </div>
+                      )}
+                      {ADM && !SA && !u.tenantId && u.role === "team" && (
+                        <button onClick={() => assignToMyTenant(u.email)}
+                          style={{fontFamily:"var(--head)",fontSize:11,fontWeight:700,background:"rgba(37,99,235,0.10)",border:"1px solid rgba(37,99,235,0.25)",color:"var(--accent)",borderRadius:6,padding:"2px 9px",cursor:"pointer",marginTop:4}}>
+                          + Assign to {orgName}
+                        </button>
+                      )}
+                    </div>
+                    <div className="user-actions">
+                      {isModalTeamUser(u) && u.status === "approved" && u.email !== currentUser.email && (
+                        <select className="role-select" value={u.role || "team"}
+                          onChange={e => updateUser(u.email, {role: e.target.value})}>
+                          <option value="team">👤 Team</option>
+                          {/* Manager/TL: super-admin-side only, per this feature's scope —
+                              never offered for a secondary admin's own team members. */}
+                          {u.isInternal === true && <option value="manager">🧭 Manager</option>}
+                          {u.isInternal === true && <option value="tl">🎯 TL</option>}
+                          <option value="admin">🔑 Admin</option>
+                        </select>
+                      )}
+                      {u.email !== currentUser.email && (u.role === "admin" || isModalTeamUser(u)) && (
+                        <button className="ua-btn ua-reset" onClick={() => resetUserPassword(u)}>🔑 Reset Password</button>
+                      )}
+                      {u.status === "pending" && <>
+                        <button className="ua-btn ua-approve" onClick={() => updateUser(u.email, {status:"approved"})}>✓ Approve</button>
+                        <button className="ua-btn ua-reject"  onClick={() => updateUser(u.email, {status:"rejected"})}>✕ Reject</button>
+                      </>}
+                      {u.status === "approved" && u.email !== currentUser.email && (
+                        <button className="ua-btn ua-revoke" onClick={() => updateUser(u.email, {status:"pending"})}>↩ Revoke</button>
+                      )}
+                      {u.status === "rejected" && (
+                        <button className="ua-btn ua-approve" onClick={() => updateUser(u.email, {status:"approved"})}>✓ Approve</button>
+                      )}
+                    </div>
+                    <span className={`usb usb-${u.status || "pending"}`}>{u.status || "pending"}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+      {isInternalUser(currentUser) && activePage !== "inbox" && !isVendorScopedTeam && (
+        <InboxWidget currentUser={currentUser} isTeam={TEAM} unreadCount={inboxUnreadCount} />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,51 @@
+// bgv-backend/routes/vendorContactRoutes.js
+// All routes require auth + superAdminOnly. Purely additive.
+
+import express from "express";
+import multer  from "multer";
+import { protect, superAdminOnly } from "../middleware/authMiddleware.js";
+import {
+  listVendorContacts,
+  createVendorContact,
+  updateVendorContact,
+  deleteVendorContact,
+  bulkImportVendorContacts,
+  getSendLog,
+  getSettings,
+  saveSettings,
+  triggerVendorSend,
+} from "../controllers/vendorContactController.js";
+
+const router = express.Router();
+
+// In-memory multer for bulk Excel import (no disk write needed)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = file.originalname.split(".").pop().toLowerCase();
+    if (ext === "xlsx" || ext === "xls") return cb(null, true);
+    cb(new Error("Only .xlsx / .xls files are allowed"));
+  },
+});
+
+// Settings (get/set master on/off) — must be before /:id to avoid route conflict
+router.get ("/settings",     protect, superAdminOnly, getSettings);
+router.put ("/settings",     protect, superAdminOnly, saveSettings);
+
+// Send log
+router.get ("/send-log",     protect, superAdminOnly, getSendLog);
+
+// Trigger (fire-and-forget from frontend)
+router.post("/trigger-send", protect, superAdminOnly, triggerVendorSend);
+
+// Bulk Excel import
+router.post("/bulk-import",  protect, superAdminOnly, upload.single("file"), bulkImportVendorContacts);
+
+// CRUD
+router.get ("/",             protect, superAdminOnly, listVendorContacts);
+router.post("/",             protect, superAdminOnly, createVendorContact);
+router.put ("/:id",          protect, superAdminOnly, updateVendorContact);
+router.delete("/:id",        protect, superAdminOnly, deleteVendorContact);
+
+export default router;

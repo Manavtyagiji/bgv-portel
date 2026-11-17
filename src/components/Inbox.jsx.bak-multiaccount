@@ -1,0 +1,866 @@
+// src/components/Inbox.jsx
+// Stage 1 — READ-ONLY per-admin email inbox. Flat, one-by-one message list
+// (like a normal mail client) rather than grouped conversation threads —
+// each email is its own row; clicking one shows just that message. Mailbox
+// scoping is entirely server-side (see bgv-backend/controllers/inboxController.js)
+// — this component never chooses or sends a mailbox identity, it just
+// renders whatever the authenticated user's scoped mailbox returns.
+
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { saveAs } from "file-saver";
+import DOMPurify from "dompurify";
+import { inboxAPI } from "../api/api";
+
+function fmtDateTime(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleString("en-IN", {
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function fmtDay(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function senderLabel(from) {
+  if (!from) return "Unknown sender";
+  return from.name && from.name.trim() ? from.name.trim() : (from.address || "Unknown sender");
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Type-to-filter sender picker — replaces a native <select> for the compose
+// To/CC fields. A native <select>'s open dropdown is an OS-level popup that
+// ignores the parent modal's boundaries (renders outside it) and offers no
+// search; this renders its suggestion list as a normal, CSS-positioned div
+// instead, so it stays inside the modal and can be filtered by typing.
+function SenderSearchInput({ options, onPick, placeholder, excludeAddresses = [] }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    const onClickOutside = (e) => {
+      if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
+
+  const excludeSet = new Set(excludeAddresses);
+  const q = query.trim().toLowerCase();
+  const filtered = options
+    .filter(s => !excludeSet.has(s.address))
+    .filter(s => !q || senderLabel(s).toLowerCase().includes(q) || s.address.toLowerCase().includes(q))
+    .slice(0, 30);
+
+  return (
+    <div ref={containerRef} style={{ position: "relative" }}>
+      <input
+        type="text"
+        value={query}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        placeholder={placeholder}
+        style={{
+          width: "100%", fontFamily: "var(--head)", fontSize: 13, padding: "9px 12px",
+          borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+          background: "var(--card)", color: "var(--text)", boxSizing: "border-box",
+        }}
+      />
+      {open && (
+        <div style={{
+          position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 20,
+          maxHeight: 180, overflowY: "auto",
+          background: "var(--card)", border: "1.5px solid var(--border2)",
+          borderRadius: "var(--r8)", boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+        }}>
+          {filtered.length === 0 && (
+            <div style={{ padding: "10px 12px", fontSize: 12, color: "var(--text3)" }}>No matches</div>
+          )}
+          {filtered.map(s => (
+            <div
+              key={s.address}
+              onMouseDown={e => e.preventDefault()} // keep input focus so onClick still fires before blur
+              onClick={() => { onPick(s); setQuery(""); setOpen(false); }}
+              style={{ padding: "9px 12px", cursor: "pointer", fontSize: 12.5, color: "var(--text)" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "rgba(37,99,235,0.08)")}
+              onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+            >
+              {senderLabel(s)} <span style={{ color: "var(--text3)" }}>&lt;{s.address}&gt;</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function Inbox() {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [ownerEmail, setOwnerEmail] = useState("");
+  const [selectedUid, setSelectedUid] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [bodies, setBodies] = useState({}); // uid -> full message (fetched on demand)
+  const [openingUid, setOpeningUid] = useState(null);
+  const [downloadingKey, setDownloadingKey] = useState(null);
+
+  // Stage 2 — reply. sentReplies is keyed by message uid, since each email
+  // is now its own independent item rather than part of a grouped thread.
+  const [replyText, setReplyText] = useState("");
+  const [replyAttachments, setReplyAttachments] = useState([]); // File[]
+  const [sending, setSending] = useState(false);
+  const [sentReplies, setSentReplies] = useState({}); // uid -> [{to, subject, text, sentAt, attachmentNames}]
+
+  // New Mail (compose) — restricted to senders who already appear in this
+  // mailbox (enforced again server-side; this dropdown is just the UI half
+  // of that restriction, not the real enforcement).
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [composeTo, setComposeTo] = useState("");
+  const [composeCc, setComposeCc] = useState([]); // array of addresses, all from knownSenders
+  const [composeSubject, setComposeSubject] = useState("");
+  const [composeText, setComposeText] = useState("");
+  const [composeAttachments, setComposeAttachments] = useState([]);
+  const [composing, setComposing] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError("");
+    inboxAPI.listMessages(50)
+      .then(({ ownerEmail: oe, messages: msgs }) => {
+        setOwnerEmail(oe || "");
+        setMessages(Array.isArray(msgs) ? msgs : []);
+      })
+      .catch(err => setError(err.message || "Failed to load inbox"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Flat, newest-first list of every individual email — no sender grouping.
+  const sortedMessages = useMemo(() => {
+    return [...messages].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  }, [messages]);
+
+  // Search/unread filters over the flat list.
+  const visibleMessages = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    let list = sortedMessages;
+    if (unreadOnly) list = list.filter(m => m.unread);
+    if (!q) return list;
+    return list.filter(m => {
+      const name = String(m.from?.name || "").toLowerCase();
+      const addr = String(m.from?.address || "").toLowerCase();
+      const subject = String(m.subject || "").toLowerCase();
+      return name.includes(q) || addr.includes(q) || subject.includes(q);
+    });
+  }, [sortedMessages, searchQuery, unreadOnly]);
+
+  const activeMessage = messages.find(m => m.uid === selectedUid) || null;
+
+  const openMessage = (uid) => {
+    if (bodies[uid]) {
+      // Content already loaded (most likely via background prefetch, which
+      // deliberately doesn't mark anything read) — this is a genuine
+      // user-initiated open, so mark it read now if it still shows unread.
+      const m = messages.find(mm => mm.uid === uid);
+      if (m?.unread) {
+        inboxAPI.setReadState(uid, true).catch(() => {});
+        setMessages(prev => prev.map(mm => (mm.uid === uid ? { ...mm, unread: false } : mm)));
+      }
+      return;
+    }
+    setOpeningUid(uid);
+    inboxAPI.getMessage(uid)
+      .then(full => {
+        setBodies(prev => ({ ...prev, [uid]: full }));
+        setMessages(prev => prev.map(m => (m.uid === uid ? { ...m, unread: false } : m)));
+      })
+      .catch(err => setBodies(prev => ({ ...prev, [uid]: { error: err.message || "Failed to load message" } })))
+      .finally(() => setOpeningUid(null));
+  };
+
+  // Quietly load message content ahead of a click, so opening feels
+  // instant — uses peek so it never marks anything read on its own.
+  const prefetchMessage = useCallback((uid) => {
+    if (bodies[uid]) return Promise.resolve();
+    return inboxAPI.getMessage(uid, { peek: true })
+      .then(full => setBodies(prev => (prev[uid] ? prev : { ...prev, [uid]: full })))
+      .catch(() => {}); // silent — this is just a background optimization
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bodies]);
+
+  // Prefetch the first handful of messages (newest first — the ones most
+  // likely to be clicked) as soon as a fresh list loads. Sequential, not
+  // parallel, so this doesn't hammer the mail server with many simultaneous
+  // IMAP connections at once.
+  useEffect(() => {
+    if (sortedMessages.length === 0) return;
+    let cancelled = false;
+    const toPrefetch = sortedMessages.slice(0, 10).map(m => m.uid);
+    (async () => {
+      for (const uid of toPrefetch) {
+        if (cancelled) return;
+        await prefetchMessage(uid);
+      }
+    })();
+    return () => { cancelled = true; };
+    // Deliberately keyed on `loading` (fires once each time a load
+    // finishes — first load and every manual Refresh) rather than on
+    // `messages` itself, which would re-trigger this on every unrelated
+    // read-state update (each one produces a new array reference).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading]);
+
+  // Auto-open the message body as soon as it's selected, so the reading
+  // pane isn't empty on click. Also clear any draft reply left over from
+  // whatever was previously selected.
+  useEffect(() => {
+    setReplyText("");
+    setReplyAttachments([]);
+    if (selectedUid != null) openMessage(selectedUid);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUid]);
+
+  const downloadAttachment = async (uid, att) => {
+    const key = `${uid}-${att.index}`;
+    setDownloadingKey(key);
+    try {
+      const blob = await inboxAPI.fetchAttachmentBlob(uid, att.index);
+      saveAs(blob, att.filename || "attachment");
+    } catch (e) {
+      alert("Download failed: " + (e.message || "Unknown error"));
+    } finally {
+      setDownloadingKey(null);
+    }
+  };
+
+  const [togglingReadUid, setTogglingReadUid] = useState(null);
+  const toggleReadState = async (uid, currentlyUnread) => {
+    setTogglingReadUid(uid);
+    const nextRead = currentlyUnread; // if it's unread, this action marks it read, and vice versa
+    try {
+      await inboxAPI.setReadState(uid, nextRead);
+      setMessages(prev => prev.map(m => (m.uid === uid ? { ...m, unread: !nextRead } : m)));
+    } catch (e) {
+      alert("Failed to update read state: " + (e.message || "Unknown error"));
+    } finally {
+      setTogglingReadUid(null);
+    }
+  };
+
+  const sendReply = async () => {
+    if (!activeMessage || !replyText.trim()) return;
+    const fullBody = bodies[activeMessage.uid];
+    const toAddress = activeMessage.from?.address || "";
+    if (!toAddress) {
+      alert("Can't determine a reply-to address for this message.");
+      return;
+    }
+    const rawSubject = fullBody?.subject || activeMessage.subject || "";
+    const subject = /^re:/i.test(rawSubject.trim()) ? rawSubject : `Re: ${rawSubject}`;
+
+    setSending(true);
+    try {
+      const result = await inboxAPI.sendReply(activeMessage.uid, {
+        to: toAddress,
+        subject,
+        text: replyText,
+        inReplyTo: fullBody?.messageId || "",
+        attachments: replyAttachments,
+      });
+      setSentReplies(prev => ({
+        ...prev,
+        [activeMessage.uid]: [...(prev[activeMessage.uid] || []), result],
+      }));
+      setReplyText("");
+      setReplyAttachments([]);
+    } catch (e) {
+      alert("Failed to send reply: " + (e.message || "Unknown error"));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Every unique sender address currently visible in this mailbox — the
+  // only valid "To" choices for a new (non-reply) email.
+  const knownSenders = useMemo(() => {
+    const map = new Map();
+    messages.forEach(m => {
+      const addr = String(m.from?.address || "").trim().toLowerCase();
+      if (addr && !map.has(addr)) map.set(addr, m.from);
+    });
+    return Array.from(map.values()).sort((a, b) =>
+      senderLabel(a).localeCompare(senderLabel(b))
+    );
+  }, [messages]);
+
+  const openCompose = () => {
+    setComposeTo("");
+    setComposeCc([]);
+    setComposeSubject("");
+    setComposeText("");
+    setComposeAttachments([]);
+    setComposeOpen(true);
+  };
+
+  const sendCompose = async () => {
+    if (!composeTo || !composeText.trim()) return;
+    setComposing(true);
+    try {
+      await inboxAPI.compose({
+        to: composeTo,
+        cc: composeCc.filter(addr => addr !== composeTo).join(", "),
+        subject: composeSubject,
+        text: composeText,
+        attachments: composeAttachments,
+      });
+      setComposeOpen(false);
+      alert("✅ Mail sent.");
+    } catch (e) {
+      alert("Failed to send: " + (e.message || "Unknown error"));
+    } finally {
+      setComposing(false);
+    }
+  };
+
+  const totalUnread = messages.filter(m => m.unread).length;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{
+        background: "var(--card)", border: "1.5px solid var(--border2)",
+        borderRadius: "var(--r16)", padding: "20px 24px", boxShadow: "var(--shadow)",
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12,
+      }}>
+        <div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 17, fontWeight: 700, color: "var(--text)", marginBottom: 4 }}>
+            📧 Inbox {ownerEmail ? <span style={{ fontSize: 13, fontWeight: 500, color: "var(--text3)" }}>— {ownerEmail}</span> : null}
+          </div>
+          <div style={{ fontSize: 13, color: "var(--text3)" }}>
+            Read-only view of your mailbox. {totalUnread > 0 ? `${totalUnread} unread.` : "All caught up."}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={openCompose}
+            disabled={knownSenders.length === 0}
+            title={knownSenders.length === 0 ? "No known senders yet to write to" : "Compose a new email"}
+            style={{
+              fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+              padding: "8px 16px", borderRadius: "var(--r8)", border: "none",
+              background: knownSenders.length === 0 ? "rgba(37,99,235,0.35)" : "#2563eb",
+              color: "#fff", cursor: knownSenders.length === 0 ? "default" : "pointer",
+            }}
+          >
+            ✏️ New Mail
+          </button>
+          <button
+            onClick={load}
+            disabled={loading}
+            style={{
+              fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+              padding: "8px 16px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+              background: "transparent", color: "var(--text)", cursor: loading ? "default" : "pointer",
+            }}
+          >
+            {loading ? "Refreshing…" : "⟳ Refresh"}
+          </button>
+        </div>
+      </div>
+
+      {composeOpen && (
+        <div
+          onClick={() => !composing && setComposeOpen(false)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 10010,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: "var(--card)", borderRadius: "var(--r16)", padding: 22,
+              width: "min(480px, 100%)", boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+              display: "flex", flexDirection: "column", gap: 10,
+            }}
+          >
+            <div style={{ fontFamily: "var(--head)", fontSize: 15, fontWeight: 700, color: "var(--text)" }}>
+              ✏️ New Mail
+            </div>
+            <div style={{ fontSize: 11.5, color: "var(--text3)", marginTop: -6, marginBottom: 4 }}>
+              You can only send to senders already in your inbox.
+            </div>
+
+            <label style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text3)" }}>To</label>
+            {composeTo ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{
+                  flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "space-between",
+                  fontSize: 12.5, color: "var(--text)", background: "rgba(37,99,235,0.08)",
+                  border: "1px solid var(--border2)", borderRadius: "var(--r8)", padding: "9px 12px",
+                }}>
+                  {(() => { const s = knownSenders.find(k => k.address === composeTo); return s ? `${senderLabel(s)} <${s.address}>` : composeTo; })()}
+                  <span
+                    onClick={() => setComposeTo("")}
+                    style={{ cursor: "pointer", fontWeight: 700, color: "var(--text3)", marginLeft: 8 }}
+                  >
+                    ×
+                  </span>
+                </span>
+              </div>
+            ) : (
+              <SenderSearchInput
+                options={knownSenders}
+                placeholder="🔍 Search sender name or email…"
+                onPick={s => setComposeTo(s.address)}
+              />
+            )}
+
+            <label style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text3)" }}>CC (optional)</label>
+            <SenderSearchInput
+              options={knownSenders}
+              placeholder="🔍 Search sender name or email…"
+              excludeAddresses={[composeTo, ...composeCc]}
+              onPick={s => setComposeCc(prev => [...prev, s.address])}
+            />
+
+            {composeCc.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {composeCc.map(addr => {
+                  const s = knownSenders.find(k => k.address === addr);
+                  return (
+                    <span key={addr} style={{
+                      display: "inline-flex", alignItems: "center", gap: 6,
+                      fontSize: 11.5, color: "var(--text)", background: "rgba(37,99,235,0.08)",
+                      border: "1px solid var(--border2)", borderRadius: "var(--r8)", padding: "4px 8px",
+                    }}>
+                      {s ? senderLabel(s) : addr}
+                      <span
+                        onClick={() => setComposeCc(prev => prev.filter(a => a !== addr))}
+                        style={{ cursor: "pointer", fontWeight: 700, color: "var(--text3)" }}
+                      >
+                        ×
+                      </span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            <label style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text3)" }}>Subject</label>
+            <input
+              type="text"
+              value={composeSubject}
+              onChange={e => setComposeSubject(e.target.value)}
+              placeholder="Subject"
+              style={{
+                fontFamily: "var(--head)", fontSize: 13, padding: "9px 12px",
+                borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                background: "var(--card)", color: "var(--text)",
+              }}
+            />
+
+            <label style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text3)" }}>Message</label>
+            <textarea
+              value={composeText}
+              onChange={e => setComposeText(e.target.value)}
+              rows={6}
+              style={{
+                fontFamily: "var(--head)", fontSize: 13, padding: "10px 12px",
+                borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                background: "var(--card)", color: "var(--text)", resize: "vertical",
+              }}
+            />
+
+            {composeAttachments.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {composeAttachments.map((file, i) => (
+                  <span key={i} style={{
+                    display: "inline-flex", alignItems: "center", gap: 6,
+                    fontSize: 11.5, color: "var(--text)", background: "rgba(37,99,235,0.08)",
+                    border: "1px solid var(--border2)", borderRadius: "var(--r8)", padding: "4px 8px",
+                  }}>
+                    📎 {file.name} ({fmtSize(file.size)})
+                    <span
+                      onClick={() => setComposeAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                      style={{ cursor: "pointer", fontWeight: 700, color: "var(--text3)" }}
+                    >
+                      ×
+                    </span>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+              <label style={{
+                fontFamily: "var(--head)", fontSize: 12, fontWeight: 600, color: "var(--text)",
+                cursor: "pointer", padding: "6px 12px", borderRadius: "var(--r8)",
+                border: "1.5px solid var(--border2)",
+              }}>
+                📎 Attach files
+                <input
+                  type="file"
+                  multiple
+                  onChange={e => {
+                    const picked = Array.from(e.target.files || []);
+                    setComposeAttachments(prev => [...prev, ...picked].slice(0, 5));
+                    e.target.value = "";
+                  }}
+                  style={{ display: "none" }}
+                />
+              </label>
+
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => setComposeOpen(false)}
+                  disabled={composing}
+                  style={{
+                    fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 600,
+                    padding: "8px 16px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                    background: "transparent", color: "var(--text)", cursor: composing ? "default" : "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={sendCompose}
+                  disabled={composing || !composeTo || !composeText.trim()}
+                  style={{
+                    fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 600,
+                    padding: "8px 18px", borderRadius: "var(--r8)", border: "none",
+                    background: (composing || !composeTo || !composeText.trim()) ? "rgba(37,99,235,0.35)" : "#2563eb",
+                    color: "#fff", cursor: (composing || !composeTo || !composeText.trim()) ? "default" : "pointer",
+                  }}
+                >
+                  {composing ? "Sending…" : "Send"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{
+          background: "rgba(239,68,68,0.08)", border: "1.5px solid rgba(239,68,68,0.25)",
+          borderRadius: "var(--r16)", padding: "16px 20px", color: "#b91c1c", fontSize: 13,
+        }}>
+          {error}
+        </div>
+      )}
+
+      {loading && messages.length === 0 && !error && (
+        <div style={{
+          background: "var(--card)", border: "1.5px dashed var(--border2)",
+          borderRadius: "var(--r16)", padding: "48px 24px", textAlign: "center", boxShadow: "var(--shadow)",
+        }}>
+          <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text3)" }}>Loading…</div>
+        </div>
+      )}
+
+      {!loading && !error && messages.length === 0 && (
+        <div style={{
+          background: "var(--card)", border: "1.5px dashed var(--border2)",
+          borderRadius: "var(--r16)", padding: "48px 24px", textAlign: "center", boxShadow: "var(--shadow)",
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.22 }}>📭</div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text3)" }}>No messages found</div>
+        </div>
+      )}
+
+      {messages.length > 0 && (
+        <div style={{
+          display: "grid", gridTemplateColumns: "320px 1fr", gap: 20, minHeight: 480,
+        }}>
+          {/* Flat message list */}
+          <div style={{
+            background: "var(--card)", border: "1.5px solid var(--border2)",
+            borderRadius: "var(--r16)", boxShadow: "var(--shadow)", overflow: "hidden",
+            display: "flex", flexDirection: "column", maxHeight: 640,
+          }}>
+            <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border2)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="🔍 Search sender or subject…"
+                style={{
+                  width: "100%", fontFamily: "var(--head)", fontSize: 12.5,
+                  padding: "8px 12px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                  background: "var(--card)", color: "var(--text)", boxSizing: "border-box",
+                }}
+              />
+              <button
+                onClick={() => setUnreadOnly(v => !v)}
+                style={{
+                  alignSelf: "flex-start", fontFamily: "var(--head)", fontSize: 11.5, fontWeight: 600,
+                  padding: "5px 12px", borderRadius: 999, cursor: "pointer",
+                  border: unreadOnly ? "1.5px solid #2563eb" : "1.5px solid var(--border2)",
+                  background: unreadOnly ? "rgba(37,99,235,0.12)" : "transparent",
+                  color: unreadOnly ? "#2563eb" : "var(--text)",
+                }}
+              >
+                {unreadOnly ? "✓ " : ""}Unread only{totalUnread > 0 ? ` (${totalUnread})` : ""}
+              </button>
+            </div>
+            <div style={{ overflowY: "auto" }}>
+              {visibleMessages.length === 0 && (
+                <div style={{ padding: "20px 18px", fontSize: 12.5, color: "var(--text3)", textAlign: "center" }}>
+                  {unreadOnly ? "No unread messages" : `No messages match "${searchQuery}"`}
+                </div>
+              )}
+              {visibleMessages.map(m => {
+                const active = m.uid === selectedUid;
+                return (
+                  <div
+                    key={m.uid}
+                    onClick={() => setSelectedUid(m.uid)}
+                    style={{
+                      padding: "14px 18px", cursor: "pointer",
+                      borderBottom: "1px solid var(--border2)",
+                      background: active ? "rgba(37,99,235,0.08)" : "transparent",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{
+                        fontFamily: "var(--head)", fontSize: 13.5, fontWeight: m.unread ? 800 : 700, color: "var(--text)",
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        {m.unread && <span style={{ color: "#2563eb", marginRight: 6 }}>●</span>}
+                        {senderLabel(m.from)}
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text3)", flexShrink: 0, whiteSpace: "nowrap" }}>
+                        {fmtDay(m.date)}
+                      </div>
+                    </div>
+                    <div style={{
+                      fontSize: 12.5, color: "var(--text3)", marginTop: 3,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      fontWeight: m.unread ? 600 : 400,
+                    }}>
+                      {m.subject}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Single-message reading pane */}
+          <div style={{
+            background: "var(--card)", border: "1.5px solid var(--border2)",
+            borderRadius: "var(--r16)", boxShadow: "var(--shadow)", overflow: "hidden",
+            display: "flex", flexDirection: "column", maxHeight: 640,
+          }}>
+            {!activeMessage && (
+              <div style={{
+                flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+                color: "var(--text3)", fontSize: 14, fontFamily: "var(--head)",
+              }}>
+                Select an email to read it
+              </div>
+            )}
+
+            {activeMessage && (() => {
+              const full = bodies[activeMessage.uid];
+              const isOpening = openingUid === activeMessage.uid;
+              return (
+                <div style={{ overflowY: "auto", padding: "20px 24px", display: "flex", flexDirection: "column", gap: 16, flex: 1 }}>
+                  <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 6 }}>
+                      <div style={{ fontFamily: "var(--head)", fontSize: 16, fontWeight: 700, color: "var(--text)" }}>
+                        {activeMessage.subject}
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+                        <button
+                          onClick={() => toggleReadState(activeMessage.uid, activeMessage.unread)}
+                          disabled={togglingReadUid === activeMessage.uid}
+                          style={{
+                            fontFamily: "var(--head)", fontSize: 11, fontWeight: 600,
+                            padding: "3px 10px", borderRadius: "var(--r8)",
+                            border: "1.5px solid var(--border2)", background: "transparent",
+                            color: "var(--text3)", cursor: togglingReadUid === activeMessage.uid ? "default" : "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {togglingReadUid === activeMessage.uid ? "…" : activeMessage.unread ? "Mark read" : "Mark unread"}
+                        </button>
+                        <div style={{ fontSize: 11.5, color: "var(--text3)", whiteSpace: "nowrap" }}>
+                          {fmtDateTime(activeMessage.date)}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 12.5, color: "var(--text3)", marginBottom: 14 }}>
+                      From <strong style={{ color: "var(--text)" }}>{senderLabel(activeMessage.from)}</strong>
+                      {activeMessage.from?.address ? ` <${activeMessage.from.address}>` : ""}
+                    </div>
+
+                    {isOpening && (
+                      <div style={{ fontSize: 12.5, color: "var(--text3)" }}>Loading…</div>
+                    )}
+
+                    {full && full.error && (
+                      <div style={{ fontSize: 12.5, color: "#b91c1c" }}>{full.error}</div>
+                    )}
+
+                    {full && !full.error && (
+                      <div>
+                        {full.html
+                          ? <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6 }}
+                              // Email HTML is untrusted content — sanitize before
+                              // rendering (strips <script>, event handlers, etc.).
+                              dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(full.html) }} />
+                          : <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                              {full.text}
+                            </div>
+                        }
+
+                        {full.attachments && full.attachments.length > 0 && (
+                          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                            {full.attachments.map(att => {
+                              const key = `${activeMessage.uid}-${att.index}`;
+                              return (
+                                <button
+                                  key={key}
+                                  onClick={() => downloadAttachment(activeMessage.uid, att)}
+                                  disabled={downloadingKey === key}
+                                  style={{
+                                    fontFamily: "var(--head)", fontSize: 12, fontWeight: 600,
+                                    padding: "6px 12px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                                    background: "transparent", color: "var(--text)",
+                                    cursor: downloadingKey === key ? "default" : "pointer",
+                                    textAlign: "left", width: "fit-content",
+                                  }}
+                                >
+                                  {downloadingKey === key ? "Downloading…" : `📎 ${att.filename} (${fmtSize(att.size)})`}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {(sentReplies[activeMessage.uid] || []).map((r, i) => (
+                    <div key={`sent-${i}`} style={{
+                      background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.25)",
+                      borderRadius: "var(--r16)", padding: "14px 18px", marginLeft: 32,
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 6 }}>
+                        <div style={{ fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 700, color: "#059669" }}>
+                          You replied
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--text3)", whiteSpace: "nowrap" }}>
+                          {fmtDateTime(r.sentAt)}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 13.5, color: "var(--text)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                        {r.text}
+                      </div>
+                      {r.attachmentNames && r.attachmentNames.length > 0 && (
+                        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                          {r.attachmentNames.map((name, ai) => (
+                            <div key={ai} style={{ fontSize: 11.5, color: "#059669" }}>📎 {name}</div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
+            {activeMessage && (
+              <div style={{
+                borderTop: "1px solid var(--border2)", padding: "14px 18px",
+                display: "flex", flexDirection: "column", gap: 8, flexShrink: 0,
+              }}>
+                <textarea
+                  value={replyText}
+                  onChange={e => setReplyText(e.target.value)}
+                  placeholder={`Reply to ${senderLabel(activeMessage.from)}…`}
+                  rows={3}
+                  style={{
+                    fontFamily: "var(--head)", fontSize: 13, padding: "10px 12px",
+                    borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+                    background: "var(--card)", color: "var(--text)", resize: "vertical",
+                  }}
+                />
+
+                {replyAttachments.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {replyAttachments.map((file, i) => (
+                      <span key={i} style={{
+                        display: "inline-flex", alignItems: "center", gap: 6,
+                        fontSize: 11.5, color: "var(--text)", background: "rgba(37,99,235,0.08)",
+                        border: "1px solid var(--border2)", borderRadius: "var(--r8)", padding: "4px 8px",
+                      }}>
+                        📎 {file.name} ({fmtSize(file.size)})
+                        <span
+                          onClick={() => setReplyAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                          style={{ cursor: "pointer", fontWeight: 700, color: "var(--text3)" }}
+                        >
+                          ×
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <label style={{
+                    fontFamily: "var(--head)", fontSize: 12, fontWeight: 600, color: "var(--text)",
+                    cursor: "pointer", padding: "6px 12px", borderRadius: "var(--r8)",
+                    border: "1.5px solid var(--border2)",
+                  }}>
+                    📎 Attach files
+                    <input
+                      type="file"
+                      multiple
+                      onChange={e => {
+                        const picked = Array.from(e.target.files || []);
+                        setReplyAttachments(prev => [...prev, ...picked].slice(0, 5));
+                        e.target.value = "";
+                      }}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+
+                  <button
+                    onClick={sendReply}
+                    disabled={sending || !replyText.trim()}
+                    style={{
+                      fontFamily: "var(--head)", fontSize: 12.5, fontWeight: 600,
+                      padding: "8px 18px", borderRadius: "var(--r8)", border: "none",
+                      background: sending || !replyText.trim() ? "rgba(37,99,235,0.35)" : "#2563eb",
+                      color: "#fff", cursor: sending || !replyText.trim() ? "default" : "pointer",
+                    }}
+                  >
+                    {sending ? "Sending…" : "Send Reply"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

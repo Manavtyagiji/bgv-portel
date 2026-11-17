@@ -1,0 +1,619 @@
+// bgv-backend/controllers/inboxController.js
+//
+// Stage 1 — READ-ONLY, per-admin email inbox. Purely additive.
+//
+// - Does NOT touch how mail is SENT. uploadController.js's getMailOwnerEmail
+//   (used for SMTP sending today) is untouched; this file has its own
+//   separate resolver (getInboxOwnerEmail) for reading mail.
+// - No new storage: every request opens a short-lived IMAP connection to the
+//   mailbox owner's account, fetches only what's needed for that request,
+//   and closes. Nothing is written to MongoDB or disk. Message bodies are
+//   fetched on demand only when a specific message is opened; attachments
+//   are streamed straight through to the response, never saved server-side.
+// - Reuses the SAME MailConfig credentials (and IMAP host derivation) that
+//   utils/saveToSentFolder.js already uses in production for the Sent-copy
+//   feature.
+
+import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
+import nodemailer from "nodemailer";
+import MailConfig from "../models/MailConfig.js";
+import PortalState from "../models/PortalState.js";
+import { saveToSentFolder } from "../utils/saveToSentFolder.js";
+
+const SUPER_ADMIN_EMAIL = "superadmin@tervies.com";
+
+// Resolves which mailbox the current user should read. Correctly implements
+// the "internal staff" fallback used elsewhere in this codebase (e.g.
+// buildAllocationScopeFilter in uploadController.js): a team member with no
+// tenantId AND no ownerAdminEmail is internal staff and reads the super
+// admin's mailbox — not their own personal email. This differs from
+// uploadController.js's getMailOwnerEmail (which lacks that fallback for
+// sending) — deliberately kept separate rather than changed, per the
+// instruction not to alter existing send behavior.
+function getInboxOwnerEmail(user) {
+  const role = String(user?.role || "").toLowerCase();
+
+  if (role === "superadmin") {
+    return String(user?.email || "").toLowerCase().trim();
+  }
+
+  if (role === "admin") {
+    return String(user?.email || "").toLowerCase().trim();
+  }
+
+  // Manager/TL are super admin's own internal-staff roles, not separate
+  // tenants with their own mailbox — they always read the super admin's
+  // mailbox, same as internal "team" members below.
+  if (role === "manager" || role === "tl") {
+    return SUPER_ADMIN_EMAIL;
+  }
+
+  if (role === "team") {
+    const tenantId = user?.tenantId || null;
+    const ownerAdminEmail = user?.ownerAdminEmail
+      ? String(user.ownerAdminEmail).trim().toLowerCase()
+      : null;
+    const isInternal = user?.isInternal === true || (!tenantId && !ownerAdminEmail);
+    if (isInternal) return SUPER_ADMIN_EMAIL;
+    return String(ownerAdminEmail || user?.adminEmail || user?.email || "")
+      .toLowerCase()
+      .trim();
+  }
+
+  return String(user?.email || "").toLowerCase().trim();
+}
+
+// Exact copy of the host-derivation logic already proven in
+// saveToSentFolder.js — kept duplicated (not imported) so this file has no
+// dependency on the sending code path at all.
+function deriveImapHost(smtpHost) {
+  if (!smtpHost) return "imap.hostinger.com";
+  if (smtpHost.startsWith("smtp.")) return "imap." + smtpHost.slice(5);
+  if (smtpHost.includes("hostinger")) return "imap.hostinger.com";
+  if (smtpHost.includes("gmail")) return "imap.gmail.com";
+  if (smtpHost.includes("outlook") || smtpHost.includes("office365")) return "imap.outlook.com";
+  return "imap.hostinger.com";
+}
+
+// Flattens a MailConfig doc into its usable accounts: the top-level fields
+// as "primary", plus each entry in accounts[] that has credentials and
+// isn't deactivated. Shared by getMailboxAccount and listInboxAccounts below
+// so the two can never disagree on what's selectable.
+function flattenMailAccounts(configDoc) {
+  const list = [];
+  if (configDoc?.smtpUser && configDoc?.smtpPass) {
+    list.push({
+      id: "primary",
+      label: configDoc.fromName || configDoc.smtpUser,
+      email: configDoc.smtpUser,
+      smtpHost: configDoc.smtpHost,
+      smtpPort: configDoc.smtpPort,
+      smtpSecure: configDoc.smtpSecure,
+      smtpUser: configDoc.smtpUser,
+      smtpPass: configDoc.smtpPass,
+      fromName: configDoc.fromName,
+    });
+  }
+  (configDoc?.accounts || []).forEach((a) => {
+    if (a?.smtpUser && a?.smtpPass && a.isActive !== false) {
+      list.push({
+        id: String(a._id),
+        label: a.label || a.fromName || a.smtpUser,
+        email: a.smtpUser,
+        smtpHost: a.smtpHost,
+        smtpPort: a.smtpPort,
+        smtpSecure: a.smtpSecure,
+        smtpUser: a.smtpUser,
+        smtpPass: a.smtpPass,
+        fromName: a.fromName,
+      });
+    }
+  });
+  return list;
+}
+
+// GET /api/inbox/accounts — the switchable mail accounts for the current
+// user. Super Admin and Manager can switch between any account configured
+// on Super Admin's own MailConfig (there's only ever one pool — Super
+// Admin's own). Everyone else gets an empty list (no switcher shown), since
+// TL/Team either use the default mailbox or a mailbox specifically
+// allocated to them (see getMailboxAccount below) — matches the request
+// that only Super Admin and Manager can pick which mailbox to use.
+export async function listInboxAccounts(req, res) {
+  try {
+    const role = String(req.user?.role || "").toLowerCase();
+    if (role !== "superadmin" && role !== "manager") {
+      return res.json([]);
+    }
+    const ownerEmail = getInboxOwnerEmail(req.user);
+    if (!ownerEmail) return res.json([]);
+    const configDoc = await MailConfig.findOne({ ownerEmail }).lean();
+    if (!configDoc) return res.json([]);
+    const accounts = flattenMailAccounts(configDoc).map(({ id, label, email }) => ({ id, label, email }));
+    return res.json(accounts);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// Looks up the mailbox the current request should use. The OWNER is always
+// resolved server-side from req.user (getInboxOwnerEmail, unchanged) — never
+// client-supplied, so cross-organization mailbox access is still not
+// possible. What CAN now be client-influenced is WHICH of that owner's own
+// configured accounts gets used:
+//   - Team/TL: whichever account Super Admin/Manager has allocated to them
+//     (mailboxAllocations portal-state key, keyed by their email) — falls
+//     back to the primary account if nothing's been allocated, i.e. exactly
+//     the original single-mailbox behavior for anyone never allocated one.
+//   - Super Admin/Manager: the account named by ?accountId=, if any and if
+//     it actually belongs to this owner's account list; otherwise primary —
+//     same original default behavior for anyone who's never switched.
+async function getMailboxAccount(req) {
+  const ownerEmail = getInboxOwnerEmail(req.user);
+  if (!ownerEmail) return null;
+
+  const configDoc = await MailConfig.findOne({ ownerEmail }).lean();
+  if (!configDoc) return null;
+
+  const accounts = flattenMailAccounts(configDoc);
+  if (!accounts.length) return null;
+
+  const role = String(req.user?.role || "").toLowerCase();
+  const userEmail = String(req.user?.email || "").toLowerCase().trim();
+
+  let chosenId = null;
+  if (role === "team" || role === "tl") {
+    const allocDoc = await PortalState.findOne({ key: "mailboxAllocations" }).lean();
+    const alloc = allocDoc?.value || {};
+    chosenId = alloc[userEmail] || null;
+  } else if (role === "superadmin" || role === "manager") {
+    const requested = req.query?.accountId ? String(req.query.accountId) : null;
+    if (requested && accounts.some((a) => a.id === requested)) chosenId = requested;
+  }
+
+  const chosen = (chosenId && accounts.find((a) => a.id === chosenId)) || accounts[0];
+
+  return {
+    ownerEmail,
+    smtpHost: chosen.smtpHost,
+    smtpPort: chosen.smtpPort,
+    smtpSecure: chosen.smtpSecure,
+    smtpUser: chosen.smtpUser,
+    smtpPass: chosen.smtpPass,
+    fromName: chosen.fromName,
+  };
+}
+
+async function withImapClient(account, fn) {
+  const client = new ImapFlow({
+    host: deriveImapHost(account.smtpHost),
+    port: 993,
+    secure: true,
+    auth: { user: account.smtpUser, pass: account.smtpPass },
+    logger: false,
+  });
+
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.logout().catch(() => {});
+  }
+}
+
+async function findInboxFolder(client) {
+  try {
+    const boxes = await client.list("*");
+    const byFlag = boxes.find((m) => m.specialUse === "\\Inbox" || m.specialUse === "\\All");
+    if (byFlag) return byFlag.path;
+    const found = boxes.find((m) => m.path.toUpperCase() === "INBOX");
+    if (found) return found.path;
+    return "INBOX";
+  } catch {
+    return "INBOX";
+  }
+}
+
+// GET /api/inbox/messages?limit=50
+// Returns envelope-only metadata (from/subject/date/read-flag) for the most
+// recent messages — no bodies downloaded, so this stays fast and light
+// regardless of mailbox size.
+export async function listMessages(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query?.limit) || 50, 1), 200);
+
+    const messages = await withImapClient(account, async (client) => {
+      const path = await findInboxFolder(client);
+      const lock = await client.getMailboxLock(path);
+      try {
+        const total = client.mailbox.exists || 0;
+        if (total === 0) return [];
+
+        const start = Math.max(1, total - limit + 1);
+        const range = `${start}:${total}`;
+
+        const out = [];
+        for await (const msg of client.fetch(range, { envelope: true, flags: true, uid: true, size: true })) {
+          out.push({
+            uid: msg.uid,
+            subject: msg.envelope?.subject || "(no subject)",
+            from: (msg.envelope?.from || [])[0] || null,
+            to: msg.envelope?.to || [],
+            date: msg.envelope?.date || null,
+            messageId: msg.envelope?.messageId || "",
+            inReplyTo: msg.envelope?.inReplyTo || "",
+            unread: !(msg.flags && msg.flags.has("\\Seen")),
+            size: msg.size || 0,
+          });
+        }
+
+        out.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+        return out;
+      } finally {
+        lock.release();
+      }
+    });
+
+    return res.json({ ownerEmail: account.ownerEmail, messages });
+  } catch (err) {
+    console.error("listMessages error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// GET /api/inbox/messages/:uid?peek=true
+// Fetches and parses ONE full message on demand — not cached anywhere.
+// Marks it \Seen now that it's actually been opened, UNLESS ?peek=true —
+// used by the frontend's background prefetch (loading likely-to-be-clicked
+// message content ahead of time so opening feels instant) so that silently
+// pre-loading a message never marks it read on the user's behalf.
+export async function getMessage(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const uid = Number(req.params.uid);
+    if (!Number.isFinite(uid) || uid <= 0) {
+      return res.status(400).json({ error: "Valid uid required" });
+    }
+
+    const peek = req.query?.peek === "true";
+
+    const result = await withImapClient(account, async (client) => {
+      const path = await findInboxFolder(client);
+      const lock = await client.getMailboxLock(path);
+      try {
+        const { content } = await client.download(uid, undefined, { uid: true });
+        if (!content) return null;
+
+        const chunks = [];
+        for await (const chunk of content) chunks.push(chunk);
+        const raw = Buffer.concat(chunks);
+
+        const parsed = await simpleParser(raw);
+
+        if (!peek) {
+          await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true }).catch(() => {});
+        }
+
+        return {
+          uid,
+          subject: parsed.subject || "(no subject)",
+          from: parsed.from?.value || [],
+          to: parsed.to?.value || [],
+          date: parsed.date || null,
+          messageId: parsed.messageId || "",
+          text: parsed.text || "",
+          html: parsed.html || "",
+          attachments: (parsed.attachments || []).map((a, i) => ({
+            index: i,
+            filename: a.filename || `attachment-${i + 1}`,
+            contentType: a.contentType || "application/octet-stream",
+            size: a.size || 0,
+          })),
+        };
+      } finally {
+        lock.release();
+      }
+    });
+
+    if (!result) return res.status(404).json({ error: "Message not found" });
+    return res.json(result);
+  } catch (err) {
+    console.error("getMessage error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// GET /api/inbox/messages/:uid/attachments/:index
+// Streams one attachment straight through to the response. Never written to
+// disk or MongoDB — the whole message is re-fetched from IMAP and only the
+// requested attachment's bytes are sent back.
+export async function getAttachment(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const uid = Number(req.params.uid);
+    const index = Number(req.params.index);
+    if (!Number.isFinite(uid) || uid <= 0 || !Number.isFinite(index) || index < 0) {
+      return res.status(400).json({ error: "Valid uid and attachment index required" });
+    }
+
+    await withImapClient(account, async (client) => {
+      const path = await findInboxFolder(client);
+      const lock = await client.getMailboxLock(path);
+      try {
+        const { content } = await client.download(uid, undefined, { uid: true });
+        if (!content) {
+          res.status(404).json({ error: "Message not found" });
+          return;
+        }
+
+        const chunks = [];
+        for await (const chunk of content) chunks.push(chunk);
+        const raw = Buffer.concat(chunks);
+
+        const parsed = await simpleParser(raw);
+        const att = (parsed.attachments || [])[index];
+        if (!att) {
+          res.status(404).json({ error: "Attachment not found" });
+          return;
+        }
+
+        res.setHeader("Content-Type", att.contentType || "application/octet-stream");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${(att.filename || "attachment").replace(/"/g, "")}"`
+        );
+        res.send(att.content);
+      } finally {
+        lock.release();
+      }
+    });
+  } catch (err) {
+    console.error("getAttachment error:", err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+}
+
+// POST /api/inbox/messages/:uid/reply
+// Stage 2 — sends a reply from the SAME mailbox the user is scoped to for
+// reading (getInboxOwnerEmail/getMailboxAccount, above), using the exact
+// same transporter-construction pattern already proven in
+// uploadController.js's getTransporterForUser. Deliberately uses the
+// corrected internal-staff-aware resolver rather than uploadController.js's
+// getMailOwnerEmail, so an internal team member always replies from the
+// same mailbox they're reading (see conversation/decision on this — the
+// alternative would let read and reply resolve to two different mailboxes
+// for that one edge case). uploadController.js's own send path is untouched.
+export async function replyToMessage(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const { to, cc, subject, text, inReplyTo } = req.body || {};
+    if (!to || !String(to).trim()) {
+      return res.status(400).json({ error: "Recipient (to) is required" });
+    }
+    if (!text || !String(text).trim()) {
+      return res.status(400).json({ error: "Message body is required" });
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: account.smtpHost || "smtp.hostinger.com",
+      port: Number(account.smtpPort || 465),
+      secure: account.smtpSecure !== false,
+      auth: { user: account.smtpUser, pass: account.smtpPass },
+    });
+
+    // Uploaded via multer memoryStorage (see inboxRoutes.js) — buffers only,
+    // never written to disk. Passed straight through to nodemailer.
+    const attachments = (req.files || []).map((f) => ({
+      filename: f.originalname,
+      content: f.buffer,
+      contentType: f.mimetype,
+    }));
+
+    const mailOptions = {
+      from: account.fromName ? `"${account.fromName}" <${account.smtpUser}>` : account.smtpUser,
+      to: String(to).trim(),
+      cc: cc && String(cc).trim() ? String(cc).trim() : undefined,
+      subject: subject && String(subject).trim() ? String(subject).trim() : "(no subject)",
+      text: String(text),
+      inReplyTo: inReplyTo || undefined,
+      references: inReplyTo || undefined,
+      attachments: attachments.length > 0 ? attachments : undefined,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+
+    // Best-effort Sent-folder copy, via the same helper already used
+    // elsewhere in production — fire-and-forget, never blocks or fails the
+    // reply itself if it errors.
+    saveToSentFolder(
+      { smtpHost: account.smtpHost, smtpUser: account.smtpUser, smtpPass: account.smtpPass },
+      mailOptions
+    ).catch(() => {});
+
+    return res.json({
+      ok: true,
+      messageId: info.messageId || "",
+      sentAt: new Date().toISOString(),
+      from: account.smtpUser,
+      to: mailOptions.to,
+      subject: mailOptions.subject,
+      text: mailOptions.text,
+      attachmentNames: attachments.map((a) => a.filename),
+    });
+  } catch (err) {
+    console.error("replyToMessage error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// POST /api/inbox/compose  { to, cc, subject, text } (+ attachments, same
+// multer field as reply)
+// A fresh, non-reply email — restricted to recipients who already appear as
+// a sender somewhere in this mailbox's recent messages. That restriction is
+// enforced HERE, not just in the frontend's dropdown, since a direct API
+// call could otherwise bypass a client-side-only check.
+export async function composeMessage(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const { to, cc, subject, text } = req.body || {};
+    if (!to || !String(to).trim()) {
+      return res.status(400).json({ error: "Recipient (to) is required" });
+    }
+    if (!text || !String(text).trim()) {
+      return res.status(400).json({ error: "Message body is required" });
+    }
+
+    const targetTo = String(to).trim().toLowerCase();
+
+    // Super admin and their own internal staff (manager/tl/internal team —
+    // same audience getInboxOwnerEmail already maps to the super admin
+    // mailbox) can email anyone, not just known senders. Secondary admin and
+    // their team are unaffected — the known-senders restriction below still
+    // applies to them exactly as before.
+    const isSuperScope = getInboxOwnerEmail(req.user) === SUPER_ADMIN_EMAIL;
+
+    if (!isSuperScope) {
+      const knownSenders = await withImapClient(account, async (client) => {
+        const path = await findInboxFolder(client);
+        const lock = await client.getMailboxLock(path);
+        try {
+          const total = client.mailbox.exists || 0;
+          if (total === 0) return new Set();
+          const start = Math.max(1, total - 500 + 1);
+          const range = `${start}:${total}`;
+          const set = new Set();
+          for await (const msg of client.fetch(range, { envelope: true })) {
+            const addr = (msg.envelope?.from || [])[0]?.address;
+            if (addr) set.add(String(addr).trim().toLowerCase());
+          }
+          return set;
+        } finally {
+          lock.release();
+        }
+      });
+
+      if (!knownSenders.has(targetTo)) {
+        return res.status(403).json({
+          error: "You can only send new mail to a sender who already appears in your inbox.",
+        });
+      }
+
+      // Same restriction applies to every CC address, not just "to".
+      const ccList = String(cc || "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      const unknownCc = ccList.filter((addr) => !knownSenders.has(addr));
+      if (unknownCc.length > 0) {
+        return res.status(403).json({
+          error: `CC can only include senders already in your inbox. Not recognized: ${unknownCc.join(", ")}`,
+        });
+      }
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: account.smtpHost || "smtp.hostinger.com",
+      port: Number(account.smtpPort || 465),
+      secure: account.smtpSecure !== false,
+      auth: { user: account.smtpUser, pass: account.smtpPass },
+    });
+
+    const attachments = (req.files || []).map((f) => ({
+      filename: f.originalname,
+      content: f.buffer,
+      contentType: f.mimetype,
+    }));
+
+    const mailOptions = {
+      from: account.fromName ? `"${account.fromName}" <${account.smtpUser}>` : account.smtpUser,
+      to: String(to).trim(),
+      cc: cc && String(cc).trim() ? String(cc).trim() : undefined,
+      subject: subject && String(subject).trim() ? String(subject).trim() : "(no subject)",
+      text: String(text),
+      attachments: attachments.length > 0 ? attachments : undefined,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+
+    saveToSentFolder(
+      { smtpHost: account.smtpHost, smtpUser: account.smtpUser, smtpPass: account.smtpPass },
+      mailOptions
+    ).catch(() => {});
+
+    return res.json({
+      ok: true,
+      messageId: info.messageId || "",
+      sentAt: new Date().toISOString(),
+      from: account.smtpUser,
+      to: mailOptions.to,
+      subject: mailOptions.subject,
+      text: mailOptions.text,
+      attachmentNames: attachments.map((a) => a.filename),
+    });
+  } catch (err) {
+    console.error("composeMessage error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// POST /api/inbox/messages/:uid/read  { read: true|false }
+// Manual read/unread control — separate from the automatic \Seen flag set
+// by getMessage when a message is actually opened. Lets the user mark
+// something back to unread (e.g. "I still need to act on this") or mark an
+// unopened message as read, on demand.
+export async function setMessageReadState(req, res) {
+  try {
+    const account = await getMailboxAccount(req);
+    if (!account) {
+      return res.status(404).json({ error: "No mailbox configured for your account yet." });
+    }
+
+    const uid = Number(req.params.uid);
+    if (!Number.isFinite(uid) || uid <= 0) {
+      return res.status(400).json({ error: "Valid uid required" });
+    }
+
+    const read = req.body?.read !== false; // default true
+
+    await withImapClient(account, async (client) => {
+      const path = await findInboxFolder(client);
+      const lock = await client.getMailboxLock(path);
+      try {
+        if (read) {
+          await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true });
+        } else {
+          await client.messageFlagsRemove(uid, ["\\Seen"], { uid: true });
+        }
+      } finally {
+        lock.release();
+      }
+    });
+
+    return res.json({ ok: true, uid, read });
+  } catch (err) {
+    console.error("setMessageReadState error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}

@@ -1,0 +1,255 @@
+// src/components/DailyFollowUp.jsx
+// Super Admin's internal team only (Super Admin, Manager, TL, internal
+// Team). Super Admin/Manager see every team member's entries, filterable
+// by person; TL/Team only ever see and manage their own — enforced
+// server-side in dailyFollowUpController.js, not just hidden here.
+import { useState, useEffect, useCallback } from "react";
+import { dailyFollowUpAPI } from "../api/api";
+
+function fmtDate(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function toInputDate(d) {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toISOString().slice(0, 10);
+}
+
+const STATUS_OPTIONS = ["Pending", "In Progress", "Contacted", "Completed", "Escalated"];
+
+const thStyle = {
+  textAlign: "left", padding: "10px 12px", fontFamily: "var(--head)", fontSize: 11,
+  fontWeight: 700, color: "var(--text3)", textTransform: "uppercase", whiteSpace: "nowrap",
+};
+const tdStyle = { padding: "10px 12px", color: "var(--text)", verticalAlign: "top" };
+const inputStyle = {
+  padding: "8px 10px", borderRadius: "var(--r8)", border: "1.5px solid var(--border2)",
+  background: "var(--card)", color: "var(--text)", fontFamily: "var(--body)", fontSize: 13,
+};
+const labelStyle = { display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: "var(--text3)" };
+const btnPrimary = {
+  fontFamily: "var(--head)", fontSize: 12, fontWeight: 600, padding: "8px 16px",
+  borderRadius: "var(--r8)", border: "none", background: "#2563eb", color: "#fff", cursor: "pointer",
+};
+const btnGhost = {
+  fontFamily: "var(--head)", fontSize: 12, fontWeight: 600, padding: "8px 16px",
+  borderRadius: "var(--r8)", border: "1.5px solid var(--border2)", background: "var(--card)",
+  color: "var(--text)", cursor: "pointer",
+};
+const actionBtnStyle = {
+  border: "1px solid var(--border2)", background: "var(--card)", borderRadius: 6,
+  fontSize: 11, padding: "3px 7px", cursor: "pointer",
+};
+
+const emptyForm = {
+  date: toInputDate(new Date()), checkId: "", candidateName: "", clientName: "",
+  remark: "", status: "Pending", nextFollowUpDate: "",
+};
+
+export default function DailyFollowUp({ currentUser }) {
+  const role = String(currentUser?.role || "").toLowerCase();
+  const canSeeEveryone = role === "superadmin" || role === "manager";
+  const myEmail = String(currentUser?.email || "").trim().toLowerCase();
+
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [members, setMembers] = useState([]);
+  const [memberFilter, setMemberFilter] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState(emptyForm);
+  const [showAddForm, setShowAddForm] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    dailyFollowUpAPI.list(memberFilter)
+      .then(list => setEntries(Array.isArray(list) ? list : []))
+      .catch(() => setEntries([]))
+      .finally(() => setLoading(false));
+  }, [memberFilter]);
+
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!canSeeEveryone) return;
+    dailyFollowUpAPI.listMembers()
+      .then(list => setMembers(Array.isArray(list) ? list : []))
+      .catch(() => {});
+  }, [canSeeEveryone]);
+
+  const resetForm = () => { setForm(emptyForm); setEditingId(null); setShowAddForm(false); };
+
+  const startEdit = (entry) => {
+    setForm({
+      date: toInputDate(entry.date),
+      checkId: entry.checkId || "",
+      candidateName: entry.candidateName || "",
+      clientName: entry.clientName || "",
+      remark: entry.remark || "",
+      status: entry.status || "Pending",
+      nextFollowUpDate: toInputDate(entry.nextFollowUpDate),
+    });
+    setEditingId(entry._id);
+    setShowAddForm(true);
+  };
+
+  const submitForm = async () => {
+    if (!form.date) { alert("Date is required"); return; }
+    setSaving(true);
+    try {
+      if (editingId) {
+        await dailyFollowUpAPI.update(editingId, form);
+      } else {
+        await dailyFollowUpAPI.create(form);
+      }
+      resetForm();
+      load();
+    } catch (e) {
+      alert("Failed to save: " + (e.message || "Unknown error"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeEntry = async (id) => {
+    if (!window.confirm("Delete this follow-up entry?")) return;
+    try {
+      await dailyFollowUpAPI.remove(id);
+      load();
+    } catch (e) {
+      alert("Failed to delete: " + (e.message || "Unknown error"));
+    }
+  };
+
+  const canEditEntry = (entry) => canSeeEveryone || entry.addedByEmail === myEmail;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{
+        background: "var(--card)", border: "1.5px solid var(--border2)",
+        borderRadius: "var(--r16)", padding: "20px 24px", boxShadow: "var(--shadow)",
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12,
+      }}>
+        <div>
+          <div style={{ fontFamily: "var(--head)", fontSize: 17, fontWeight: 700, color: "var(--text)", marginBottom: 4 }}>
+            📝 Daily Follow-Up
+          </div>
+          <div style={{ fontSize: 13, color: "var(--text3)" }}>
+            {canSeeEveryone ? "Track every team member's daily case follow-ups" : "Log your own daily case follow-ups"}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {canSeeEveryone && members.length > 0 && (
+            <select value={memberFilter} onChange={e => setMemberFilter(e.target.value)} style={inputStyle}>
+              <option value="">All team members</option>
+              {members.map(m => <option key={m.email} value={m.email}>{m.name}</option>)}
+            </select>
+          )}
+          <button onClick={() => { resetForm(); setShowAddForm(true); }} style={btnPrimary}>+ Add Entry</button>
+          <button onClick={load} disabled={loading} style={{ ...btnGhost, cursor: loading ? "wait" : "pointer" }}>🔄 Refresh</button>
+        </div>
+      </div>
+
+      {showAddForm && (
+        <div style={{
+          background: "var(--card)", border: "1.5px solid var(--border2)",
+          borderRadius: "var(--r16)", padding: 20, display: "flex", flexDirection: "column", gap: 10,
+        }}>
+          <div style={{ fontFamily: "var(--head)", fontWeight: 700, fontSize: 14, color: "var(--text)" }}>
+            {editingId ? "Edit Entry" : "New Follow-Up Entry"}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10 }}>
+            <label style={labelStyle}>
+              Date
+              <input type="date" value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} style={inputStyle} />
+            </label>
+            <label style={labelStyle}>
+              Check/Case ID
+              <input type="text" value={form.checkId} onChange={e => setForm(f => ({ ...f, checkId: e.target.value }))} style={inputStyle} />
+            </label>
+            <label style={labelStyle}>
+              Candidate Name
+              <input type="text" value={form.candidateName} onChange={e => setForm(f => ({ ...f, candidateName: e.target.value }))} style={inputStyle} />
+            </label>
+            <label style={labelStyle}>
+              Client Name
+              <input type="text" value={form.clientName} onChange={e => setForm(f => ({ ...f, clientName: e.target.value }))} style={inputStyle} />
+            </label>
+            <label style={labelStyle}>
+              Status
+              <select value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value }))} style={inputStyle}>
+                {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </label>
+            <label style={labelStyle}>
+              Next Follow-up Date
+              <input type="date" value={form.nextFollowUpDate} onChange={e => setForm(f => ({ ...f, nextFollowUpDate: e.target.value }))} style={inputStyle} />
+            </label>
+          </div>
+          <label style={labelStyle}>
+            Follow-up Remark
+            <textarea rows={2} value={form.remark} onChange={e => setForm(f => ({ ...f, remark: e.target.value }))}
+              style={{ ...inputStyle, resize: "vertical" }} />
+          </label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={submitForm} disabled={saving} style={{ ...btnPrimary, cursor: saving ? "wait" : "pointer" }}>
+              {saving ? "Saving…" : editingId ? "Save Changes" : "Add Entry"}
+            </button>
+            <button onClick={resetForm} style={btnGhost}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: "var(--card)", border: "1.5px solid var(--border2)", borderRadius: "var(--r16)", overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "rgba(37,99,235,0.06)" }}>
+                <th style={thStyle}>Date</th>
+                {canSeeEveryone && <th style={thStyle}>Team Member</th>}
+                <th style={thStyle}>Check/Case ID</th>
+                <th style={thStyle}>Candidate</th>
+                <th style={thStyle}>Client</th>
+                <th style={thStyle}>Remark</th>
+                <th style={thStyle}>Status</th>
+                <th style={thStyle}>Next Follow-up</th>
+                <th style={thStyle}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr><td colSpan={canSeeEveryone ? 9 : 8} style={{ padding: 24, textAlign: "center", color: "var(--text3)" }}>Loading…</td></tr>
+              ) : entries.length === 0 ? (
+                <tr><td colSpan={canSeeEveryone ? 9 : 8} style={{ padding: 24, textAlign: "center", color: "var(--text3)" }}>No follow-up entries yet.</td></tr>
+              ) : entries.map(entry => (
+                <tr key={entry._id} style={{ borderTop: "1px solid var(--border2)" }}>
+                  <td style={tdStyle}>{fmtDate(entry.date)}</td>
+                  {canSeeEveryone && <td style={tdStyle}>{entry.addedByName || entry.addedByEmail}</td>}
+                  <td style={tdStyle}>{entry.checkId}</td>
+                  <td style={tdStyle}>{entry.candidateName}</td>
+                  <td style={tdStyle}>{entry.clientName}</td>
+                  <td style={{ ...tdStyle, maxWidth: 240, whiteSpace: "pre-wrap" }}>{entry.remark}</td>
+                  <td style={tdStyle}>{entry.status}</td>
+                  <td style={tdStyle}>{entry.nextFollowUpDate ? fmtDate(entry.nextFollowUpDate) : "—"}</td>
+                  <td style={tdStyle}>
+                    {canEditEntry(entry) && (
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => startEdit(entry)} style={actionBtnStyle} title="Edit">✏️</button>
+                        <button onClick={() => removeEntry(entry._id)} style={{ ...actionBtnStyle, color: "#dc2626", borderColor: "rgba(220,38,38,0.28)" }} title="Delete">🗑️</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

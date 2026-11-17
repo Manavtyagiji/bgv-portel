@@ -1,0 +1,158 @@
+// bgv-backend/controllers/dailyFollowUpController.js
+// Daily Follow-Up — Super Admin's internal team only. A team member logs
+// their own daily case follow-ups; Super Admin/Manager can see every
+// member's entries (filterable by person); TL/Team can only ever see and
+// manage their own. Every check below is server-side and independent of
+// whatever the frontend hides, per the app's existing dual-layer pattern.
+import DailyFollowUp from "../models/DailyFollowUp.js";
+
+function isInternalStaff(user) {
+  const role = String(user?.role || "").toLowerCase();
+  if (role === "superadmin" || role === "manager" || role === "tl") return true;
+  if (role === "team") {
+    const tenantId = user?.tenantId || null;
+    const ownerAdminEmail = user?.ownerAdminEmail
+      ? String(user.ownerAdminEmail).trim().toLowerCase()
+      : null;
+    return user?.isInternal === true || (!tenantId && !ownerAdminEmail);
+  }
+  return false;
+}
+
+function canSeeEveryone(user) {
+  const role = String(user?.role || "").toLowerCase();
+  return role === "superadmin" || role === "manager";
+}
+
+// GET /api/daily-followups?memberEmail=&from=&to=
+export async function listFollowUps(req, res) {
+  try {
+    if (!isInternalStaff(req.user)) {
+      return res.status(403).json({ error: "Not available for your account" });
+    }
+
+    const filter = {};
+    if (canSeeEveryone(req.user)) {
+      const memberEmail = String(req.query?.memberEmail || "").trim().toLowerCase();
+      if (memberEmail) filter.addedByEmail = memberEmail;
+    } else {
+      // TL/Team — always their own, regardless of any query param sent.
+      filter.addedByEmail = String(req.user?.email || "").trim().toLowerCase();
+    }
+
+    if (req.query?.from || req.query?.to) {
+      filter.date = {};
+      if (req.query.from) filter.date.$gte = new Date(req.query.from);
+      if (req.query.to) filter.date.$lte = new Date(req.query.to);
+    }
+
+    const entries = await DailyFollowUp.find(filter).sort({ date: -1, createdAt: -1 }).lean();
+    res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// POST /api/daily-followups
+export async function createFollowUp(req, res) {
+  try {
+    if (!isInternalStaff(req.user)) {
+      return res.status(403).json({ error: "Not available for your account" });
+    }
+
+    const body = req.body || {};
+    if (!body.date) {
+      return res.status(400).json({ error: "Date is required" });
+    }
+
+    const doc = await DailyFollowUp.create({
+      addedByEmail: String(req.user?.email || "").trim().toLowerCase(),
+      addedByName:  req.user?.name || req.user?.email || "",
+      date: new Date(body.date),
+      checkId: body.checkId || "",
+      candidateName: body.candidateName || "",
+      clientName: body.clientName || "",
+      remark: body.remark || "",
+      status: body.status || "Pending",
+      nextFollowUpDate: body.nextFollowUpDate ? new Date(body.nextFollowUpDate) : null,
+    });
+
+    res.status(201).json(doc);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// PATCH /api/daily-followups/:id
+export async function updateFollowUp(req, res) {
+  try {
+    if (!isInternalStaff(req.user)) {
+      return res.status(403).json({ error: "Not available for your account" });
+    }
+
+    const entry = await DailyFollowUp.findById(req.params.id);
+    if (!entry) return res.status(404).json({ error: "Entry not found" });
+
+    const isOwner = entry.addedByEmail === String(req.user?.email || "").trim().toLowerCase();
+    if (!isOwner && !canSeeEveryone(req.user)) {
+      return res.status(403).json({ error: "You can only edit your own entries" });
+    }
+
+    const body = req.body || {};
+    const patch = {};
+    if (body.date !== undefined) patch.date = new Date(body.date);
+    if (body.checkId !== undefined) patch.checkId = body.checkId;
+    if (body.candidateName !== undefined) patch.candidateName = body.candidateName;
+    if (body.clientName !== undefined) patch.clientName = body.clientName;
+    if (body.remark !== undefined) patch.remark = body.remark;
+    if (body.status !== undefined) patch.status = body.status;
+    if (body.nextFollowUpDate !== undefined) {
+      patch.nextFollowUpDate = body.nextFollowUpDate ? new Date(body.nextFollowUpDate) : null;
+    }
+
+    const updated = await DailyFollowUp.findByIdAndUpdate(req.params.id, { $set: patch }, { new: true });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// DELETE /api/daily-followups/:id
+export async function deleteFollowUp(req, res) {
+  try {
+    if (!isInternalStaff(req.user)) {
+      return res.status(403).json({ error: "Not available for your account" });
+    }
+
+    const entry = await DailyFollowUp.findById(req.params.id);
+    if (!entry) return res.status(404).json({ error: "Entry not found" });
+
+    const isOwner = entry.addedByEmail === String(req.user?.email || "").trim().toLowerCase();
+    if (!isOwner && !canSeeEveryone(req.user)) {
+      return res.status(403).json({ error: "You can only delete your own entries" });
+    }
+
+    await DailyFollowUp.findByIdAndDelete(req.params.id);
+    res.json({ message: "Deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// GET /api/daily-followups/members — Super Admin/Manager only, for the
+// "filter by team member" dropdown. Reuses whatever's already in the
+// collection rather than a separate team-roster call.
+export async function listFollowUpMembers(req, res) {
+  try {
+    if (!canSeeEveryone(req.user)) {
+      return res.json([]);
+    }
+    const members = await DailyFollowUp.aggregate([
+      { $group: { _id: "$addedByEmail", name: { $first: "$addedByName" } } },
+      { $sort: { _id: 1 } },
+    ]);
+    res.json(members.map(m => ({ email: m._id, name: m.name || m._id })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}

@@ -1,0 +1,57 @@
+// src/utils/idbCache.js
+// Async get/set for large record sets in IndexedDB.
+// localStorage caps at ~5 MB and silently fails on 12k-record payloads;
+// IndexedDB has no practical size limit and is the right tool for caching
+// the full clientsData object between sessions.
+
+const DB_NAME    = "bgv_cache_db";
+const DB_STORE   = "cache";
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: "k" });
+      }
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror   = (e) => reject(e.target.error);
+  });
+}
+
+export async function idbGet(key) {
+  try {
+    const db  = await openDB();
+    const tx  = db.transaction(DB_STORE, "readonly");
+    const st  = tx.objectStore(DB_STORE);
+    const req = st.get(key);
+    const rec = await new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    });
+    db.close();
+    return rec?.v ?? null;
+  } catch (e) {
+    console.warn("idbGet failed:", e?.message);
+    return null;
+  }
+}
+
+export async function idbSet(key, value) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const st = tx.objectStore(DB_STORE);
+    st.put({ k: key, v: value });
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror    = () => reject(tx.error);
+    });
+    db.close();
+  } catch (e) {
+    console.warn("idbSet failed:", e?.message);
+  }
+}

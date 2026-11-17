@@ -1,0 +1,129 @@
+// bgv-backend/routes/uploadRoutes.js
+
+import express from "express";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+
+import { protect, adminOnly } from "../middleware/authMiddleware.js";
+
+import {
+  uploadExcel,
+  getRecords,
+  addRecord,
+  updateRecord,
+  deleteRecord,
+  deleteBatch,
+  getStats,
+  uploadReportFile,
+  sendCaseMail,
+  listMailAccountsForUser,
+  getReportStatusUpdates,
+  convertDocToPdf,
+} from "../controllers/uploadController.js";
+
+const router = express.Router();
+
+/* ───────────── PATH SETUP ───────────── */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const reportsDir = path.join(__dirname, "..", "uploads", "reports");
+
+if (!fs.existsSync(reportsDir)) {
+  fs.mkdirSync(reportsDir, { recursive: true });
+}
+
+/* ───────────── EXCEL UPLOAD ───────────── */
+const excelUpload = multer({
+  storage: multer.memoryStorage(),
+});
+
+/* ───────────── REPORT UPLOAD ───────────── */
+const reportUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, reportsDir),
+
+    filename: (req, file, cb) =>
+      cb(
+        null,
+        `report_${Date.now()}${path.extname(file.originalname)}`
+      ),
+  }),
+});
+
+/* ───────────── ROUTES ───────────── */
+
+router.post(
+  "/",
+  protect,
+  excelUpload.single("file"),
+  uploadExcel
+);
+
+router.get("/records", protect, getRecords);
+
+router.post("/records", protect, addRecord);
+
+router.patch("/records/:id", protect, updateRecord);
+
+router.delete(
+  "/records/:id",
+  protect,
+  adminOnly,
+  deleteRecord
+);
+
+router.delete(
+  "/batch/:batchId",
+  protect,
+  adminOnly,
+  deleteBatch
+);
+
+router.get("/stats", protect, getStats);
+
+router.post(
+  "/convert-doc-to-pdf",
+  protect,
+  reportUpload.single("file"),
+  convertDocToPdf
+);
+
+/* ───────────── REPORT FILE UPLOAD ───────────── */
+
+router.post(
+  "/report-file",
+  protect,
+  reportUpload.single("file"),
+  uploadReportFile
+);
+
+
+
+/* ───────────── REAL-TIME REPORT STATUS (delta poll) ───────────── */
+
+router.get(
+  "/report-status",
+  protect,
+  getReportStatusUpdates
+);
+
+/* ───────────── LIST MAIL ACCOUNTS (for sender picker) ───────────── */
+
+router.get(
+  "/mail-configs",
+  protect,
+  listMailAccountsForUser
+);
+
+/* ───────────── SEND MAIL WITH EXCEL + PDF ───────────── */
+
+router.post(
+  "/send-mail",
+  protect,
+  sendCaseMail
+);
+
+export default router;
